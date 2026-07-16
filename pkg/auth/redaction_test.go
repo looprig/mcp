@@ -42,15 +42,33 @@ import (
 // a leak rather than a coincidence.
 const canary = "CANARY-c7f3a1e9-SECRET-TOKEN-VALUE"
 
-// verbs are the fmt verbs that dispatch to Stringer/GoStringer. A type that
-// implements both cannot be rendered by reflection through any of them.
+// verbs is every fmt verb, not a chosen few.
 //
-// %x and %X are included because they are easy to overlook: fmt routes them
-// through Stringer like the rest, so they hex-encode the redacted text rather
-// than the struct — but only as long as the Stringer exists. They are asserted
-// hex-aware in TestNoSecretsInFormatting, since a leak there would arrive
-// encoded rather than in plain text.
-var verbs = []string{"%v", "%s", "%q", "%+v", "%#v", "%x", "%X"}
+// The list is generated rather than hand-picked, and that is a deliberate
+// correction: an earlier version of this test swept only {%v %s %q %+v %#v} —
+// exactly the verbs fmt routes through Stringer, and therefore exactly the
+// verbs that could not fail. It passed while `fmt.Sprintf("%d", set)` printed
+// the token in full, because %d falls through to reflection and reflection
+// reads unexported fields. A redaction test that only tries the safe verbs is
+// not evidence of anything.
+//
+// So: every ASCII letter as a verb, each with the flags that change fmt's
+// dispatch (%#v reaches GoStringer, %+v the plus flag), plus the invalid-verb
+// case. Anything fmt can be asked to do, it is asked to do here.
+var verbs = buildVerbs()
+
+func buildVerbs() []string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	flags := []string{"", "+", "#", " ", "-", "0"}
+	out := make([]string, 0, len(letters)*len(flags)+2)
+	for _, flag := range flags {
+		for _, letter := range letters {
+			out = append(out, "%"+flag+string(letter))
+		}
+	}
+	// A verb fmt does not know: it must not fall back to dumping the value.
+	return append(out, "%!", "%9.3v")
+}
 
 // secretValues returns, by name, every value that holds the canary — both the
 // secret-bearing types themselves and the containers they travel in.
@@ -219,6 +237,71 @@ func TestNoSecretsInLoggingPipelines(t *testing.T) {
 			}
 		}
 	})
+}
+
+// A secret-bearing value held in someone else's UNEXPORTED field is the case
+// that methods cannot defend: fmt reaches it by reflection but cannot call a
+// method on it (CanInterface is false), so Formatter, Stringer and GoStringer
+// are all skipped. It is also a realistic case — an application's own
+// credential manager keeping `set auth.TokenSet` as a private field, then
+// logging itself, is an obvious thing to write.
+//
+// It holds anyway, because the secrets sit behind a pointer and fmt renders a
+// nested pointer as an address rather than following it. This test is what
+// stops that indirection from being "refactored away" as a needless
+// allocation: delete it and this fails.
+func TestSecretsSurviveUnexportedFieldWrapper(t *testing.T) {
+	t.Parallel()
+
+	type wrapper struct {
+		set    auth.TokenSet
+		header auth.Header
+	}
+	w := wrapper{
+		set:    auth.NewTokenSet(canary, canary, time.Time{}, []string{"read"}),
+		header: auth.NewHeader("Authorization", canary),
+	}
+
+	for _, verb := range verbs {
+		if got := fmt.Sprintf(verb, w); strings.Contains(got, canary) {
+			t.Errorf("fmt.Sprintf(%q, wrapper-with-unexported-fields) leaked: %s", verb, got)
+		}
+	}
+
+	// The same shape through the logger an application would really use.
+	var buf bytes.Buffer
+	slog.New(slog.NewTextHandler(&buf, nil)).Info("creds", "w", w)
+	if strings.Contains(buf.String(), canary) {
+		t.Errorf("slog leaked a wrapper's unexported secret fields: %s", buf.String())
+	}
+}
+
+// Refusing to marshal is only half a contract: a store that persists a TokenSet
+// must not be able to silently decode an empty one back.
+func TestUnmarshalJSONRefuses(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		target json.Unmarshaler
+	}{
+		{name: "TokenSet", target: &auth.TokenSet{}},
+		{name: "Header", target: &auth.Header{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if err := tt.target.UnmarshalJSON([]byte(`{"access":"x"}`)); !errors.Is(err, auth.ErrMarshalRefused) {
+				t.Errorf("UnmarshalJSON() error = %v, want ErrMarshalRefused", err)
+			}
+		})
+	}
+
+	// And through the encoding/json entry point a caller would really use.
+	var set auth.TokenSet
+	if err := json.Unmarshal([]byte(`{"access":"x"}`), &set); !errors.Is(err, auth.ErrMarshalRefused) {
+		t.Errorf("json.Unmarshal error = %v, want ErrMarshalRefused", err)
+	}
 }
 
 // Redaction must not be so total that it is useless: the rendered text should

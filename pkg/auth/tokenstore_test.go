@@ -52,6 +52,17 @@ func TestKeyValidate(t *testing.T) {
 		{name: "port above range", key: auth.Key{ServerOrigin: "https://mcp.example.com:99999"}, wantErr: true},
 		{name: "port zero", key: auth.Key{ServerOrigin: "https://mcp.example.com:0"}, wantErr: true},
 		{name: "non-numeric port", key: auth.Key{ServerOrigin: "https://mcp.example.com:abc"}, wantErr: true},
+		// A leading zero is the same port spelled differently. Accepting it
+		// would split the cache: ":0443" and ":443" are one server, two keys.
+		{name: "leading-zero port", key: auth.Key{ServerOrigin: "https://mcp.example.com:0443"}, wantErr: true},
+		{name: "double leading-zero port", key: auth.Key{ServerOrigin: "https://mcp.example.com:00443"}, wantErr: true},
+		{name: "leading-zero non-default port", key: auth.Key{ServerOrigin: "https://mcp.example.com:08443"}, wantErr: true},
+		// Same name, root label spelled out: another split-cache spelling.
+		{name: "trailing dot host", key: auth.Key{ServerOrigin: "https://mcp.example.com."}, wantErr: true},
+		{name: "ipv6 zone identifier", key: auth.Key{ServerOrigin: "https://[fe80::1%25eth0]"}, wantErr: true},
+		{name: "u2028 in origin", key: auth.Key{ServerOrigin: "https://mcp.example.com\u2028"}, wantErr: true},
+		{name: "u2028 in client id", key: auth.Key{ServerOrigin: "https://mcp.example.com", ClientID: "a\u2028b"}, wantErr: true},
+		{name: "u2029 in client id", key: auth.Key{ServerOrigin: "https://mcp.example.com", ClientID: "a\u2029b"}, wantErr: true},
 		{name: "control byte in origin", key: auth.Key{ServerOrigin: "https://mcp.example.com\n"}, wantErr: true},
 		{name: "origin over max", key: auth.Key{ServerOrigin: "https://" + strings.Repeat("a", auth.MaxOriginBytes) + ".com"}, wantErr: true},
 		{name: "client id over max", key: auth.Key{ServerOrigin: "https://mcp.example.com", ClientID: strings.Repeat("c", auth.MaxClientIDBytes+1)}, wantErr: true},

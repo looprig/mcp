@@ -8,9 +8,8 @@
 // plus redacting String/GoString/MarshalJSON methods:
 //
 //   - Redacting methods only cover the paths that call them. Unexported fields
-//     also close the paths that do not: encoding/json, encoding/gob, any
-//     reflection-based logger or struct-differ, and `fmt` itself, which will
-//     happily print unexported fields via reflection when no Stringer exists.
+//     also close the paths that do not: encoding/json and encoding/gob have
+//     nothing to reflect over.
 //   - `set.Access` as a field is a leak one keystroke away, and reviewing for
 //     it means reviewing every use forever. `set.Access()` as a method is the
 //     same keystroke, but it is greppable: the audit question "who reads token
@@ -19,9 +18,20 @@
 //     A caller cannot hold a reference into a stored TokenSet's scopes, because
 //     the only way out is Scopes(), which clones.
 //
-// The redacting String/GoString methods are still here — they are what makes
-// the fmt paths render something useful instead of an opaque struct — but they
-// are the second layer, not the first.
+// Unexported fields are necessary but NOT sufficient, and it is worth being
+// exact about why, because the obvious mental model is wrong: fmt's reflection
+// path reads unexported fields perfectly well. `fmt.Sprintf("%d", set)` on a
+// type with only a Stringer prints the tokens verbatim, because fmt consults
+// Stringer for just %v, %s, %q, %x and %X and sends every other verb to
+// reflection. That is why these types implement fmt.Formatter, which fmt
+// consults first, for every verb. String and GoString remain for direct callers
+// and for readable output; Format is what makes the coverage total.
+//
+// Formatter still leaves three paths uncovered — %p and %w, which fmt resolves
+// before consulting it; anything routed through badVerb, which suppresses
+// methods; and a value inside someone else's unexported field, which fmt
+// reaches by reflection but cannot call a method on. Those are closed by where
+// the bytes live rather than by any method: see the secret type below.
 //
 // MarshalJSON refuses rather than redacts. Redacting would make
 // json.Marshal(set) succeed and silently produce a token-shaped document with
@@ -37,6 +47,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"slices"
@@ -49,6 +60,48 @@ import (
 // Redacted is the text that stands in for secret material in every rendering
 // this package produces.
 const Redacted = "[REDACTED]"
+
+// secret holds credential material inside a closure, behind a pointer.
+//
+// This is the layer that makes redaction unconditional rather than merely
+// thorough, and it is deliberate despite looking like a needless allocation.
+// Methods (Format, String, GoString) cover most of fmt, but three paths reach a
+// value without ever consulting them:
+//
+//   - %p and %w, which fmt resolves before it looks for Formatter;
+//   - any verb fmt cannot apply, which lands in badVerb — badVerb sets an
+//     erroring flag that suppresses method dispatch, then re-prints the value
+//     by reflection at depth zero, which is deep enough to follow a pointer;
+//   - a TokenSet or Header held in another struct's unexported field, which
+//     fmt reaches by reflection but cannot call a method on (CanInterface is
+//     false).
+//
+// A plain string field prints the credential in full down all three. A pointer
+// to a string field closes the first and third but not badVerb, which follows
+// it. A closure closes all three, because the bytes live in the captured
+// environment: reflection sees a func value and renders it as an address. There
+// is nowhere for it to look.
+//
+// A secret is immutable, so copying a TokenSet by value — which shares the
+// pointer — is safe, and the closure is never nil for a non-nil secret.
+type secret struct{ reveal func() string }
+
+// newSecret wraps v, or returns nil for the empty string so that "absent" has
+// exactly one representation.
+func newSecret(v string) *secret {
+	if v == "" {
+		return nil
+	}
+	return &secret{reveal: func() string { return v }}
+}
+
+// value returns the wrapped material, or "" when there is none.
+func (s *secret) value() string {
+	if s == nil {
+		return ""
+	}
+	return s.reveal()
+}
 
 // ErrMarshalRefused reports that a value holding secret material refused to
 // serialize itself. See the file comment for why refusal beats redaction here;
@@ -176,6 +229,19 @@ func validateOrigin(origin string) error {
 	if i := strings.IndexFunc(host, func(r rune) bool { return r > 127 }); i >= 0 {
 		return fmt.Errorf("ServerOrigin host must be ASCII; encode an internationalized name as its punycode A-label")
 	}
+	// "example.com." is the same name as "example.com" with the root label
+	// spelled out — another two-spellings-one-server split.
+	if strings.HasSuffix(host, ".") {
+		return fmt.Errorf("ServerOrigin host must not have a trailing dot; want %q", canonicalOrigin(u.Scheme, strings.TrimSuffix(host, "."), u.Port()))
+	}
+	// An IPv6 zone identifier is scoped to one machine's interfaces, so it is
+	// not an identity a token can meaningfully be keyed by — and it cannot
+	// survive the round trip anyway: Hostname() unescapes "%25" to "%", which
+	// url.Parse then rejects, so the canonical form we would suggest is one
+	// the caller cannot use.
+	if strings.Contains(host, "%") {
+		return fmt.Errorf("ServerOrigin host must not carry an IPv6 zone identifier")
+	}
 	// Checked explicitly rather than left to the canonical comparison below:
 	// url.Parse lowercases the scheme but preserves the host's case, so the
 	// canonical serialization would echo back whatever case it was given and
@@ -196,11 +262,22 @@ func validateOrigin(origin string) error {
 
 	port := u.Port()
 	if port != "" {
+		// url.Parse guarantees the port is digits, but nothing more: it
+		// accepts ":0", ":99999" and ":0443" alike.
 		n, err := strconv.Atoi(port)
 		if err != nil || n < 1 || n > 65535 {
 			return fmt.Errorf("ServerOrigin has an invalid port")
 		}
-		if (u.Scheme == "https" && port == "443") || (u.Scheme == "http" && port == "80") {
+		// A leading zero is the canonicalization hole that matters: ":0443"
+		// and ":443" are the same port, so comparing the string against "443"
+		// misses it and canonicalOrigin echoes the input back, letting it
+		// through both checks — two keys, one server, a redundant login.
+		// Comparing against the re-rendered number closes it for every
+		// non-minimal spelling at once.
+		if strconv.Itoa(n) != port {
+			return fmt.Errorf("ServerOrigin port must have no leading zeros; want %q", canonicalOrigin(u.Scheme, host, strconv.Itoa(n)))
+		}
+		if (u.Scheme == "https" && n == 443) || (u.Scheme == "http" && n == 80) {
 			return fmt.Errorf("ServerOrigin must omit the default port for scheme %q", u.Scheme)
 		}
 	}
@@ -237,11 +314,21 @@ func isLoopbackHost(host string) bool {
 	return false
 }
 
-// indexOfControl returns the index of the first control character in s, or -1.
+// indexOfControl returns the index of the first line-breaking or control
+// character in s, or -1.
+//
+// U+2028 and U+2029 are included alongside the ASCII controls because they are
+// category Zl/Zp rather than Cc — unicode.IsControl does not report them — yet
+// they terminate a line for a JavaScript or JSON log consumer just as newline
+// does. A Key is rendered into logs by Key.String, so a forged line here is a
+// forged record there.
+func isLineBreaking(r rune) bool {
+	return r < 0x20 || r == 0x7f || r == '\u2028' || r == '\u2029'
+}
+
+// indexOfControl returns the index of the first such character in s, or -1.
 func indexOfControl(s string) int {
-	return strings.IndexFunc(s, func(r rune) bool {
-		return r < 0x20 || r == 0x7f
-	})
+	return strings.IndexFunc(s, isLineBreaking)
 }
 
 // ExpirySkew is subtracted from a token's expiry when deciding whether it is
@@ -265,8 +352,8 @@ const ExpirySkew = 30 * time.Second
 // construction, so copies cannot diverge and concurrent readers need no
 // synchronization.
 type TokenSet struct {
-	access  string // SECRET — reachable only via Access()
-	refresh string // SECRET — reachable only via Refresh()
+	access  *secret // SECRET — reachable only via Access()
+	refresh *secret // SECRET — reachable only via Refresh()
 	expiry  time.Time
 	scopes  []string
 }
@@ -279,8 +366,8 @@ type TokenSet struct {
 // dead.
 func NewTokenSet(access, refresh string, expiry time.Time, scopes []string) TokenSet {
 	return TokenSet{
-		access:  access,
-		refresh: refresh,
+		access:  newSecret(access),
+		refresh: newSecret(refresh),
 		expiry:  expiry,
 		scopes:  slices.Clone(scopes),
 	}
@@ -289,12 +376,12 @@ func NewTokenSet(access, refresh string, expiry time.Time, scopes []string) Toke
 // Access returns the access token. This is secret material: send it to a
 // server, or hand it to a store that is persisting it. Never log it, never put
 // it in an error, never put it in an event.
-func (t TokenSet) Access() string { return t.access }
+func (t TokenSet) Access() string { return t.access.value() }
 
 // Refresh returns the refresh token, which is empty when the grant did not
 // include one. This is secret material — and the more valuable of the two, since
 // it mints access tokens. The rules for Access apply with more force.
-func (t TokenSet) Refresh() string { return t.refresh }
+func (t TokenSet) Refresh() string { return t.refresh.value() }
 
 // Expiry returns the access token's expiry, or the zero time when the server
 // did not state one.
@@ -316,7 +403,7 @@ func (t TokenSet) Expired(now time.Time) bool {
 // about expiry — a caller that needs a usable token checks both, and the two are
 // separate because an expired token with a refresh token is a different
 // situation from no token at all.
-func (t TokenSet) Valid() bool { return t.access != "" }
+func (t TokenSet) Valid() bool { return t.access != nil }
 
 // String renders the set with its secrets redacted, reporting only the metadata
 // an operator needs: whether each token is present, when it expires, and what it
@@ -328,10 +415,28 @@ func (t TokenSet) String() string {
 	)
 }
 
-// GoString makes %#v redacted too. Without it, %#v would reach for reflection
-// and print the struct's unexported fields verbatim — the one fmt verb that
-// would otherwise defeat the whole design.
+// GoString renders redacted text for %#v and for direct callers.
 func (t TokenSet) GoString() string { return t.String() }
+
+// Format routes every fmt verb through the redacted rendering.
+//
+// Stringer is not enough on its own, and this is the subtle part of the whole
+// design: fmt consults Stringer only for %v, %s, %q, %x and %X. Any other verb
+// — %d, %t, %f, %c, ... — falls through to reflection, and fmt's reflection
+// path reads unexported fields, so `fmt.Sprintf("%d", set)` would print
+// `{%!d(string=<the token>) ...}`. A wrong verb is a typo, not a decision, and
+// a typo must not be the difference between a redacted log line and a leaked
+// credential.
+//
+// Formatter is consulted before Stringer and before reflection, for every verb,
+// which closes the whole class. The verb is deliberately ignored: there is no
+// verb for which printing this value in any form other than redacted is
+// correct.
+func (t TokenSet) Format(f fmt.State, verb rune) {
+	// fmt.Formatter cannot report a write error and fmt ignores them
+	// anyway; discarding is the contract here, not an oversight.
+	_, _ = io.WriteString(f, t.String())
+}
 
 // MarshalJSON always fails, so that a TokenSet reaching a JSON encoder — a log
 // line, an event payload, an HTTP response — is a loud error rather than a
@@ -340,12 +445,21 @@ func (t TokenSet) MarshalJSON() ([]byte, error) {
 	return nil, fmt.Errorf("auth.TokenSet: %w", ErrMarshalRefused)
 }
 
+// UnmarshalJSON always fails, for the mirror of MarshalJSON's reason. Without
+// it, decoding into a struct containing a TokenSet would silently produce an
+// empty one — the same silent-credential-loss failure that argues against a
+// redacting MarshalJSON, arriving from the other direction. A store that
+// persists tokens reconstructs them with NewTokenSet.
+func (t *TokenSet) UnmarshalJSON([]byte) error {
+	return fmt.Errorf("auth.TokenSet: %w", ErrMarshalRefused)
+}
+
 // presence renders whether a secret is set, without revealing anything about
 // it. Presence is not itself secret: it is the difference between "the server
 // gave us no refresh token" and "we lost it", which is what an operator reading
 // a log is trying to tell apart.
-func presence(secret string) string {
-	if secret == "" {
+func presence(s *secret) string {
+	if s == nil {
 		return "<empty>"
 	}
 	return Redacted
@@ -469,3 +583,16 @@ func (s *MemoryStore) String() string {
 
 // GoString makes %#v redacted too.
 func (s *MemoryStore) GoString() string { return s.String() }
+
+// Format routes every fmt verb through the redacted rendering.
+//
+// A store needs this for a reason its contents do not: fmt skips the methods of
+// a value it reaches through an *unexported* field, and the token map is one.
+// Without Format, an unhandled verb would walk straight past TokenSet's own
+// Format into the map and render every entry. Holding secrets transitively is
+// the same obligation as holding them directly.
+func (s *MemoryStore) Format(f fmt.State, verb rune) {
+	// fmt.Formatter cannot report a write error and fmt ignores them
+	// anyway; discarding is the contract here, not an oversight.
+	_, _ = io.WriteString(f, s.String())
+}

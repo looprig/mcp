@@ -28,6 +28,8 @@ package auth
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"strings"
 	"unicode"
 
@@ -152,6 +154,22 @@ func (e *Error) Unwrap() error {
 	return e.Err
 }
 
+// Format routes every fmt verb through Error, so that the decision not to
+// render the wrapped cause actually holds.
+//
+// Without this, the decision is only skin deep: fmt consults the error
+// interface for %v, %s, %q, %x and %X, but sends every other verb to
+// reflection — which walks the struct and prints the Err field's contents in
+// full. `fmt.Sprintf("%d", err)` on an Error wrapping an HTTP failure would
+// print whatever that failure's text contains, which is exactly the material
+// Error refuses to render through Error(). A verb typo must not be the
+// difference.
+func (e *Error) Format(f fmt.State, verb rune) {
+	// fmt.Formatter cannot report a write error and fmt ignores them
+	// anyway; discarding is the contract here, not an oversight.
+	_, _ = io.WriteString(f, e.Error())
+}
+
 // ClassOf walks err's chain and reports the class of the outermost *Error.
 // It returns false when the chain contains no *Error.
 func ClassOf(err error) (Class, bool) {
@@ -171,7 +189,10 @@ func ClassOf(err error) (Class, bool) {
 // no separate validity pass is needed.
 func boundMessage(s string) string {
 	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		// isLineBreaking covers U+2028/U+2029 as well as the ASCII controls;
+		// unicode.IsControl reports neither, since they are Zl/Zp rather than
+		// Cc, yet both end a line for a JSON or JavaScript log consumer.
+		if unicode.IsControl(r) || isLineBreaking(r) {
 			return ' '
 		}
 		return r

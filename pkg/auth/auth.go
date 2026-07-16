@@ -20,23 +20,33 @@
 // Every type here that holds a secret — TokenSet, Header — keeps it in an
 // unexported field and exposes it only through a named accessor, so that:
 //
-//   - no reflection-based encoder or logger can reach it;
-//   - fmt cannot print it, since the redacting String/GoString methods are what
-//     every verb dispatches to;
-//   - json.Marshal fails loudly rather than emitting it;
+//   - no reflection-based encoder can reach it: encoding/json refuses via
+//     MarshalJSON, and encoding/gob refuses because there is nothing exported
+//     to encode;
+//   - fmt renders it redacted for every verb, because these types implement
+//     fmt.Formatter — Stringer alone would cover only %v, %s, %q, %x and %X
+//     and let %d and friends fall through to reflection, which reads unexported
+//     fields;
 //   - reading it is a deliberate, greppable act.
 //
 // Values are non-secret metadata (expiry, scopes, header names, auth state) and
 // are exported normally: Status in particular is designed to be logged as-is.
 //
 // The dividing line is that leaking must require intent. Accessors make
-// intentional use easy and accidental use impossible, rather than making both
-// merely discouraged.
+// intentional use easy and accidental use hard.
+//
+// This holds even where methods cannot reach. fmt renders a value held in
+// another struct's unexported field by reflection, skipping Formatter,
+// Stringer and GoStringer alike, and %p and %w bypass those methods outright —
+// so the secrets additionally sit behind a pointer, which fmt's reflection
+// prints as an address rather than following. Redaction is therefore a
+// property of the layout, not only of the methods.
 package auth
 
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 )
 
@@ -85,13 +95,13 @@ type HeaderProvider interface {
 // — and renders as redacted like any other.
 type Header struct {
 	name  string
-	value string // SECRET — reachable only via Value()
+	value *secret // SECRET — reachable only via Value()
 }
 
 // NewHeader builds a Header. Call Validate before using one built from
 // configuration or from any other untrusted source.
 func NewHeader(name, value string) Header {
-	return Header{name: name, value: value}
+	return Header{name: name, value: newSecret(value)}
 }
 
 // Name returns the header's field name, which is not secret.
@@ -99,7 +109,7 @@ func (h Header) Name() string { return h.name }
 
 // Value returns the header's value. This is secret material: write it to a
 // request, and nothing else.
-func (h Header) Value() string { return h.value }
+func (h Header) Value() string { return h.value.value() }
 
 // Validate reports whether h is a well-formed HTTP header. Violations are
 // returned as *Error with class ClassInvalidConfig.
@@ -126,8 +136,9 @@ func (h Header) Validate() error {
 			return fail(fmt.Sprintf("header name %q contains an invalid byte 0x%02x at index %d", h.name, h.name[i], i))
 		}
 	}
-	for i := 0; i < len(h.value); i++ {
-		if !isFieldValueByte(h.value[i]) {
+	value := h.value.value()
+	for i := 0; i < len(value); i++ {
+		if !isFieldValueByte(value[i]) {
 			// The value IS secret: report the offense and its position, never
 			// the byte or the value. A validation error is precisely the kind
 			// of thing that gets logged.
@@ -146,13 +157,26 @@ func (h Header) String() string {
 	return fmt.Sprintf("auth.Header{name:%s, value:%s}", name, presence(h.value))
 }
 
-// GoString makes %#v redacted too; see TokenSet.GoString.
+// GoString renders redacted text for %#v and for direct callers.
 func (h Header) GoString() string { return h.String() }
+
+// Format routes every fmt verb through the redacted rendering; see
+// TokenSet.Format for why Stringer alone is insufficient.
+func (h Header) Format(f fmt.State, verb rune) {
+	// fmt.Formatter cannot report a write error and fmt ignores them
+	// anyway; discarding is the contract here, not an oversight.
+	_, _ = io.WriteString(f, h.String())
+}
 
 // MarshalJSON always fails, for the reason TokenSet.MarshalJSON does: a header
 // reaching a JSON encoder is a leak, and refusing is the loud answer.
 func (h Header) MarshalJSON() ([]byte, error) {
 	return nil, fmt.Errorf("auth.Header: %w", ErrMarshalRefused)
+}
+
+// UnmarshalJSON always fails; see TokenSet.UnmarshalJSON.
+func (h *Header) UnmarshalJSON([]byte) error {
+	return fmt.Errorf("auth.Header: %w", ErrMarshalRefused)
 }
 
 // tcharPunctuation is the punctuation permitted in the RFC 9110 "tchar"
