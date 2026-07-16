@@ -2,6 +2,7 @@ package protocol_test
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -29,6 +30,11 @@ func FuzzFromSDKToolSchema(f *testing.F) {
 		`{"s":"}}}}]]]]"}`,
 		`{"s":"\\"}`,
 		"{\"\xff\xfe\":1}",
+		// Over the byte and depth bounds below: as an output schema these
+		// must be dropped, never fatal. Seeds run on every `go test`, so
+		// these pin the tolerance whether or not the fuzzer is engaged.
+		`{"pad":"` + strings.Repeat("x", 600) + `"}`,
+		strings.Repeat(`{"x":`, 20) + `{}` + strings.Repeat(`}`, 20),
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -60,23 +66,42 @@ func FuzzFromSDKToolSchema(f *testing.F) {
 			}
 		}
 
-		// As output schema: a bad one is dropped with a warning rather than
-		// failing the tool, but a retained one is still within bounds.
+		// As output schema, alongside a known-good input schema: no server-
+		// controlled output schema may fail the tool. Whatever the bytes, the
+		// conversion must succeed — dropping the schema with a warning — so
+		// this asserts err == nil rather than merely tolerating an error.
 		got, err = protocol.FromSDKTool(&mcp.Tool{
 			Name:         "t",
 			InputSchema:  json.RawMessage(`{"type":"object"}`),
 			OutputSchema: json.RawMessage(schema),
 		}, bounds)
-		if err == nil {
-			if got.OutputSchema != nil {
-				assertSchemaWithinBounds(t, "OutputSchema", got.OutputSchema, maxBytes, maxDepth)
-			}
-			if len(got.Warnings) > protocol.MaxWarnings {
-				t.Errorf("Warnings = %d entries, want at most %d",
-					len(got.Warnings), protocol.MaxWarnings)
-			}
+		if err != nil {
+			t.Fatalf("a defective output schema must be tolerated, got error: %v (schema %q)",
+				err, schema)
+		}
+		// A retained output schema is still within bounds; a dropped one
+		// leaves a bounded warning behind.
+		if got.OutputSchema != nil {
+			assertSchemaWithinBounds(t, "OutputSchema", got.OutputSchema, maxBytes, maxDepth)
+		} else if len(got.Warnings) == 0 && !isAbsent(schema) {
+			t.Errorf("output schema %q was dropped without a warning", schema)
+		}
+		if len(got.Warnings) > protocol.MaxWarnings {
+			t.Errorf("Warnings = %d entries, want at most %d",
+				len(got.Warnings), protocol.MaxWarnings)
+		}
+		// The input schema is good, so the tool always survives intact.
+		if len(got.InputSchema) == 0 {
+			t.Errorf("valid InputSchema was lost for output schema %q", schema)
 		}
 	})
+}
+
+// isAbsent reports whether a schema is JSON null, which means "the server sent
+// no schema" rather than "the server sent a bad one" — the one drop that is
+// not a defect and so carries no warning.
+func isAbsent(schema string) bool {
+	return strings.TrimSpace(schema) == "null"
 }
 
 func assertSchemaWithinBounds(t *testing.T, field string, raw json.RawMessage, maxBytes, maxDepth int) {

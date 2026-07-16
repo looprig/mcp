@@ -51,7 +51,10 @@ type Bounds struct {
 	// MaxTextBytes caps one text (or embedded-resource text) payload before
 	// it is truncated.
 	MaxTextBytes int
-	// MaxStructuredBytes caps one structured-content document.
+	// MaxStructuredBytes caps one structured-content document. Not read by
+	// any converter yet: structured content arrives on CallToolResult, whose
+	// conversion lands in a later task and enforces this. It is carried here
+	// so the client's Limits map onto one complete Bounds view.
 	MaxStructuredBytes int
 	// MaxBinaryItemBytes caps one binary (image/audio/blob) item.
 	MaxBinaryItemBytes int
@@ -175,11 +178,16 @@ type EmbeddedResourceContent struct {
 
 // UnsupportedContent stands in for content this boundary will not retain: a
 // kind the module does not model, or a payload over a bound. It records only
-// bounded metadata — Kind is one of the Kind* constants and Bytes the size of
-// the payload that was dropped — so an unusable item is always visible to the
-// caller rather than silently disappearing.
+// bounded metadata, so an unusable item is always visible to the caller rather
+// than silently disappearing.
 type UnsupportedContent struct {
-	Kind  string
+	// Kind is one of the Kind* constants.
+	Kind string
+	// Bytes is the size of the payload that was refused. It is exact for an
+	// item dropped on a size bound (image, audio, embedded blob), and a
+	// diagnostic lower bound for a kind dropped as unsupported, whose size is
+	// summed from its known fields rather than by marshalling data we are
+	// refusing. Treat it as a diagnostic, never as an accounting figure.
 	Bytes int
 }
 

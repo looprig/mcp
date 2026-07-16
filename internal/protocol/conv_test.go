@@ -102,9 +102,12 @@ func TestFromSDKTool(t *testing.T) {
 			bounds: testBounds(), wantErr: true,
 		},
 		{
-			name:   "over-byte output schema",
+			// An optional schema over a bound is dropped, not fatal: letting
+			// it fail the tool would let a server make an otherwise-usable
+			// tool unavailable just by padding an optional field.
+			name:   "over-byte output schema is dropped and warned",
 			tool:   &mcp.Tool{Name: "t", InputSchema: okSchema, OutputSchema: bigSchema},
-			bounds: testBounds(), wantErr: true,
+			bounds: testBounds(), wantName: "t", wantOutNil: true, wantWarnings: 1,
 		},
 		{
 			name:   "over-depth input schema",
@@ -112,9 +115,9 @@ func TestFromSDKTool(t *testing.T) {
 			bounds: testBounds(), wantErr: true,
 		},
 		{
-			name:   "over-depth output schema",
+			name:   "over-depth output schema is dropped and warned",
 			tool:   &mcp.Tool{Name: "t", InputSchema: okSchema, OutputSchema: deepJSON(12)},
-			bounds: testBounds(), wantErr: true,
+			bounds: testBounds(), wantName: "t", wantOutNil: true, wantWarnings: 1,
 		},
 		{
 			name:   "at-limit depth passes",
@@ -230,6 +233,48 @@ func TestFromSDKToolDefensiveCopy(t *testing.T) {
 	if !bytes.Equal(before, got.InputSchema) {
 		t.Errorf("InputSchema changed to %s after mutating SDK memory; want %s",
 			got.InputSchema, before)
+	}
+}
+
+// A dropped output schema is only visible through its warning, so the warning
+// must say why it went.
+func TestFromSDKToolDropWarningNamesReason(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		schema   json.RawMessage
+		wantWord string
+	}{
+		{name: "over bytes", schema: json.RawMessage(`{"pad":"` + strings.Repeat("x", 5000) + `"}`),
+			wantWord: protocol.WhatSchemaBytes},
+		{name: "over depth", schema: deepJSON(12), wantWord: limits.WhatJSONDepth},
+		{name: "malformed", schema: json.RawMessage(`{bad`), wantWord: "marshalable"},
+		{name: "not an object", schema: json.RawMessage(`42`), wantWord: "object"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := protocol.FromSDKTool(&mcp.Tool{
+				Name: "t", InputSchema: json.RawMessage(`{"type":"object"}`),
+				OutputSchema: tt.schema,
+			}, testBounds())
+			if err != nil {
+				t.Fatalf("FromSDKTool() error = %v, want the defect tolerated", err)
+			}
+			if got.OutputSchema != nil {
+				t.Errorf("OutputSchema = %s, want it dropped", got.OutputSchema)
+			}
+			if len(got.Warnings) != 1 {
+				t.Fatalf("Warnings = %v, want exactly one", got.Warnings)
+			}
+			if !strings.Contains(got.Warnings[0], tt.wantWord) {
+				t.Errorf("warning %q does not name the reason %q", got.Warnings[0], tt.wantWord)
+			}
+			// The tool itself stays usable: its input schema survives.
+			if len(got.InputSchema) == 0 {
+				t.Error("InputSchema was lost along with the output schema")
+			}
+		})
 	}
 }
 
@@ -561,6 +606,12 @@ func TestFromSDKContent(t *testing.T) {
 				}
 				if uc.Kind != protocol.KindResourceLink {
 					t.Errorf("Kind = %q, want %q", uc.Kind, protocol.KindResourceLink)
+				}
+				// Sized from the fields (len "file:///x" + len "x"), not by
+				// marshalling the item we are refusing.
+				if uc.Bytes != len("file:///x")+len("x") {
+					t.Errorf("Bytes = %d, want the summed field lengths %d",
+						uc.Bytes, len("file:///x")+len("x"))
 				}
 			},
 		},

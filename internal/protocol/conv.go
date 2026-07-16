@@ -38,13 +38,18 @@ func isNilContent(c mcp.Content) bool {
 // FromSDKTool converts an SDK tool, enforcing the schema bounds before
 // retaining anything.
 //
-// The two schemas are deliberately asymmetric. An input schema is load-bearing
-// — it is what constrains the arguments a model may send — so a missing,
-// malformed, non-object, or over-bound one is an error: the tool is rejected
-// rather than exposed with unconstrained arguments. An output schema only
-// describes what comes back, so a malformed one is tolerated: it is dropped,
-// OutputSchema is left nil, and the defect is reported in Warnings. An
-// over-bound output schema is still an error — a bound is a bound.
+// The two schemas are deliberately asymmetric, because only one of them is
+// load-bearing. An input schema constrains the arguments a model may send, so
+// a missing, malformed, non-object, or over-bound one is an error: the tool is
+// rejected rather than exposed with unconstrained arguments (widening a
+// schema is never a safe fallback).
+//
+// An output schema is optional and only describes what comes back, so any
+// defect in one — malformed, non-object, or over a bound — is tolerated
+// identically: the schema is dropped, OutputSchema is left nil, and the
+// reason is reported in Warnings. Failing the tool instead would let a server
+// make an otherwise-usable tool unavailable by padding an optional field,
+// while protecting nothing that dropping does not already protect.
 func FromSDKTool(t *mcp.Tool, b Bounds) (ToolSpec, error) {
 	if t == nil {
 		return ToolSpec{}, fmt.Errorf("%w: tool", errNilInput)
@@ -72,14 +77,17 @@ func FromSDKTool(t *mcp.Tool, b Bounds) (ToolSpec, error) {
 	// An absent output schema is the norm, not a defect: no warning.
 	if !isAbsentSchema(t.OutputSchema) {
 		out, err := marshalSchema(t.OutputSchema)
+		if err == nil {
+			err = checkSchemaBounds(out, b)
+		}
 		if err != nil {
+			// Dropping already achieves what the bound exists for — the
+			// oversized document is not retained — so there is nothing left
+			// to protect by failing the tool as well.
 			spec.warn(fmt.Sprintf("output schema dropped: %v", err))
-			return spec, nil
+		} else {
+			spec.OutputSchema = out
 		}
-		if err := checkSchemaBounds(out, b); err != nil {
-			return ToolSpec{}, fmt.Errorf("protocol: tool %q output schema: %w", t.Name, err)
-		}
-		spec.OutputSchema = out
 	}
 	return spec, nil
 }
@@ -289,15 +297,39 @@ func fromSDKEmbeddedResource(v *mcp.EmbeddedResource, b Bounds) (Content, error)
 	}, nil
 }
 
-// unsupported measures a content item we will not retain. The size is its
-// marshaled form, which is the only thing we can report generically; a kind
-// that refuses to marshal reports 0 rather than failing.
+// unsupported measures a content item we will not retain — without
+// marshalling it. Rendering hostile data in full purely to count bytes we then
+// discard would allocate the entire payload we are refusing, which is the
+// opposite of what refusing it is for.
+//
+// For the kinds the SDK enumerates, the size is summed from the fields that
+// carry the item's weight; see UnsupportedContent.Bytes for what that number
+// promises. Binary items never reach here — they are refused at the call site
+// against their exact len(Data).
 func unsupported(kind string, c mcp.Content) UnsupportedContent {
-	n := 0
-	if raw, err := c.MarshalJSON(); err == nil {
-		n = len(raw)
+	return UnsupportedContent{Kind: kind, Bytes: unsupportedSize(c)}
+}
+
+func unsupportedSize(c mcp.Content) int {
+	switch v := c.(type) {
+	case *mcp.ResourceLink:
+		return len(v.URI) + len(v.Name) + len(v.Title) + len(v.Description) + len(v.MIMEType)
+	case *mcp.ToolUseContent:
+		return len(v.ID) + len(v.Name)
+	case *mcp.ToolResultContent:
+		return len(v.ToolUseID)
+	default:
+		// A kind this SDK version does not enumerate: no field can be named
+		// to size it, so its marshaled form is the only signal there is. This
+		// is unreachable with go-sdk v1.6.1 — every Content kind it defines is
+		// either converted natively or handled above — so the allocation is a
+		// forward-compatibility cost we only pay for a kind we do not know.
+		raw, err := c.MarshalJSON()
+		if err != nil {
+			return 0
+		}
+		return len(raw)
 	}
-	return UnsupportedContent{Kind: kind, Bytes: n}
 }
 
 // FromSDKContents converts a content list, additionally enforcing
