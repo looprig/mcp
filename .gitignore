@@ -1,0 +1,17 @@
+# Binaries and build output
+/bin/
+*.exe
+*.test
+*.out
+
+# Coverage
+*.coverprofile
+coverage.*
+
+# Nested worktree checkouts
+.worktrees/
+
+# Editor/OS noise
+.DS_Store
+
+# vendor/ is deliberately tracked (house convention) — do not ignore it.
