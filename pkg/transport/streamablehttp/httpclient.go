@@ -122,7 +122,7 @@ func vetTransport(c *http.Client, t Timeouts) (*http.Transport, error) {
 	// the caller set are only overwritten where this package promises a bound.
 	base.TLSHandshakeTimeout = t.TLSHandshake
 	base.ResponseHeaderTimeout = t.ResponseHeader
-	base.IdleConnTimeout = t.Idle
+	base.IdleConnTimeout = t.IdleConn
 	return base, nil
 }
 
@@ -140,7 +140,7 @@ func defaultTransport(t Timeouts) *http.Transport {
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   4,
-		IdleConnTimeout:       t.Idle,
+		IdleConnTimeout:       t.IdleConn,
 		TLSHandshakeTimeout:   t.TLSHandshake,
 		ResponseHeaderTimeout: t.ResponseHeader,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -164,7 +164,9 @@ type roundTripper struct {
 	wire     wireLimits
 	// request bounds a whole non-streaming exchange; see Timeouts.Request.
 	request time.Duration
-	diags   *diagnostics
+	// frame bounds one frame's arrival on a stream; see Timeouts.Frame.
+	frame time.Duration
+	diags *diagnostics
 }
 
 // RoundTrip implements http.RoundTripper.
@@ -255,16 +257,22 @@ func (rt *roundTripper) rejectCredentials(err error) error {
 // would work perfectly and then kill a healthy session in an hour, which is the
 // kind of bug that reaches production.
 func (rt *roundTripper) boundBody(resp *http.Response, cancel context.CancelFunc) io.ReadCloser {
-	var r io.Reader
+	body := resp.Body
 	if isEventStream(resp.Header.Get("Content-Type")) {
-		r = newFrameReader(resp.Body, rt.wire.maxFrame, rt.diags)
-	} else {
-		r = &recordingReader{
-			r:     limits.BoundedReader(resp.Body, rt.wire.maxBody),
-			diags: rt.diags,
-		}
+		// The frame clock closes the body to unblock a parked Read, so it is
+		// handed the body itself as its interrupt.
+		fr := newFrameReader(body, rt.wire.maxFrame, rt.diags, rt.frame, func() { _ = body.Close() })
+		return &boundedBody{Reader: fr, closer: body, cancel: cancel, stop: fr.close}
 	}
-	return &boundedBody{Reader: r, closer: resp.Body, cancel: cancel}
+	// A non-streaming body needs no clock of its own: it is the answer to a
+	// request, so it dies with that request's context — which every caller
+	// bounds, and which the DELETE gets from Timeouts.Request. The stream is the
+	// case with no such owner, which is why it is the case with the clock.
+	r := &recordingReader{
+		r:     limits.BoundedReader(body, rt.wire.maxBody),
+		diags: rt.diags,
+	}
+	return &boundedBody{Reader: r, closer: body, cancel: cancel}
 }
 
 // mayStream reports whether req's response could be an SSE stream.
@@ -299,6 +307,10 @@ type boundedBody struct {
 	// cancel releases the whole-request context, or is nil for a request that
 	// did not get one.
 	cancel context.CancelFunc
+	// stop releases the frame clock, or is nil for a body that has none. A
+	// timer left armed on a finished stream is a goroutine holding a body close
+	// aimed at whatever connection the pool hands out next.
+	stop func()
 }
 
 // Close closes the underlying body and releases the request's deadline.
@@ -307,6 +319,9 @@ type boundedBody struct {
 // does on some paths — must still release both, and only Close is guaranteed to
 // happen. It is safe to call twice; both halves are idempotent.
 func (b *boundedBody) Close() error {
+	if b.stop != nil {
+		b.stop()
+	}
 	err := b.closer.Close()
 	if b.cancel != nil {
 		b.cancel()
@@ -355,6 +370,23 @@ type diagnostics struct {
 	lastStatus int
 	authErr    error
 	limitErr   error
+	stallErr   error
+}
+
+// recordStallError keeps the first stalled frame. Like the others it is a
+// record of a cause, written where the cause was still a value.
+func (d *diagnostics) recordStallError(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stallErr == nil {
+		d.stallErr = err
+	}
+}
+
+func (d *diagnostics) stallError() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.stallErr
 }
 
 func (d *diagnostics) recordStatus(status int) {

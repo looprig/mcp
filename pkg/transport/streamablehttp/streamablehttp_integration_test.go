@@ -260,33 +260,58 @@ func TestToolCallRoundTrip(t *testing.T) {
 func TestToolCallIsNotRetried(t *testing.T) {
 	t.Parallel()
 
-	upstream := newFixtureServer(t, mcptest.Config{})
-	var calls atomic.Int64
-	proxy := newProxy(t, upstream, func(w http.ResponseWriter, r *http.Request, body []byte) bool {
-		if r.Method == http.MethodPost && bytes.Contains(body, []byte(`"tools/call"`)) {
-			calls.Add(1)
-			w.WriteHeader(http.StatusInternalServerError)
-			return true
-		}
-		return false
-	})
-
-	c := connectFixture(t, Config{Endpoint: proxy + "/mcp"})
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	if _, err := callTool(ctx, c, mcptest.ToolEcho, map[string]any{"text": "never arrives"}); err == nil {
-		t.Fatal("CallTool() succeeded against a 500, want a failure")
+	tests := []struct {
+		name   string
+		status int
+	}{
+		// 401 and 403 are the only statuses that reach the SDK's
+		// authorize-and-resend branch. They are the cases that would break the
+		// day someone wires OAuthHandler up, and a tool call is the payload
+		// where re-sending actually costs something — so they are tested here,
+		// against a real server, on a real call.
+		{name: "401", status: http.StatusUnauthorized},
+		{name: "403", status: http.StatusForbidden},
+		{name: "500", status: http.StatusInternalServerError},
+		{name: "429", status: http.StatusTooManyRequests},
+		{name: "503", status: http.StatusServiceUnavailable},
 	}
 
-	// Long enough for the SDK's jittered backoff — which starts at a second —
-	// to have produced a retry, if there were one to produce. Without the wait
-	// this test would pass against a retrying transport by finishing first.
-	time.Sleep(1500 * time.Millisecond)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
 
-	if n := calls.Load(); n != 1 {
-		t.Errorf("the server received %d tools/call POSTs, want exactly 1: a tool call must never be re-sent", n)
+			upstream := newFixtureServer(t, mcptest.Config{})
+			var calls atomic.Int64
+			// Only tools/call fails, so the handshake still succeeds and what is
+			// counted is the call itself.
+			proxy := newProxy(t, upstream, func(w http.ResponseWriter, r *http.Request, body []byte) bool {
+				if r.Method == http.MethodPost && bytes.Contains(body, []byte(`"tools/call"`)) {
+					calls.Add(1)
+					w.WriteHeader(tt.status)
+					return true
+				}
+				return false
+			})
+
+			c := connectFixture(t, Config{Endpoint: proxy + "/mcp"})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+
+			if _, err := callTool(ctx, c, mcptest.ToolEcho, map[string]any{"text": "never arrives"}); err == nil {
+				t.Fatalf("CallTool() succeeded against a %d, want a failure", tt.status)
+			}
+
+			// Long enough for the SDK's jittered backoff — which starts at a
+			// second — to have produced a retry, if there were one to produce.
+			// Without the wait this test would pass against a retrying transport
+			// by finishing first.
+			time.Sleep(1500 * time.Millisecond)
+
+			if n := calls.Load(); n != 1 {
+				t.Errorf("the server received %d tools/call POSTs, want exactly 1: a tool call must never be re-sent", n)
+			}
+		})
 	}
 }
 

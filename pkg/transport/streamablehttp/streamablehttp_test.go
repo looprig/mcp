@@ -18,8 +18,10 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -280,6 +282,219 @@ func TestNoSecretsWhenTheServerIsUnreachable(t *testing.T) {
 	}
 }
 
+// TestRedirectsThatLeaveTheOriginAreRefused is the credential-leak case, and it
+// is the one where this transport was, briefly, strictly worse than the
+// http.Client it wraps.
+//
+// http.Client strips Authorization when a redirect crosses origins. This
+// package's RoundTripper runs below that logic and attaches credentials to every
+// request it sees — so without CheckRedirect it puts the stripped header back,
+// and hands the bearer token to whoever the 302 names. The subtests cover both
+// facets: the credential must not travel, and the hop must not reach a host New
+// itself would refuse.
+func TestRedirectsThatLeaveTheOriginAreRefused(t *testing.T) {
+	t.Parallel()
+
+	// newEvil returns a server that records the Authorization it was given, and
+	// the origin to redirect to — spelled with a different hostname for the same
+	// address, which is a different origin to the stdlib and to this package.
+	newEvil := func(t *testing.T) (*atomic.Value, string) {
+		t.Helper()
+		var saw atomic.Value
+		saw.Store("")
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			saw.Store(r.Header.Get("Authorization"))
+			w.WriteHeader(http.StatusOK)
+		}))
+		t.Cleanup(srv.Close)
+		return &saw, strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	}
+
+	t.Run("the credential does not follow a cross-origin redirect", func(t *testing.T) {
+		t.Parallel()
+
+		saw, evil := newEvil(t)
+		legit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, evil+"/mcp", http.StatusFound)
+		}))
+		t.Cleanup(legit.Close)
+
+		f := newFactory(t, Config{
+			Endpoint: legit.URL + "/mcp",
+			Auth:     staticProvider{auth.NewHeader("Authorization", "Bearer "+secret)},
+		})
+		err := initializeExpectingFailure(t, f)
+
+		if got := saw.Load().(string); got != "" {
+			t.Errorf("the redirect target saw Authorization = %q; a credential must never leave its origin", got)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Errorf("the error leaked the credential: %v", err)
+		}
+	})
+
+	t.Run("a redirect to a host New would refuse is not followed", func(t *testing.T) {
+		t.Parallel()
+
+		// The exact URL New rejects at config time: cleartext, non-loopback.
+		const forbidden = "http://nonloopback.invalid/mcp"
+		if _, err := New(Config{Endpoint: forbidden}); err == nil {
+			t.Fatalf("New(%q) was accepted; this test assumes it is refused", forbidden)
+		}
+
+		var reached atomic.Bool
+		legit := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reached.Store(true)
+			http.Redirect(w, r, forbidden, http.StatusFound)
+		}))
+		t.Cleanup(legit.Close)
+
+		f := newFactory(t, Config{Endpoint: legit.URL + "/mcp"})
+		err := initializeExpectingFailure(t, f)
+
+		if !reached.Load() {
+			t.Fatal("the endpoint was never reached; the test proved nothing")
+		}
+		// Config time and run time must agree: what New refuses, a 302 must not
+		// smuggle in.
+		if !strings.Contains(err.Error(), "refusing a redirect") {
+			t.Errorf("error = %q, want a refusal to follow the redirect", err)
+		}
+		if strings.Contains(err.Error(), "lookup") || strings.Contains(err.Error(), "no such host") {
+			t.Errorf("error = %q: the transport tried to resolve the forbidden host, so it followed the redirect", err)
+		}
+	})
+
+	t.Run("a same-origin redirect is followed", func(t *testing.T) {
+		t.Parallel()
+
+		// Same origin, different path: an ordinary thing for a server to do, and
+		// the credential is not going anywhere new. Refusing this would be a
+		// policy that breaks real servers for no gain.
+		var mu sync.Mutex
+		var paths []string
+		var auths []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			paths = append(paths, r.URL.Path)
+			auths = append(auths, r.Header.Get("Authorization"))
+			mu.Unlock()
+			if r.URL.Path == "/mcp" {
+				http.Redirect(w, r, "/mcp/v2", http.StatusFound)
+				return
+			}
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		t.Cleanup(srv.Close)
+
+		f := newFactory(t, Config{
+			Endpoint: srv.URL + "/mcp",
+			Auth:     staticProvider{auth.NewHeader("Authorization", "Bearer "+secret)},
+		})
+		initializeExpectingFailure(t, f)
+
+		mu.Lock()
+		defer mu.Unlock()
+		if !slices.Contains(paths, "/mcp/v2") {
+			t.Errorf("paths = %v, want the same-origin redirect to have been followed to /mcp/v2", paths)
+		}
+		for i, a := range auths {
+			if a != "Bearer "+secret {
+				t.Errorf("request %d (%s) carried Authorization = %q, want the credential: it never left its origin", i, paths[i], a)
+			}
+		}
+	})
+
+	t.Run("a redirect loop is bounded", func(t *testing.T) {
+		t.Parallel()
+
+		// POSTs only: the connection also makes a DELETE at close, which is a
+		// separate request with a redirect budget of its own. Counting both
+		// would measure the number of requests rather than the hop bound.
+		var hops atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				hops.Add(1)
+			}
+			// Same origin, so the origin check passes and only the hop bound can
+			// stop this — which is why the hop bound is not redundant with it.
+			http.Redirect(w, r, "/mcp?n="+fmt.Sprint(hops.Load()), http.StatusTemporaryRedirect)
+		}))
+		t.Cleanup(srv.Close)
+
+		f := newFactory(t, Config{Endpoint: srv.URL + "/mcp"})
+		initializeExpectingFailure(t, f)
+
+		// The client makes the first request, then follows at most maxRedirects-1
+		// more before CheckRedirect refuses the next: maxRedirects requests reach
+		// the server. What matters is that the number is finite and small.
+		if n := hops.Load(); n > maxRedirects {
+			t.Errorf("the server saw %d POST hops, want at most %d: a redirect loop must be bounded", n, maxRedirects)
+		}
+		if hops.Load() == 0 {
+			t.Error("the server saw no POSTs; the test proved nothing")
+		}
+	})
+}
+
+// TestStallingStreamIsBounded is the slowloris case: a server that satisfies
+// every other bound and then simply stops.
+//
+// It flushes its headers at once, which disarms ResponseHeaderTimeout, and then
+// dribbles bytes without ever completing a frame. No byte limit catches this in
+// useful time (a byte every two seconds against a four-mebibyte cap is about
+// ninety-seven days), and the standalone SSE stream has no caller deadline to
+// fall back on. Only the frame clock ends it.
+func TestStallingStreamIsBounded(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		// A frame that starts and never finishes.
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+			if _, err := io.WriteString(w, "d"); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	f := newFactory(t, Config{Endpoint: srv.URL, Timeouts: Timeouts{Frame: 250 * time.Millisecond}})
+	c, err := f.Connect(context.Background(), testConnectConfig())
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer func() { _ = c.Close(context.Background()) }()
+
+	done := make(chan error, 1)
+	go func() {
+		// No deadline of its own: the frame clock is the only thing that can end
+		// this, which is the whole point of the test.
+		_, err := c.Initialize(context.Background())
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("Initialize() succeeded against a stalling server")
+		}
+		if !strings.Contains(err.Error(), "stalled") {
+			t.Errorf("error = %q, want it to name the stall", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Initialize() hung: a server that dribbles bytes without completing a frame is not bounded")
+	}
+}
+
 func TestDefaultTransportIsTLSSafe(t *testing.T) {
 	t.Parallel()
 
@@ -518,8 +733,15 @@ func TestCallIsNeverRetried(t *testing.T) {
 		name   string
 		status int
 	}{
-		// 500, 502, 503, 504 and 429 are the statuses the SDK treats as
-		// transient — which is exactly the set a retrying client would retry.
+		// The transient set the SDK recognizes (500, 502, 503, 504, 429), plus
+		// the two that reach its authorize-and-resend branch.
+		// 401 and 403 first: they are the ONLY statuses that reach the SDK's
+		// re-send branch, which fires when OAuthHandler is non-nil. They are
+		// therefore the cases that would break the instant someone "adds OAuth
+		// support" by setting that field — which is exactly the plausible future
+		// change this test exists to stop.
+		{name: "401", status: http.StatusUnauthorized},
+		{name: "403", status: http.StatusForbidden},
 		{name: "500", status: http.StatusInternalServerError},
 		{name: "502", status: http.StatusBadGateway},
 		{name: "503", status: http.StatusServiceUnavailable},
@@ -842,7 +1064,8 @@ func TestTimeoutsWithDefaults(t *testing.T) {
 		Dial:           DefaultDialTimeout,
 		TLSHandshake:   DefaultTLSHandshakeTimeout,
 		ResponseHeader: DefaultResponseHeaderTimeout,
-		Idle:           DefaultIdleConnTimeout,
+		Frame:          DefaultFrameTimeout,
+		IdleConn:       DefaultIdleConnTimeout,
 		Request:        DefaultRequestTimeout,
 	}
 	if got != want {
@@ -850,7 +1073,7 @@ func TestTimeoutsWithDefaults(t *testing.T) {
 	}
 
 	// A set field is never replaced.
-	set := Timeouts{Dial: time.Second, TLSHandshake: 2 * time.Second, ResponseHeader: 3 * time.Second, Idle: 4 * time.Second, Request: 5 * time.Second}
+	set := Timeouts{Dial: time.Second, TLSHandshake: 2 * time.Second, ResponseHeader: 3 * time.Second, Frame: 4 * time.Second, IdleConn: 5 * time.Second, Request: 6 * time.Second}
 	if got := set.withDefaults(); got != set {
 		t.Errorf("withDefaults() overwrote a set value: got %+v, want %+v", got, set)
 	}

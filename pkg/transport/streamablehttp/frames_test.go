@@ -123,7 +123,7 @@ func TestFrameReader(t *testing.T) {
 			t.Parallel()
 
 			d := &diagnostics{}
-			got, err := readAll(newFrameReader(strings.NewReader(tt.input), tt.limit, d))
+			got, err := readAll(newFrameReader(strings.NewReader(tt.input), tt.limit, d, 0, nil))
 
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("read error = %v, wantErr %v (read %d bytes)", err, tt.wantErr, len(got))
@@ -164,7 +164,7 @@ func TestFrameReader(t *testing.T) {
 func TestFrameReaderErrorIsSticky(t *testing.T) {
 	t.Parallel()
 
-	r := newFrameReader(strings.NewReader(strings.Repeat("x", 512)+"\n\ndata: ok\n\n"), 16, &diagnostics{})
+	r := newFrameReader(strings.NewReader(strings.Repeat("x", 512)+"\n\ndata: ok\n\n"), 16, &diagnostics{}, 0, nil)
 	if _, err := readAll(r); err == nil {
 		t.Fatal("read succeeded past the bound")
 	}
@@ -185,7 +185,7 @@ func TestFrameReaderSplitCRLF(t *testing.T) {
 
 	// One frame, well over the bound, whose every CRLF is split across a read.
 	body := "data: " + strings.Repeat("x", 256) + "\r\n" + "data: " + strings.Repeat("y", 256) + "\r\n\r\n"
-	r := newFrameReader(&crSplitter{s: body}, 64, &diagnostics{})
+	r := newFrameReader(&crSplitter{s: body}, 64, &diagnostics{}, 0, nil)
 	if got, err := readAll(r); err == nil {
 		t.Errorf("read %d bytes without error; a split CRLF must not reset the frame budget", len(got))
 	}
@@ -210,7 +210,7 @@ func TestFrameReaderCountsEveryByte(t *testing.T) {
 		t.Fatalf("the fixture is %d bytes, which does not exceed the %d byte bound", len(body), limit)
 	}
 
-	got, err := readAll(newFrameReader(strings.NewReader(body), limit, &diagnostics{}))
+	got, err := readAll(newFrameReader(strings.NewReader(body), limit, &diagnostics{}, 0, nil))
 	if err == nil {
 		t.Fatalf("read all %d bytes of a %d byte frame without error; the bound was %d — "+
 			"line terminators must be counted", len(got), len(body), limit)
@@ -250,7 +250,7 @@ func TestNewFrameReaderRejectsANonPositiveBound(t *testing.T) {
 					t.Errorf("newFrameReader(_, %d, _) did not panic; a bound that cannot bound is a bug at the call site", limit)
 				}
 			}()
-			newFrameReader(strings.NewReader(""), limit, &diagnostics{})
+			newFrameReader(strings.NewReader(""), limit, &diagnostics{}, 0, nil)
 		}()
 	}
 }

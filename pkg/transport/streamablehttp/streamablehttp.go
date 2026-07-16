@@ -45,11 +45,21 @@
 //
 // The server is untrusted and remote, which makes it strictly worse than the
 // stdio child: it is anonymous until TLS says otherwise, it can hold a stream
-// open forever, and it can answer a small request with an unbounded body. So
-// TLS is verified always, cleartext is refused to anything but loopback, every
-// response body is bounded before it is buffered, and every stream is bounded
-// per frame — because a total on a stream that is designed to live for a
-// session is not a limit, it is an expiry date.
+// open forever, it can answer a small request with an unbounded body, and it can
+// tell this client to go somewhere else. So TLS is verified always, cleartext is
+// refused to anything but loopback, every response body is bounded before it is
+// buffered, every stream is bounded per frame — because a total on a stream that
+// is designed to live for a session is not a limit, it is an expiry date — and
+// every frame is on a clock, because a server that starts a message and stops is
+// otherwise a socket held forever.
+//
+// A redirect that leaves the configured origin is refused outright, credential
+// or no credential. This one is worth stating plainly because getting it wrong
+// makes this package *worse* than the http.Client underneath it: the stdlib
+// strips Authorization across origins, and a transport that attaches
+// credentials in a RoundTripper — as this one does, so that they can be
+// refreshed per request — runs below that logic and would put the header back.
+// See checkRedirect.
 package streamablehttp
 
 import (
@@ -133,6 +143,16 @@ type Config struct {
 	// hold for a caller's client too, and the caller's client is not mutated. A
 	// non-zero Timeout is refused: it is a deadline on a whole exchange, and it
 	// would sever the streams this transport is built on.
+	//
+	// The default client honors the proxy environment (HTTP_PROXY, HTTPS_PROXY,
+	// NO_PROXY), as http.DefaultTransport and pkg/auth do. That is worth knowing
+	// for a transport this deliberate about what may see a credential: those
+	// variables can route this traffic through a host the endpoint does not
+	// name. It stays the default because it is what every Go HTTP client does
+	// and operators rely on it, and because the exposure is narrow — an https
+	// endpoint stays end-to-end encrypted through a proxy's CONNECT, so the
+	// proxy sees the host but not the credential, and loopback is exempt.
+	// Supply an HTTPClient whose transport sets Proxy: nil to opt out.
 	HTTPClient *http.Client
 	// Timeouts bounds the network. Zero fields select their defaults.
 	Timeouts Timeouts
@@ -146,8 +166,13 @@ type Config struct {
 // which for this transport means killing the SSE stream a session is listening
 // on, and killing a long tool call that is answering exactly as intended. Those
 // two are bounded where the knowledge is: ResponseHeader catches a server that
-// is not answering, and the caller's context bounds the call, which is what the
-// client's own Timeouts.Request already sets.
+// is not answering, the caller's context bounds the call (which is what the
+// client's own Timeouts.Request sets), and Frame catches the case neither of
+// those sees — a server that answers, starts a message, and stops.
+//
+// Between them the bounds cover a request end to end: getting a socket (Dial,
+// TLSHandshake), getting an answer (ResponseHeader), getting each message of it
+// (Frame), and letting go (Request, IdleConn).
 type Timeouts struct {
 	// Dial bounds the TCP connect. Zero means DefaultDialTimeout.
 	Dial time.Duration
@@ -159,9 +184,26 @@ type Timeouts struct {
 	// and then says nothing — it stops before the body, so it costs a stream
 	// nothing. Zero means DefaultResponseHeaderTimeout.
 	ResponseHeader time.Duration
-	// Idle bounds how long a pooled connection is kept alive unused. Zero means
+	// Frame bounds how long one wire frame may take to arrive, measured from
+	// its first byte to its last. Zero means DefaultFrameTimeout.
+	//
+	// This is the "idle timeout" the transport needs, expressed in the only
+	// unit that means anything for a stream that is idle by design. A bound on
+	// silence would be wrong: a healthy SSE stream says nothing for hours at a
+	// time, and cutting it off for that would break the sessions it is meant to
+	// protect. Silence inside a frame the server has already begun is the thing
+	// that is never legitimate, and that is what this bounds — see frames.go.
+	//
+	// It is a completion deadline and not an idle one, deliberately: a deadline
+	// that any byte resets is a deadline a server dribbling one byte at a time
+	// never trips, which is the attack. A frame that legitimately needs longer
+	// than this is a very large frame on a very slow link; raise it.
+	Frame time.Duration
+	// IdleConn bounds how long a pooled connection is kept alive unused. It is
+	// about sockets this transport is not using; for the bound on a server that
+	// has gone quiet mid-message, see Frame. Zero means
 	// DefaultIdleConnTimeout.
-	Idle time.Duration
+	IdleConn time.Duration
 	// Request bounds a whole request that cannot stream — in practice the DELETE
 	// that ends the session at Close, which is the one request this transport
 	// makes whose response is not, and cannot become, a stream. Zero means
@@ -188,6 +230,11 @@ const (
 	// generous because a legitimate tool call can be slow to start answering,
 	// and a server that has said nothing for this long is not going to.
 	DefaultResponseHeaderTimeout = 30 * time.Second
+	// DefaultFrameTimeout bounds one frame's arrival. It is generous enough for
+	// a large result over a poor link — the frame cap is a few mebibytes, and a
+	// minute of it is a floor of tens of kilobytes a second — and short enough
+	// that a server which has stopped mid-message is noticed the same minute.
+	DefaultFrameTimeout = 60 * time.Second
 	// DefaultIdleConnTimeout bounds an unused pooled connection.
 	DefaultIdleConnTimeout = 90 * time.Second
 	// DefaultRequestTimeout bounds a whole non-streaming request — the DELETE
@@ -211,7 +258,8 @@ func (t Timeouts) withDefaults() Timeouts {
 		Dial:           pick(t.Dial, DefaultDialTimeout),
 		TLSHandshake:   pick(t.TLSHandshake, DefaultTLSHandshakeTimeout),
 		ResponseHeader: pick(t.ResponseHeader, DefaultResponseHeaderTimeout),
-		Idle:           pick(t.Idle, DefaultIdleConnTimeout),
+		Frame:          pick(t.Frame, DefaultFrameTimeout),
+		IdleConn:       pick(t.IdleConn, DefaultIdleConnTimeout),
 		Request:        pick(t.Request, DefaultRequestTimeout),
 	}
 }
@@ -226,7 +274,8 @@ func (t Timeouts) validate() error {
 		{"Timeouts.Dial", t.Dial},
 		{"Timeouts.TLSHandshake", t.TLSHandshake},
 		{"Timeouts.ResponseHeader", t.ResponseHeader},
-		{"Timeouts.Idle", t.Idle},
+		{"Timeouts.Frame", t.Frame},
+		{"Timeouts.IdleConn", t.IdleConn},
 		{"Timeouts.Request", t.Request},
 	} {
 		if f.value < 0 {
@@ -402,15 +451,72 @@ func (f *factory) httpClient(d *diagnostics, w wireLimits) *http.Client {
 		// No Timeout, by design: see Timeouts. The bounds live on the transport
 		// underneath and in the RoundTripper, where a stream can be told apart
 		// from an exchange.
+		CheckRedirect: f.checkRedirect,
 		Transport: &roundTripper{
 			base:     f.base,
 			headers:  f.headers,
 			provider: f.provider,
 			wire:     w,
 			request:  f.times.Request,
+			frame:    f.times.Frame,
 			diags:    d,
 		},
 	}
+}
+
+// maxRedirects bounds a redirect chain. Even a same-origin chain is bounded: a
+// server that bounces a request between two of its own paths forever is a hang,
+// and a hang is what every bound in this package exists to prevent.
+const maxRedirects = 5
+
+// checkRedirect refuses any redirect that leaves the configured origin.
+//
+// This is not a hardening nicety; without it this transport is strictly worse
+// than the http.Client it wraps. The stdlib strips Authorization when a redirect
+// crosses origins — and then this package's RoundTripper, which runs *below*
+// that logic and attaches credentials to every request it sees, puts it back. A
+// 302 from a configured endpoint to an attacker's host would hand over the
+// bearer token, in cleartext if the redirect said http. A test proves both
+// halves, because the failure is invisible from the happy path.
+//
+// The policy is origin-pinning, and it is deliberately stricter than the
+// scheme check pkg/auth's defaultHTTPClient applies to its own flows:
+//
+//   - An MCP endpoint is configuration. The caller named one server; a server
+//     that answers "I am actually over there" is not a redirect to follow, it is
+//     a different server, and only the caller can decide to talk to it.
+//   - The credential is keyed by origin. auth.Key binds a token to the origin it
+//     was minted for, so sending it to another origin is incoherent by
+//     construction — whatever the scheme, whatever the trust.
+//   - Allowing cross-origin https "because TLS" would still send a token for
+//     server A to server B. The scheme is not what makes that wrong.
+//
+// So same-origin redirects pass — "/mcp" to "/mcp/" is an ordinary thing for a
+// server to do, and the credential is not going anywhere new — and everything
+// else is refused. Refusing costs a caller nothing but an explicit config
+// change, which is the point: it makes the move deliberate.
+//
+// Canonicalization is auth.CanonicalOrigin, the same function New validated the
+// endpoint with, which is what makes config time and run time agree. A hop to a
+// non-loopback http host does not need its own check: it fails to match the
+// origin, and would fail CanonicalOrigin too.
+func (f *factory) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("stopped after %d redirects", maxRedirects)
+	}
+	origin, err := auth.CanonicalOrigin(req.URL.String())
+	if err != nil {
+		// The URL is not repeated: a redirect target is server-controlled and a
+		// query string is a place tokens live. The auth error is already
+		// bounded, normalized and secret-free.
+		return fmt.Errorf("refusing a redirect to an unusable URL: %s", err.Error())
+	}
+	if origin != f.origin {
+		// Origins are not secret and naming both is the whole diagnostic.
+		return fmt.Errorf("refusing a redirect from %s to %s: an MCP endpoint's origin is configuration, "+
+			"and a credential minted for one origin is never sent to another", f.origin, origin)
+	}
+	return nil
 }
 
 // conn is one MCP session over Streamable HTTP.
@@ -490,6 +596,14 @@ func (c *conn) classify(ctx context.Context, op string, err error) error {
 	if lerr := c.diags.limitError(); lerr != nil {
 		return client.NewError(client.FailureLimitExceeded, "", op,
 			"the streamable HTTP server's response exceeded a limit: "+lerr.Error(), lerr)
+	}
+
+	// A server that started a message and stopped. It is reported ahead of the
+	// status for the reason the limit is: whatever the response line said, the
+	// stream is what ended the session.
+	if serr := c.diags.stallError(); serr != nil {
+		return client.NewError(client.FailureServerProtocol, "", op,
+			"the streamable HTTP server stalled mid-frame: "+serr.Error(), serr)
 	}
 
 	if status, ok := c.diags.status(); ok {
