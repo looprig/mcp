@@ -413,6 +413,94 @@ func TestMachineWatchReentrant(t *testing.T) {
 	}
 }
 
+// TestMachineWatchPanicDoesNotWedge pins the fault-isolation contract: one
+// watcher panicking must not deny other watchers their notification, must not
+// wedge the drainer, and must not swallow the panic.
+func TestMachineWatchPanicDoesNotWedge(t *testing.T) {
+	t.Parallel()
+
+	m := NewMachine()
+	var seen []change
+	// Registered FIRST, so a drainer that abandons the delivery loop on panic
+	// would starve the well-behaved watcher registered after it.
+	m.Watch(func(_, _ State) { panic("watcher boom") })
+	m.Watch(func(from, to State) { seen = append(seen, change{from, to}) })
+
+	// toRecoveringPanic runs To and reports whether a watcher panic escaped.
+	toRecoveringPanic := func(next State) (panicked bool) {
+		defer func() {
+			if r := recover(); r != nil {
+				panicked = true
+			}
+		}()
+		if err := m.To(next); err != nil {
+			t.Errorf("To(%v) = %v, want nil", next, err)
+		}
+		return false
+	}
+
+	if !toRecoveringPanic(StateStarting) {
+		t.Fatalf("To(starting) swallowed the watcher panic, want it propagated")
+	}
+	if got := m.State(); got != StateStarting {
+		t.Fatalf("State() = %v, want %v (state must commit despite the panic)", got, StateStarting)
+	}
+	// The machine must still be usable: a wedged drainer would accept this
+	// transition and silently notify nobody.
+	if !toRecoveringPanic(StateReady) {
+		t.Fatalf("To(ready) swallowed the watcher panic, want it propagated")
+	}
+	if got := m.State(); got != StateReady {
+		t.Fatalf("State() = %v, want %v", got, StateReady)
+	}
+
+	want := []change{{StateConfigured, StateStarting}, {StateStarting, StateReady}}
+	if !equalChanges(seen, want) {
+		t.Errorf("well-behaved watcher saw %v, want %v (machine wedged or watcher starved by the panicking one)", seen, want)
+	}
+}
+
+// TestMachineWatchPanicDeliversPending proves a panic mid-drain does not drop
+// changes already committed by a reentrant To — the "no change is ever
+// dropped" guarantee To documents.
+func TestMachineWatchPanicDeliversPending(t *testing.T) {
+	t.Parallel()
+
+	m := NewMachine()
+	var seen []change
+	// The first watcher enqueues a follow-on transition reentrantly (it is
+	// appended to pending, since this goroutine already owns the drain), the
+	// second panics, and the third records. The reentrant change must still be
+	// delivered after the panicking watcher is done.
+	var once bool
+	m.Watch(func(_, to State) {
+		if to == StateStarting && !once {
+			once = true
+			if err := m.To(StateReady); err != nil {
+				t.Errorf("reentrant To(ready) = %v, want nil", err)
+			}
+		}
+	})
+	m.Watch(func(_, _ State) { panic("watcher boom") })
+	m.Watch(func(from, to State) { seen = append(seen, change{from, to}) })
+
+	func() {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Errorf("To(starting) swallowed the watcher panic, want it propagated")
+			}
+		}()
+		if err := m.To(StateStarting); err != nil {
+			t.Errorf("To(starting) = %v, want nil", err)
+		}
+	}()
+
+	want := []change{{StateConfigured, StateStarting}, {StateStarting, StateReady}}
+	if !equalChanges(seen, want) {
+		t.Errorf("watcher saw %v, want %v (pending change dropped by the panic)", seen, want)
+	}
+}
+
 func TestMachineConcurrentTo(t *testing.T) {
 	t.Parallel()
 

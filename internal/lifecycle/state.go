@@ -175,6 +175,13 @@ func (e *TransitionError) Error() string {
 // Machine is a binding's current lifecycle state, guarded for concurrent use,
 // with change notification for registered watchers. The zero value is not
 // usable; call NewMachine.
+//
+// A Machine has no notion of who owns a transition: any goroutine may move it,
+// and every To is judged against the state at that moment. Because shutdown is
+// reachable from every non-terminal state, a multi-step sequence such as
+// startup can be overtaken at any step by a concurrent close. Callers must
+// therefore treat a *TransitionError as a legitimate race outcome and unwind;
+// see To.
 type Machine struct {
 	mu       sync.Mutex
 	current  State
@@ -211,6 +218,20 @@ func (m *Machine) State() State {
 // or a state outside the declared range — in which case the current state is
 // unchanged.
 //
+// The legality check is against the CURRENT state, not against an expected
+// source state: To is not a compare-and-swap. A caller cannot assert that the
+// state it last observed still held, because another goroutine may have moved
+// the machine in between. Callers needing that guarantee must serialize their
+// own transitions.
+//
+// Consequently a *TransitionError from a step of an otherwise-correct sequence
+// (say discovering -> ready during startup) does not imply a bug in the
+// caller: it usually means someone else legally moved the machine first, and
+// since shutdown is reachable from every non-terminal state, that someone is
+// most often a concurrent close. The contract for such a caller is to treat
+// the error as "my sequence has been overtaken", abandon the remaining steps,
+// and unwind — not to retry, force the state, or panic.
+//
 // On success the new state is committed before any watcher is notified, and
 // notifications are delivered without holding the machine's lock, so a
 // callback may call back into the machine.
@@ -223,6 +244,11 @@ func (m *Machine) State() State {
 // delivery to that goroutine — no change is ever dropped. This is also what
 // makes a To call from inside a callback safe: it commits and returns, and the
 // callback's own delivery loop notifies afterwards.
+//
+// If a watcher panics, the panic is re-raised to the caller of To once every
+// watcher and pending change has been delivered, so the machine is left
+// consistent and usable. When several watchers panic on one drain, only the
+// first value propagates.
 func (m *Machine) To(next State) error {
 	m.mu.Lock()
 
@@ -240,6 +266,30 @@ func (m *Machine) To(next State) error {
 		return nil
 	}
 	m.draining = true
+	if p := m.drain(); p != nil {
+		panic(p.value)
+	}
+	return nil
+}
+
+// drain delivers every pending change to the watchers, then hands ownership of
+// delivery back. The caller must hold m.mu with m.draining already set; drain
+// returns with m.mu released and m.draining cleared, whatever the watchers do.
+//
+// A panicking watcher must not corrupt the machine, so each callback is
+// isolated: a panic is recovered, the remaining watchers and pending changes
+// are still delivered, and the first recovered value is returned for the
+// caller to re-raise. Abandoning the loop instead would clear neither
+// m.draining (wedging every later To into the early return above, silently
+// notifying nobody) nor m.pending (dropping changes other goroutines committed
+// and already returned nil for).
+func (m *Machine) drain() *watcherPanic {
+	defer func() {
+		m.draining = false
+		m.mu.Unlock()
+	}()
+
+	var first *watcherPanic
 	for len(m.pending) > 0 {
 		c := m.pending[0]
 		m.pending = slices.Delete(m.pending, 0, 1)
@@ -249,12 +299,32 @@ func (m *Machine) To(next State) error {
 		snapshot := slices.Clone(m.watchers)
 		m.mu.Unlock()
 		for _, w := range snapshot {
-			w.fn(c.from, c.to)
+			if p := notify(w, c); p != nil && first == nil {
+				first = p
+			}
 		}
 		m.mu.Lock()
 	}
-	m.draining = false
-	m.mu.Unlock()
+	return first
+}
+
+// watcherPanic carries a value recovered from a panicking watcher so it can be
+// re-raised once the machine is consistent again. recover is typed any by the
+// language; the value is never inspected or passed on, only re-panicked, so it
+// is not narrowed to a domain type.
+type watcherPanic struct {
+	value any
+}
+
+// notify invokes w for change c, converting a panic into a returned value so
+// one bad watcher cannot abort delivery to the others.
+func notify(w *watcher, c change) (p *watcherPanic) {
+	defer func() {
+		if r := recover(); r != nil {
+			p = &watcherPanic{value: r}
+		}
+	}()
+	w.fn(c.from, c.to)
 	return nil
 }
 
@@ -265,6 +335,19 @@ func (m *Machine) To(next State) error {
 // committed, and never while the machine's lock is held — fn may safely call
 // State (or To; see that method) on the machine. fn runs on the goroutine
 // performing delivery and blocks further notification, so it must not block.
+// A panic in fn is isolated: the other watchers still receive the change, and
+// the value is re-raised to the caller of To (see that method).
+//
+// Registration is NOT a snapshot of the current state. Watchers are resolved
+// when a change's delivery BEGINS, not when it was committed, so a watcher
+// registered after a transition committed but before its delivery began still
+// receives it — possible whenever registration races an in-flight drain. A
+// caller that seeds its own view from State and then calls Watch may therefore
+// be told about a change it has already accounted for, and must tolerate the
+// repeat rather than assume every delivery is news. (Registering during a
+// change's delivery — from another watcher's callback — is the other side of
+// the same rule: that watcher misses the in-flight change and starts at the
+// next one.)
 //
 // cancel is idempotent and safe to call concurrently. Once it returns, fn will
 // not be invoked for any notification whose delivery starts afterwards; a
