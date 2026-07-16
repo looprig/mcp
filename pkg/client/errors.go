@@ -16,11 +16,6 @@ import (
 	"unicode/utf8"
 )
 
-// Name identifies a server binding (the configured name a server is mounted
-// under). Validation arrives with Definition in a later task; until then any
-// string value is carried as-is.
-type Name string
-
 // FailureClass classifies a failure so callers can branch on what went wrong
 // without parsing error text. The zero value is not a valid class.
 type FailureClass uint8
