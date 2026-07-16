@@ -131,14 +131,35 @@ func (s *Session) Close(ctx context.Context) error {
 	}
 }
 
+// errNotInitialized reports a request made before the handshake settled. It is
+// a caller bug: every method other than Initialize and Close needs a live
+// session, and the client only issues them from a state the handshake produced.
+var errNotInitialized = errors.New("protocol: session is not initialized")
+
+// established returns the live SDK session, or an error if there is none.
+//
+// Every request method funnels through it, so "the session went away" is
+// reported once, as a typed error, rather than as a nil dereference on whatever
+// goroutine happened to make the call. Close nils nothing, so a session closed
+// concurrently with a call still reaches the SDK, which reports the closure
+// itself — that is the SDK's race to lose, and it loses it with an error.
+func (s *Session) established() (*mcp.ClientSession, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cs == nil {
+		return nil, errNotInitialized
+	}
+	return s.cs, nil
+}
+
 // SDKSession returns the underlying SDK session, or nil before Initialize.
 //
 // It is an escape hatch for the packages inside this module that are allowed to
 // speak SDK (see the leak guard's allowlist) and is not, and must not become, a
 // way around this package's conversions: everything a caller above the boundary
-// consumes still arrives as a neutral, bounded type. The later tasks that add
-// tools, prompts and resources add converted methods to Session; until then this
-// is what lets a transport's own tests drive real MCP traffic over it.
+// consumes still arrives as a neutral, bounded type. It is what lets a
+// transport's own tests drive real MCP traffic, and it dies with the task that
+// gives them converted call methods to use instead.
 func (s *Session) SDKSession() *mcp.ClientSession {
 	s.mu.Lock()
 	defer s.mu.Unlock()

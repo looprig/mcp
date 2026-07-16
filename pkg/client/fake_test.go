@@ -6,6 +6,8 @@ package client
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -26,6 +28,21 @@ type fakeConn struct {
 	closeErr error
 	closes   atomic.Int32
 	inits    atomic.Int32
+
+	// The catalog this conn serves. Each family is a single page unless
+	// toolPages is set, which scripts tools/list page by page (indexed by the
+	// cursor "p<n>", as the discovery tests do).
+	tools     []protocol.ToolSpec
+	prompts   []protocol.PromptSpec
+	resources []protocol.ResourceSpec
+	templates []protocol.ResourceTemplateSpec
+	toolPages []protocol.ToolPage
+
+	// listErr, when set, fails tools/list — the discovery failure a Client has
+	// to unwind from.
+	listErr error
+	// lists counts every list call.
+	lists atomic.Int32
 }
 
 func (c *fakeConn) Initialize(ctx context.Context) (protocol.InitializeResult, error) {
@@ -46,6 +63,41 @@ func (c *fakeConn) Initialize(ctx context.Context) (protocol.InitializeResult, e
 func (c *fakeConn) Close(_ context.Context) error {
 	c.closes.Add(1)
 	return c.closeErr
+}
+
+func (c *fakeConn) ListTools(_ context.Context, cursor string) (protocol.ToolPage, error) {
+	c.lists.Add(1)
+	if c.listErr != nil {
+		return protocol.ToolPage{}, c.listErr
+	}
+	if c.toolPages != nil {
+		i := 0
+		if cursor != "" {
+			if _, err := fmt.Sscanf(cursor, "p%d", &i); err != nil {
+				return protocol.ToolPage{}, fmt.Errorf("fake: unroutable cursor %q", cursor)
+			}
+		}
+		if i >= len(c.toolPages) {
+			return protocol.ToolPage{}, fmt.Errorf("fake: no page %d", i)
+		}
+		return c.toolPages[i], nil
+	}
+	return protocol.ToolPage{Tools: c.tools}, nil
+}
+
+func (c *fakeConn) ListPrompts(context.Context, string) (protocol.PromptPage, error) {
+	c.lists.Add(1)
+	return protocol.PromptPage{Prompts: c.prompts}, nil
+}
+
+func (c *fakeConn) ListResources(context.Context, string) (protocol.ResourcePage, error) {
+	c.lists.Add(1)
+	return protocol.ResourcePage{Resources: c.resources}, nil
+}
+
+func (c *fakeConn) ListResourceTemplates(context.Context, string) (protocol.ResourceTemplatePage, error) {
+	c.lists.Add(1)
+	return protocol.ResourceTemplatePage{Templates: c.templates}, nil
 }
 
 // closeCount reports how many times Close reached the conn.
@@ -122,13 +174,27 @@ func (t *fakeTransport) connectCalls() int {
 	return t.calls
 }
 
-// okConn returns a conn whose Initialize succeeds with a representative result.
+// okConn returns a conn whose Initialize succeeds with a representative result
+// and which serves a small, valid catalog — enough for startup to get through
+// discovery and reach ready.
 func okConn() *fakeConn {
-	return &fakeConn{initResult: protocol.InitializeResult{
-		Server:          protocol.ServerIdentity{Name: "srv", Version: "1.2.3", Title: "Test Server"},
-		ProtocolVersion: "2025-06-18",
-		Capabilities:    protocol.ServerCapabilities{Tools: true},
-	}}
+	return &fakeConn{
+		initResult: protocol.InitializeResult{
+			Server:          protocol.ServerIdentity{Name: "srv", Version: "1.2.3", Title: "Test Server"},
+			ProtocolVersion: "2025-06-18",
+			Capabilities:    protocol.ServerCapabilities{Tools: true},
+		},
+		tools: []protocol.ToolSpec{fakeTool("echo")},
+	}
+}
+
+// fakeTool is a minimal well-formed tool spec.
+func fakeTool(name string) protocol.ToolSpec {
+	return protocol.ToolSpec{
+		RawName:     name,
+		Description: name + " tool",
+		InputSchema: json.RawMessage(`{"type":"object"}`),
+	}
 }
 
 // okDefinition returns a minimal valid Definition wired to tr.

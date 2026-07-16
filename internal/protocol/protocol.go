@@ -25,12 +25,29 @@ import (
 // connection. Close is idempotent from the caller's point of view — the client
 // guarantees it calls it at most once — and must never panic on a connection
 // that was never initialized.
+// A Conn's request methods must only be called between a successful Initialize
+// and Close; they report an error otherwise rather than panicking. None of them
+// checks whether the server advertised the capability behind the method — that
+// is the caller's decision (see the design's compatibility rule) and this
+// interface would have to guess at a policy to enforce it.
 type Conn interface {
 	// Initialize performs the MCP handshake and reports what the server said
 	// about itself. Everything in the result is server-supplied and untrusted;
 	// implementations bound it against the ConnectConfig Bounds before
 	// returning it.
 	Initialize(ctx context.Context) (InitializeResult, error)
+
+	// ListTools fetches one page of tools. cursor is empty for the first page,
+	// and otherwise the preceding page's NextCursor. Paginating — and bounding
+	// the pagination — is the caller's job; see internal/catalog.
+	ListTools(ctx context.Context, cursor string) (ToolPage, error)
+	// ListPrompts fetches one page of prompts.
+	ListPrompts(ctx context.Context, cursor string) (PromptPage, error)
+	// ListResources fetches one page of concrete resources.
+	ListResources(ctx context.Context, cursor string) (ResourcePage, error)
+	// ListResourceTemplates fetches one page of resource templates.
+	ListResourceTemplates(ctx context.Context, cursor string) (ResourceTemplatePage, error)
+
 	// Close releases the connection's resources.
 	Close(ctx context.Context) error
 }

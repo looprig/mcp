@@ -64,6 +64,11 @@ const (
 	opConnect    = "connect"
 	opInitialize = "initialize"
 	opClose      = "close"
+	// The catalog list operations, named as they appear in an error.
+	opListTools             = "list_tools"
+	opListPrompts           = "list_prompts"
+	opListResources         = "list_resources"
+	opListResourceTemplates = "list_resource_templates"
 )
 
 // DefaultStderrLimit is the stderr capture size used when Config.StderrLimit is
@@ -539,6 +544,52 @@ func (c *conn) Initialize(ctx context.Context) (protocol.InitializeResult, error
 		return protocol.InitializeResult{}, c.classify(ctx, opInitialize, err)
 	}
 	return res, nil
+}
+
+// The catalog list methods. Each is a straight delegation to the session, with
+// the transport's own classification applied to a failure: only this layer can
+// tell "the server spoke badly" from "the child process is gone", and a list that
+// fails during discovery must be classified the same way a handshake would be.
+//
+// The four are generated through listVia rather than written out because they
+// differ only in the method they call — and a hand-written fourth copy is where
+// the classification would eventually go missing.
+
+// ListTools fetches one page of tools.
+func (c *conn) ListTools(ctx context.Context, cursor string) (protocol.ToolPage, error) {
+	return listVia(ctx, c, opListTools, cursor, c.session.ListTools)
+}
+
+// ListPrompts fetches one page of prompts.
+func (c *conn) ListPrompts(ctx context.Context, cursor string) (protocol.PromptPage, error) {
+	return listVia(ctx, c, opListPrompts, cursor, c.session.ListPrompts)
+}
+
+// ListResources fetches one page of resources.
+func (c *conn) ListResources(ctx context.Context, cursor string) (protocol.ResourcePage, error) {
+	return listVia(ctx, c, opListResources, cursor, c.session.ListResources)
+}
+
+// ListResourceTemplates fetches one page of resource templates.
+func (c *conn) ListResourceTemplates(ctx context.Context, cursor string) (protocol.ResourceTemplatePage, error) {
+	return listVia(ctx, c, opListResourceTemplates, cursor, c.session.ListResourceTemplates)
+}
+
+// listVia runs one list method and classifies its failure. The page type is the
+// only thing that varies, so it is the only type parameter.
+func listVia[P any](
+	ctx context.Context,
+	c *conn,
+	op string,
+	cursor string,
+	fetch func(context.Context, string) (P, error),
+) (P, error) {
+	page, err := fetch(ctx, cursor)
+	if err != nil {
+		var zero P
+		return zero, c.classify(ctx, op, err)
+	}
+	return page, nil
 }
 
 // classify turns a session failure into a typed error, distinguishing the two
