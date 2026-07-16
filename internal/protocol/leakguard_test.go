@@ -67,6 +67,15 @@ var sdkImportAllowlist = map[string]struct{}{
 	// The SDK <-> neutral conversion layer. The only such site today.
 	modulePath + "/internal/protocol": {},
 
+	// The fixture MCP *server* the transport tests run as a subprocess, and the
+	// command that serves it. They are on the SDK's other side: a real server
+	// built on the SDK's server API, so that the transports are tested against
+	// MCP rather than against our idea of it. Neither is imported by anything
+	// that ships, and neither is a pkg/... package, so nothing they name can
+	// reach a consumer.
+	modulePath + "/internal/mcptest":             {},
+	modulePath + "/internal/mcptest/cmd/fixture": {},
+
 	// Transports (Tasks 2.x). Each wraps an SDK transport implementation.
 	modulePath + "/pkg/transport/stdio":          {},
 	modulePath + "/pkg/transport/streamablehttp": {},
