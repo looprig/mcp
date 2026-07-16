@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -930,6 +931,47 @@ func TestStderrTailIsBounded(t *testing.T) {
 	}
 	if len(body) > ringBytes {
 		t.Errorf("the tail carries %d bytes of the server's chatter, want at most the ring's %d", len(body), ringBytes)
+	}
+}
+
+// TestReapedProcessIsNeverSignalled checks the guard that stands between this
+// transport and a recycled pid: once Wait has reaped the child, its pid is the
+// kernel's to hand out again, and the group signal — a raw kill(-pid) with no
+// post-reap guard of its own — must not be sent.
+//
+// The osProcess here has no started process, which is what makes the assertion
+// legible: reaching the signalling path at all fails ("no process to signal"),
+// so a reaped process returning nil can only mean it never got there. The
+// unreaped row proves that — without the flag, this same value does try, and
+// does fail. The race the flag exists for is not reproducible on demand; the
+// flag's effect on the two states it has is.
+func TestReapedProcessIsNeverSignalled(t *testing.T) {
+	t.Parallel()
+	ops := []struct {
+		name string
+		call func(*osProcess) error
+	}{
+		{name: "Terminate", call: (*osProcess).Terminate},
+		{name: "Kill", call: (*osProcess).Kill},
+	}
+	tests := []struct {
+		name    string
+		reaped  bool
+		wantErr bool
+	}{
+		{name: "reaped: the signal is never attempted", reaped: true, wantErr: false},
+		{name: "not reaped: the signal is attempted", reaped: false, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, op := range ops {
+				p := &osProcess{cmd: &exec.Cmd{}, reaped: tt.reaped}
+				if err := op.call(p); (err != nil) != tt.wantErr {
+					t.Errorf("%s() error = %v, wantErr %v", op.name, err, tt.wantErr)
+				}
+			}
+		})
 	}
 }
 
