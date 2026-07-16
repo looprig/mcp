@@ -12,6 +12,7 @@ package stdio
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -900,8 +901,9 @@ func backgroundCtx() (context.Context, context.CancelFunc) {
 // message unbounded, and that the tail is what survives.
 func TestStderrTailIsBounded(t *testing.T) {
 	t.Parallel()
+	const ringBytes = 128
 	c := &conn{
-		stderr:      newRing(128),
+		stderr:      newRing(ringBytes),
 		times:       fastTimings(),
 		exited:      make(chan struct{}),
 		stderrDrain: make(chan struct{}),
@@ -915,11 +917,19 @@ func TestStderrTailIsBounded(t *testing.T) {
 	if !strings.Contains(tail, "the last thing it said") {
 		t.Errorf("tail = %q, want the end of stderr", tail)
 	}
-	if len(tail) > 128+len(": stderr tail (99999 earlier bytes dropped): ") {
-		t.Errorf("tail is %d bytes, want it bounded by the ring", len(tail))
+
+	// The message is a known prefix followed by the ring's contents, so the
+	// bound is computed rather than allowed for: the prefix is built from the
+	// drop count the ring actually reports, and the text after it is what has
+	// to fit in the ring. An eyeballed fudge factor for the prefix would let
+	// the assertion go slack by a digit every time the count grew one.
+	wantPrefix := fmt.Sprintf(": stderr tail (%d earlier bytes dropped): ", c.stderr.Dropped())
+	body, ok := strings.CutPrefix(tail, wantPrefix)
+	if !ok {
+		t.Fatalf("tail = %q, want it to start with %q: the message must admit that earlier bytes were dropped", tail, wantPrefix)
 	}
-	if !strings.Contains(tail, "dropped") {
-		t.Errorf("tail = %q, want it to admit that earlier bytes were dropped", tail)
+	if len(body) > ringBytes {
+		t.Errorf("the tail carries %d bytes of the server's chatter, want at most the ring's %d", len(body), ringBytes)
 	}
 }
 

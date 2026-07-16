@@ -1,4 +1,4 @@
-.PHONY: test fmt fmt-check vendor vendor-check lint vuln secure
+.PHONY: test test-integration fmt fmt-check vendor vendor-check lint vuln secure
 
 # Module's own package dirs, excluding vendor/ and the nested .worktrees/ modules
 # (go list ./... stops at nested module boundaries and skips vendor). Empty while
@@ -13,6 +13,16 @@ export GOFLAGS := -mod=vendor
 
 test:
 	@if [ -n "$(GO_DIRS)" ]; then go test -race ./...; fi
+
+# The tagged tests: real subprocesses, real pipes, real MCP servers. Kept out of
+# `test` (and therefore out of `secure`) on purpose — they exec children and are
+# slower than a unit run, and the gate developers hit on every commit should
+# stay fast. CI runs both: `make secure test` and `make test-integration`.
+#
+# -count=1 defeats the test cache: a cached pass here would be a claim about a
+# process that was never started.
+test-integration:
+	@if [ -n "$(GO_DIRS)" ]; then go test -tags integration -race -count=1 ./...; fi
 
 # Format the whole module in place.
 fmt:

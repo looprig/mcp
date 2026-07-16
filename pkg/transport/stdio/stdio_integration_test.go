@@ -18,11 +18,13 @@
 package stdio
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -498,6 +500,94 @@ func TestCloseTerminatesTheChildAndItsGroup(t *testing.T) {
 	if err := c.Close(ctx); err != nil {
 		t.Errorf("second Close() error = %v, want nil", err)
 	}
+}
+
+// TestCloseReapsTheChildsChildren is the claim TestCloseTerminatesTheChildAndItsGroup
+// cannot make. That test's group has exactly one member, so it would pass
+// against a transport that had never heard of process groups: a plain kill of
+// the leader satisfies every assertion in it. The reason Setpgid exists is the
+// server that spawns something — a language runtime's worker, a wrapper
+// script's real payload — and an orphan like that holds the pipes it inherited
+// long after the server it belonged to is gone.
+//
+// So this starts a child that starts a child, and asks the kernel about the
+// grandchild after Close. It is the only test here that would notice
+// Setpgid being dropped.
+//
+// The shell is the test fixture, not the transport's doing. A grandchild has to
+// come from somewhere, and /bin/sh is the portable way to spawn one; the
+// transport still receives an explicit argv — Command "/bin/sh", Args
+// ["-c", script] — and execs it directly, exactly as it would any other
+// program. Nothing here interprets a command string, and the no-shell rule this
+// transport enforces is about what it does with a *caller's* command, which is
+// unchanged: see TestArgsReachTheChildUninterpreted, which proves it.
+func TestCloseReapsTheChildsChildren(t *testing.T) {
+	t.Parallel()
+	const probe = "/bin/sh"
+	if _, err := os.Stat(probe); err != nil {
+		t.Skipf("no %s on this host: %v", probe, err)
+	}
+
+	// The background sleep is the grandchild; it prints its pid and outlives
+	// the script's own sleep by design. Both sleeps are far longer than this
+	// test, so neither can end on its own and pass the test by accident.
+	const script = "sleep 300 & echo $!; sleep 300"
+	f := newFixtureFactory(t, Config{Command: probe, Args: []string{"-c", script}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	got, err := f.Connect(ctx, testConnectConfig())
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	c := got.(*conn)
+	pid := c.proc.Pid()
+
+	// The probe is not an MCP server, so stdout is nobody else's: no session has
+	// been initialized, and reading the pid off the pipe is safe.
+	line, err := bufio.NewReader(c.stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("reading the grandchild's pid: %v", err)
+	}
+	gcpid, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatalf("the probe printed %q, want a pid: %v", line, err)
+	}
+
+	// Both must be running, or the test proves nothing about what Close ended.
+	if !processAlive(pid) {
+		t.Fatalf("the child (pid %d) is not running before Close", pid)
+	}
+	if !processAlive(gcpid) {
+		t.Fatalf("the grandchild (pid %d) is not running before Close", gcpid)
+	}
+	// The grandchild is in the child's group — inherited, not arranged — which
+	// is what makes one signal reach both.
+	gcpgid, err := syscall.Getpgid(gcpid)
+	if err != nil {
+		t.Fatalf("Getpgid(%d) error = %v", gcpid, err)
+	}
+	if gcpgid != pid {
+		t.Fatalf("the grandchild's pgid = %d, want the child's pid %d: it is not in the group Close signals", gcpgid, pid)
+	}
+
+	closeCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer closeCancel()
+	if err := c.Close(closeCtx); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+
+	// The point of the test: the grandchild, which nothing ever signalled by
+	// name, is gone because its group was.
+	deadline := time.Now().Add(10 * time.Second)
+	for processAlive(gcpid) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the grandchild (pid %d) is still alive after Close: the transport killed the server it started and orphaned what the server started", gcpid)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	requireGone(t, pid)
 }
 
 // TestGracefulShutdownDoesNotYankStdin is the finding this transport is built

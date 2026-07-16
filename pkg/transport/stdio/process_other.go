@@ -6,6 +6,12 @@
 // them. A host that needs a hard boundary on such a platform supplies a
 // ProcessLauncher — a job object, a container — which is precisely why that
 // seam exists.
+//
+// Nothing here is covered by a test. This module is developed and tested on
+// unix, where this file does not build, and the process-lifetime tests it would
+// need ask the kernel questions (kill(pid, 0), process groups) that have no
+// equivalent on the platform this file exists for. Treat it as unverified until
+// it is run on such a host: it is a considered fallback, not a tested one.
 
 package stdio
 
