@@ -30,12 +30,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
-	"unsafe"
 
+	"github.com/looprig/mcp/internal/secrettest"
 	"github.com/looprig/mcp/pkg/auth"
 )
 
@@ -79,6 +78,7 @@ func secretValues(t *testing.T) map[string]any {
 
 	set := auth.NewTokenSet(canary, canary, time.Unix(1<<30, 0), []string{"read"})
 	header := auth.NewHeader("Authorization", "Bearer "+canary)
+	creds := auth.NewClientCredentials("client-id", canary)
 
 	store := auth.NewMemoryStore()
 	key := auth.Key{ServerOrigin: "https://a.example.com", ClientID: "cid"}
@@ -90,18 +90,22 @@ func secretValues(t *testing.T) map[string]any {
 		Note   string
 		Tokens auth.TokenSet
 		Header auth.Header
+		Creds  auth.ClientCredentials
 	}
 
 	return map[string]any{
-		"TokenSet":         set,
-		"TokenSet pointer": &set,
-		"Header":           header,
-		"Header pointer":   &header,
-		"[]TokenSet":       []auth.TokenSet{set},
-		"[]Header":         []auth.Header{header},
-		"map[Key]TokenSet": map[auth.Key]auth.TokenSet{key: set},
-		"wrapping struct":  wrapper{Note: "n", Tokens: set, Header: header},
-		"MemoryStore":      store,
+		"TokenSet":                  set,
+		"TokenSet pointer":          &set,
+		"Header":                    header,
+		"Header pointer":            &header,
+		"ClientCredentials":         creds,
+		"ClientCredentials pointer": &creds,
+		"[]TokenSet":                []auth.TokenSet{set},
+		"[]Header":                  []auth.Header{header},
+		"[]ClientCredentials":       []auth.ClientCredentials{creds},
+		"map[Key]TokenSet":          map[auth.Key]auth.TokenSet{key: set},
+		"wrapping struct":           wrapper{Note: "n", Tokens: set, Header: header, Creds: creds},
+		"MemoryStore":               store,
 	}
 }
 
@@ -173,8 +177,10 @@ func TestMarshalJSONRefuses(t *testing.T) {
 	}{
 		{name: "TokenSet", value: auth.NewTokenSet(canary, canary, time.Time{}, nil)},
 		{name: "Header", value: auth.NewHeader("Authorization", canary)},
+		{name: "ClientCredentials", value: auth.NewClientCredentials("id", canary)},
 		{name: "zero TokenSet", value: auth.TokenSet{}},
 		{name: "zero Header", value: auth.Header{}},
+		{name: "zero ClientCredentials", value: auth.ClientCredentials{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -279,79 +285,6 @@ func TestSecretsSurviveUnexportedFieldWrapper(t *testing.T) {
 	}
 }
 
-// unsafeDump walks v and renders everything it can reach, in the manner of
-// go-spew and of the structured loggers and debug dumpers built the same way:
-// it uses unsafe.Pointer + reflect.NewAt to rebuild unexported fields as
-// readable values, defeating CanInterface, and it follows pointers at any
-// depth. It deliberately ignores String/GoString/Format — a dumper's whole
-// purpose is to show what a value *is* rather than what it says it is.
-//
-// This is the adversary the secret closure exists for, reproduced here rather
-// than imported because go-spew is not a sanctioned dependency (and because a
-// hand-rolled 30 lines is clearer about what the threat actually does).
-func unsafeDump(v reflect.Value, depth int) string {
-	if depth > 8 || !v.IsValid() {
-		return "<stop>"
-	}
-	// Stop at time.Time. Not for tidiness: a timestamp cannot hold the canary,
-	// so walking in proves nothing, and walking in is actively unsafe — a
-	// time.Time carries a *time.Location, whose fields the standard library
-	// initializes lazily under a sync.Once. Reading them by reflection races
-	// with any parallel test that formats a time (slog stamps every record),
-	// which -race duly reports. The walker's business is this package's layout.
-	if v.Type() == reflect.TypeOf(time.Time{}) {
-		return "<time.Time>"
-	}
-	// The move that defeats CanInterface: re-create the value at its address.
-	if !v.CanInterface() && v.CanAddr() {
-		v = reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem() //nolint:gosec // test-only reflector, see doc
-	}
-	switch v.Kind() {
-	case reflect.Struct:
-		var b strings.Builder
-		b.WriteString(v.Type().String() + "{")
-		for i := range v.NumField() {
-			if i > 0 {
-				b.WriteString(", ")
-			}
-			b.WriteString(v.Type().Field(i).Name + ":" + unsafeDump(v.Field(i), depth+1))
-		}
-		b.WriteString("}")
-		return b.String()
-	case reflect.Pointer, reflect.Interface:
-		if v.IsNil() {
-			return "<nil>"
-		}
-		return "&" + unsafeDump(v.Elem(), depth+1)
-	case reflect.Slice, reflect.Array:
-		var b strings.Builder
-		b.WriteString("[")
-		for i := range v.Len() {
-			if i > 0 {
-				b.WriteString(" ")
-			}
-			b.WriteString(unsafeDump(v.Index(i), depth+1))
-		}
-		b.WriteString("]")
-		return b.String()
-	case reflect.Map:
-		var b strings.Builder
-		b.WriteString("map[")
-		for _, key := range v.MapKeys() {
-			b.WriteString(unsafeDump(key, depth+1) + ":" + unsafeDump(v.MapIndex(key), depth+1) + " ")
-		}
-		b.WriteString("]")
-		return b.String()
-	case reflect.String:
-		return v.String()
-	case reflect.Func:
-		// All a walker can do with a closure: report that it exists.
-		return fmt.Sprintf("func@%v", v.Pointer())
-	default:
-		return fmt.Sprintf("%v", v)
-	}
-}
-
 // This is the test that justifies the secret closure, and the only one that
 // does. Everything else in this file passes with the secrets held in a plain
 // *string, because fmt never dereferences a pointer to a string.
@@ -360,11 +293,18 @@ func unsafeDump(v reflect.Value, depth int) string {
 // Swap secret's closure for a *string and this test fails; that is precisely
 // its job, because the indirection reads as a pointless allocation to anyone
 // who has not met this failure.
+//
+// The walker itself lives in internal/secrettest, because the unexported
+// secret-bearing types added by the OAuth flow — the PKCE verifier, the CSRF
+// state, the authorization code — can only be reached from an internal test,
+// and one adversary tested from both sides beats two that can drift. See
+// oauth_internal_test.go for that half.
 func TestSecretsSurviveUnsafeReflection(t *testing.T) {
 	t.Parallel()
 
 	set := auth.NewTokenSet(canary, canary, time.Unix(1<<30, 0), []string{"read"})
 	header := auth.NewHeader("Authorization", "Bearer "+canary)
+	creds := auth.NewClientCredentials("client-id", canary)
 
 	store := auth.NewMemoryStore()
 	key := auth.Key{ServerOrigin: "https://a.example.com", ClientID: "cid"}
@@ -372,17 +312,34 @@ func TestSecretsSurviveUnsafeReflection(t *testing.T) {
 		t.Fatalf("Store() error = %v", err)
 	}
 
+	// A whole provider: the realistic worst case, since it transitively holds
+	// the client secret and a store full of tokens, and is exactly the kind of
+	// long-lived object an application keeps in a struct and dumps when
+	// something goes wrong.
+	provider, err := auth.NewOAuthProvider(auth.OAuthConfig{
+		ServerURL:   "https://a.example.com/mcp",
+		Credentials: creds,
+		Store:       store,
+		Browser:     refusingBrowser{},
+	})
+	if err != nil {
+		t.Fatalf("NewOAuthProvider() error = %v", err)
+	}
+
 	// The shapes a dumper realistically meets: the values themselves, a
 	// caller's private struct holding them, and a whole store.
 	type private struct {
 		set    auth.TokenSet
 		header auth.Header
+		creds  auth.ClientCredentials
 	}
 	subjects := map[string]any{
 		"TokenSet":                set,
 		"Header":                  header,
-		"private wrapper":         private{set: set, header: header},
+		"ClientCredentials":       creds,
+		"private wrapper":         private{set: set, header: header, creds: creds},
 		"MemoryStore":             store,
+		"OAuthProvider":           provider,
 		"slice of TokenSet":       []auth.TokenSet{set},
 		"map of Key to TokenSet":  map[auth.Key]auth.TokenSet{key: set},
 		"pointer to the TokenSet": &set,
@@ -390,20 +347,25 @@ func TestSecretsSurviveUnsafeReflection(t *testing.T) {
 	for name, subject := range subjects {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			// Address the value so the walker can rebuild unexported fields,
-			// which is what it would do to a field it found in a real struct.
-			holder := reflect.New(reflect.TypeOf(subject))
-			holder.Elem().Set(reflect.ValueOf(subject))
 
-			got := unsafeDump(holder.Elem(), 0)
+			got := secrettest.Dump(subject)
 			if strings.Contains(got, canary) {
 				t.Errorf("an unsafe reflection walker recovered the secret from %s: %s", name, got)
 			}
-			if !strings.Contains(got, "func@") && !strings.Contains(got, "keys:") {
+			if !secrettest.ReachedSecret(got) {
 				t.Errorf("walker never reached a secret in %s; the test proves nothing: %s", name, got)
 			}
 		})
 	}
+}
+
+// refusingBrowser is the BrowserOpener a headless service would supply: it
+// refuses rather than blocking on a human who is not there. These tests never
+// reach a browser, so refusing is also the assertion that they never do.
+type refusingBrowser struct{}
+
+func (refusingBrowser) OpenURL(context.Context, string) error {
+	return errors.New("refusingBrowser: no browser here")
 }
 
 // GoString is unreachable through fmt — Format is consulted before GoStringer,
@@ -451,6 +413,7 @@ func TestUnmarshalJSONRefuses(t *testing.T) {
 	}{
 		{name: "TokenSet", target: &auth.TokenSet{}},
 		{name: "Header", target: &auth.Header{}},
+		{name: "ClientCredentials", target: &auth.ClientCredentials{}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
