@@ -61,29 +61,36 @@ import (
 // this package produces.
 const Redacted = "[REDACTED]"
 
-// secret holds credential material inside a closure, behind a pointer.
+// secret holds credential material inside a closure.
 //
-// This is the layer that makes redaction unconditional rather than merely
-// thorough, and it is deliberate despite looking like a needless allocation.
-// Methods (Format, String, GoString) cover most of fmt, but three paths reach a
-// value without ever consulting them:
+// The closure looks like a needless allocation and is not. Its justification is
+// specifically NOT the standard library, so it is worth being exact, because
+// the plausible-sounding version of this comment is false and would get the
+// indirection deleted:
 //
-//   - %p and %w, which fmt resolves before it looks for Formatter;
-//   - any verb fmt cannot apply, which lands in badVerb — badVerb sets an
-//     erroring flag that suppresses method dispatch, then re-prints the value
-//     by reflection at depth zero, which is deep enough to follow a pointer;
-//   - a TokenSet or Header held in another struct's unexported field, which
-//     fmt reaches by reflection but cannot call a method on (CanInterface is
-//     false).
+//   - Against stdlib fmt, Format plus a plain string field is nearly enough,
+//     and any pointer field would finish the job. fmt's reflection follows a
+//     pointer only at depth 0 and only into an Array, Slice, Struct or Map, so
+//     even a *string is never dereferenced — the paths that skip methods (%p,
+//     %w, badVerb, and a value inside another struct's unexported field) all
+//     print an address. A `*string` here would sweep every verb clean. That is
+//     measured, not assumed: see TestSecretsSurviveUnexportedFieldWrapper.
+//   - The threat the closure answers is the reflection walkers that are not
+//     fmt: go-spew, and structured loggers and debug dumpers built the same
+//     way. They use unsafe.Pointer + reflect.NewAt to rebuild an unexported
+//     field as a readable value, which defeats CanInterface, and they follow
+//     pointers at any depth. Such a walker renders a *string field as the
+//     string. It renders this as `&auth.secret{reveal:func@0x...}`, because a
+//     closure's captured environment is not a field: the only way to the bytes
+//     is to call the func, and a walker cannot know to. Measured too, by
+//     TestSecretsSurviveUnsafeReflection, which fails if this becomes a
+//     *string.
 //
-// A plain string field prints the credential in full down all three. A pointer
-// to a string field closes the first and third but not badVerb, which follows
-// it. A closure closes all three, because the bytes live in the captured
-// environment: reflection sees a func value and renders it as an address. There
-// is nowhere for it to look.
+// So: the methods handle fmt, and this handles everything that reflects
+// harder than fmt does.
 //
 // A secret is immutable, so copying a TokenSet by value — which shares the
-// pointer — is safe, and the closure is never nil for a non-nil secret.
+// pointer — is safe, and reveal is never nil for a non-nil secret.
 type secret struct{ reveal func() string }
 
 // newSecret wraps v, or returns nil for the empty string so that "absent" has
@@ -415,7 +422,12 @@ func (t TokenSet) String() string {
 	)
 }
 
-// GoString renders redacted text for %#v and for direct callers.
+// GoString renders redacted text for a direct caller.
+//
+// It is not what serves %#v — Format is consulted before GoStringer, so fmt
+// never reaches this. It is kept as defense in depth: if Format is ever
+// removed, this becomes load-bearing again for %#v, and a caller invoking
+// GoString itself still gets redacted text.
 func (t TokenSet) GoString() string { return t.String() }
 
 // Format routes every fmt verb through the redacted rendering.
@@ -581,7 +593,8 @@ func (s *MemoryStore) String() string {
 	return fmt.Sprintf("auth.MemoryStore{keys:%d}", len(s.tokens))
 }
 
-// GoString makes %#v redacted too.
+// GoString renders redacted text for a direct caller; Format is what serves
+// %#v. See TokenSet.GoString.
 func (s *MemoryStore) GoString() string { return s.String() }
 
 // Format routes every fmt verb through the redacted rendering.

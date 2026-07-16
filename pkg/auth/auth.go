@@ -157,7 +157,8 @@ func (h Header) String() string {
 	return fmt.Sprintf("auth.Header{name:%s, value:%s}", name, presence(h.value))
 }
 
-// GoString renders redacted text for %#v and for direct callers.
+// GoString renders redacted text for a direct caller; Format is what serves
+// %#v. See TokenSet.GoString.
 func (h Header) GoString() string { return h.String() }
 
 // Format routes every fmt verb through the redacted rendering; see

@@ -30,9 +30,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/looprig/mcp/pkg/auth"
 )
@@ -240,16 +242,17 @@ func TestNoSecretsInLoggingPipelines(t *testing.T) {
 }
 
 // A secret-bearing value held in someone else's UNEXPORTED field is the case
-// that methods cannot defend: fmt reaches it by reflection but cannot call a
-// method on it (CanInterface is false), so Formatter, Stringer and GoStringer
-// are all skipped. It is also a realistic case — an application's own
-// credential manager keeping `set auth.TokenSet` as a private field, then
-// logging itself, is an obvious thing to write.
+// methods cannot defend: fmt reaches it by reflection but cannot call a method
+// on it (CanInterface is false), so Formatter, Stringer and GoStringer are all
+// skipped. It is also a realistic case — an application's own credential
+// manager keeping `set auth.TokenSet` as a private field, then logging itself,
+// is an obvious thing to write.
 //
-// It holds anyway, because the secrets sit behind a pointer and fmt renders a
-// nested pointer as an address rather than following it. This test is what
-// stops that indirection from being "refactored away" as a needless
-// allocation: delete it and this fails.
+// It holds because the secrets sit behind a pointer, which fmt renders as an
+// address rather than following. Note what this test does NOT prove: any
+// pointer passes it, including a *string. The closure earns its keep against
+// reflectors that are not fmt — see TestSecretsSurviveUnsafeReflection, which
+// is the test that actually pins it.
 func TestSecretsSurviveUnexportedFieldWrapper(t *testing.T) {
 	t.Parallel()
 
@@ -273,6 +276,167 @@ func TestSecretsSurviveUnexportedFieldWrapper(t *testing.T) {
 	slog.New(slog.NewTextHandler(&buf, nil)).Info("creds", "w", w)
 	if strings.Contains(buf.String(), canary) {
 		t.Errorf("slog leaked a wrapper's unexported secret fields: %s", buf.String())
+	}
+}
+
+// unsafeDump walks v and renders everything it can reach, in the manner of
+// go-spew and of the structured loggers and debug dumpers built the same way:
+// it uses unsafe.Pointer + reflect.NewAt to rebuild unexported fields as
+// readable values, defeating CanInterface, and it follows pointers at any
+// depth. It deliberately ignores String/GoString/Format — a dumper's whole
+// purpose is to show what a value *is* rather than what it says it is.
+//
+// This is the adversary the secret closure exists for, reproduced here rather
+// than imported because go-spew is not a sanctioned dependency (and because a
+// hand-rolled 30 lines is clearer about what the threat actually does).
+func unsafeDump(v reflect.Value, depth int) string {
+	if depth > 8 || !v.IsValid() {
+		return "<stop>"
+	}
+	// Stop at time.Time. Not for tidiness: a timestamp cannot hold the canary,
+	// so walking in proves nothing, and walking in is actively unsafe — a
+	// time.Time carries a *time.Location, whose fields the standard library
+	// initializes lazily under a sync.Once. Reading them by reflection races
+	// with any parallel test that formats a time (slog stamps every record),
+	// which -race duly reports. The walker's business is this package's layout.
+	if v.Type() == reflect.TypeOf(time.Time{}) {
+		return "<time.Time>"
+	}
+	// The move that defeats CanInterface: re-create the value at its address.
+	if !v.CanInterface() && v.CanAddr() {
+		v = reflect.NewAt(v.Type(), unsafe.Pointer(v.UnsafeAddr())).Elem() //nolint:gosec // test-only reflector, see doc
+	}
+	switch v.Kind() {
+	case reflect.Struct:
+		var b strings.Builder
+		b.WriteString(v.Type().String() + "{")
+		for i := range v.NumField() {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			b.WriteString(v.Type().Field(i).Name + ":" + unsafeDump(v.Field(i), depth+1))
+		}
+		b.WriteString("}")
+		return b.String()
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() {
+			return "<nil>"
+		}
+		return "&" + unsafeDump(v.Elem(), depth+1)
+	case reflect.Slice, reflect.Array:
+		var b strings.Builder
+		b.WriteString("[")
+		for i := range v.Len() {
+			if i > 0 {
+				b.WriteString(" ")
+			}
+			b.WriteString(unsafeDump(v.Index(i), depth+1))
+		}
+		b.WriteString("]")
+		return b.String()
+	case reflect.Map:
+		var b strings.Builder
+		b.WriteString("map[")
+		for _, key := range v.MapKeys() {
+			b.WriteString(unsafeDump(key, depth+1) + ":" + unsafeDump(v.MapIndex(key), depth+1) + " ")
+		}
+		b.WriteString("]")
+		return b.String()
+	case reflect.String:
+		return v.String()
+	case reflect.Func:
+		// All a walker can do with a closure: report that it exists.
+		return fmt.Sprintf("func@%v", v.Pointer())
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// This is the test that justifies the secret closure, and the only one that
+// does. Everything else in this file passes with the secrets held in a plain
+// *string, because fmt never dereferences a pointer to a string.
+//
+// A reflector that uses unsafe does dereference it, and prints the credential.
+// Swap secret's closure for a *string and this test fails; that is precisely
+// its job, because the indirection reads as a pointless allocation to anyone
+// who has not met this failure.
+func TestSecretsSurviveUnsafeReflection(t *testing.T) {
+	t.Parallel()
+
+	set := auth.NewTokenSet(canary, canary, time.Unix(1<<30, 0), []string{"read"})
+	header := auth.NewHeader("Authorization", "Bearer "+canary)
+
+	store := auth.NewMemoryStore()
+	key := auth.Key{ServerOrigin: "https://a.example.com", ClientID: "cid"}
+	if err := store.Store(context.Background(), key, set); err != nil {
+		t.Fatalf("Store() error = %v", err)
+	}
+
+	// The shapes a dumper realistically meets: the values themselves, a
+	// caller's private struct holding them, and a whole store.
+	type private struct {
+		set    auth.TokenSet
+		header auth.Header
+	}
+	subjects := map[string]any{
+		"TokenSet":                set,
+		"Header":                  header,
+		"private wrapper":         private{set: set, header: header},
+		"MemoryStore":             store,
+		"slice of TokenSet":       []auth.TokenSet{set},
+		"map of Key to TokenSet":  map[auth.Key]auth.TokenSet{key: set},
+		"pointer to the TokenSet": &set,
+	}
+	for name, subject := range subjects {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			// Address the value so the walker can rebuild unexported fields,
+			// which is what it would do to a field it found in a real struct.
+			holder := reflect.New(reflect.TypeOf(subject))
+			holder.Elem().Set(reflect.ValueOf(subject))
+
+			got := unsafeDump(holder.Elem(), 0)
+			if strings.Contains(got, canary) {
+				t.Errorf("an unsafe reflection walker recovered the secret from %s: %s", name, got)
+			}
+			if !strings.Contains(got, "func@") && !strings.Contains(got, "keys:") {
+				t.Errorf("walker never reached a secret in %s; the test proves nothing: %s", name, got)
+			}
+		})
+	}
+}
+
+// GoString is unreachable through fmt — Format is consulted before GoStringer,
+// so %#v never lands here — which is exactly why it needs a test of its own.
+// It is kept as defense in depth: if Format were ever removed, GoString would
+// silently become what serves %#v again, and it must already be correct when
+// that happens. An untested fallback is not a fallback.
+func TestGoStringRedactsForDirectCallers(t *testing.T) {
+	t.Parallel()
+
+	store := auth.NewMemoryStore()
+	if err := store.Store(context.Background(),
+		auth.Key{ServerOrigin: "https://a.example.com", ClientID: "cid"},
+		auth.NewTokenSet(canary, canary, time.Time{}, nil)); err != nil {
+		t.Fatalf("Store() error = %v", err)
+	}
+
+	subjects := map[string]fmt.GoStringer{
+		"TokenSet":    auth.NewTokenSet(canary, canary, time.Time{}, []string{"read"}),
+		"Header":      auth.NewHeader("Authorization", "Bearer "+canary),
+		"MemoryStore": store,
+	}
+	for name, subject := range subjects {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			got := subject.GoString()
+			if strings.Contains(got, canary) {
+				t.Errorf("%s.GoString() leaked the secret: %s", name, got)
+			}
+			if got == "" {
+				t.Errorf("%s.GoString() rendered empty", name)
+			}
+		})
 	}
 }
 

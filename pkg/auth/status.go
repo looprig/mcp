@@ -124,5 +124,7 @@ func StatusOf(set TokenSet, now time.Time) Status {
 	case set.Expired(now):
 		state = StateExpired
 	}
-	return NewStatus(state, set.Expiry(), set.Scopes(), "")
+	// set.scopes is cloned once, by NewStatus. Going through set.Scopes()
+	// would clone it a second time and throw the first copy away.
+	return NewStatus(state, set.Expiry(), set.scopes, "")
 }
