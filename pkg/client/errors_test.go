@@ -10,8 +10,10 @@ import (
 )
 
 // allClasses lists every declared FailureClass exactly once. Keep in sync with
-// the const block in errors.go; TestFailureClassString relies on it being
-// exhaustive and covers contiguity via the FailureShutdown count check.
+// the const block in errors.go; TestFailureClassString proves it is exhaustive
+// by comparing its length against failureClassSentinel, the unexported marker
+// that must remain the final const in the block — any class appended before
+// the sentinel bumps its value and fails the guard until it is listed here.
 var allClasses = []FailureClass{
 	FailureInvalidConfig,
 	FailureUnsupportedProtocol,
@@ -47,8 +49,8 @@ var allClasses = []FailureClass{
 func TestFailureClassString(t *testing.T) {
 	t.Parallel()
 
-	if got, want := int(FailureShutdown), len(allClasses); got != want {
-		t.Fatalf("FailureShutdown = %d, want %d (allClasses out of sync with const block)", got, want)
+	if got, want := int(failureClassSentinel)-1, len(allClasses); got != want {
+		t.Fatalf("declared class count = %d, want %d (allClasses out of sync with const block)", got, want)
 	}
 
 	snake := regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
@@ -85,7 +87,8 @@ func TestFailureClassStringUnknown(t *testing.T) {
 		class FailureClass
 	}{
 		{name: "zero value", class: FailureClass(0)},
-		{name: "past last declared", class: FailureShutdown + 1},
+		{name: "sentinel", class: failureClassSentinel},
+		{name: "past sentinel", class: failureClassSentinel + 1},
 		{name: "max uint8", class: FailureClass(255)},
 	}
 	for _, tt := range tests {

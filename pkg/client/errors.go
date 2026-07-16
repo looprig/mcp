@@ -1,10 +1,12 @@
 // Package client provides the MCP client surface for the looprig/mcp module.
 //
 // This file defines the typed error taxonomy every package in the module
-// classifies failures with. Operational errors never expose tokens, headers,
-// raw environment values, or unbounded server text: all message text carried
-// by Error is normalized and bounded at construction, and wrapped-error text
-// is only rendered — bounded — when no explicit message was provided.
+// classifies failures with. All message text carried by Error is normalized
+// and bounded at construction, and wrapped/server-derived text is rendered —
+// bounded and normalized — only when no explicit message was provided; an
+// explicit Msg fully suppresses it. Callers should supply an explicit Msg for
+// auth-adjacent failures rather than relying on redaction, since bounded
+// wrapped-error text is otherwise rendered verbatim.
 package client
 
 import (
@@ -55,6 +57,7 @@ const (
 	FailureSamplingOverBudget
 	FailureIndeterminate
 	FailureShutdown
+	failureClassSentinel // must remain last; used by tests for exhaustiveness
 )
 
 // String returns a stable lowercase snake_case identifier for the class.
