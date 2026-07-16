@@ -33,6 +33,39 @@
 // the stderr noise, any diagnostic — goes to stderr, and the SDK's own logger
 // defaults to discarding. A single stray byte on stdout corrupts the framing,
 // which is exactly the failure the stderr-noise mode exists to test for.
+//
+// # Shutdown: closing stdin is a stop, not a flush
+//
+// The MCP spec has the client shut a stdio server down by closing stdin. In
+// this SDK that is a hard stop, not a drain: the resulting read EOF puts the
+// connection into shutdown, and any reply not already written is dropped on
+// the floor. A client must therefore be quiescent — every reply it wants
+// already in hand — before it closes stdin. Otherwise it will observe a server
+// that "never answered", and the cause will look like the transport rather
+// than the shutdown.
+//
+// What decides the outcome is whether anything was still owed when the EOF
+// landed — not how the EOF was produced. Two cases, verified against this
+// fixture:
+//
+//   - EOF with replies outstanding (a pipe that ends right after its requests,
+//     a redirect from a file of requests, or an explicit close mid-request):
+//     the unwritten replies are dropped, the process exits 1, and stderr
+//     carries "fixture: serving: server is closing: EOF". The drop reaches all
+//     the way back: send initialize and close, and even *its* reply is lost —
+//     stdout ends up completely empty, which reads as a server that never
+//     spoke.
+//   - EOF with nothing outstanding (all replies written, or nothing ever
+//     asked — e.g. a redirect from /dev/null): the process exits 0 with empty
+//     stderr.
+//
+// The second case is what keeps a non-zero exit meaningful: a crash is
+// distinguishable from an ordinary shutdown only because an ordinary shutdown
+// is silent and zero.
+//
+// The exit code and the error text above are this fixture's, from the command
+// in cmd/fixture; the dropped-reply behavior underneath is the SDK's, and
+// applies to any stdio MCP server built on it.
 package mcptest
 
 import (
@@ -112,6 +145,17 @@ const elicitTimeout = 30 * time.Second
 // ElicitMessage is the prompt the initialize-time elicitation sends. Tests
 // match on it.
 const ElicitMessage = "fixture: confirm startup"
+
+// SlowCancelledMarker is written to stderr when the "slow" tool observes its
+// context being cancelled.
+//
+// It exists because server-side cancellation is otherwise invisible: the reply
+// to a cancelled request is discarded, so from the client there is nothing to
+// see, and a test that only measures its own deadline passes just as happily
+// against a handler that ignores ctx entirely. This marker is what makes "slow
+// honors cancellation" a falsifiable claim — which matters, because the
+// transport's cancellation and timeout tests are built on it.
+const SlowCancelledMarker = "MCPTEST-SLOW-CANCELLED"
 
 // Config is the fixture's complete configuration. The zero value is a valid,
 // minimal server: the four tools, no prompts, no resources, no instructions,
@@ -273,9 +317,15 @@ func addBaseTools(s *mcp.Server) {
 		defer t.Stop()
 		select {
 		case <-ctx.Done():
-			// The client cancelled or the session died. Report it as an error
-			// so a handler bug can never masquerade as a successful sleep;
-			// the SDK drops the reply if the request was cancelled.
+			// The client cancelled or the session died. Announce it on stderr
+			// before returning: the reply never reaches a cancelled caller, so
+			// this marker is the *only* evidence that the server noticed. A
+			// test asserting on it is asserting on the server's behavior; a
+			// test that merely watches its own deadline fire is asserting on
+			// nothing, because that happens whatever the server does.
+			fmt.Fprintln(os.Stderr, SlowCancelledMarker)
+			// Report it as an error too, so a handler bug can never masquerade
+			// as a successful sleep.
 			return nil, nil, ctx.Err()
 		case <-t.C:
 			return textResult(fmt.Sprintf("slept %dms", in.MS)), nil, nil

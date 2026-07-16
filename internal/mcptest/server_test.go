@@ -35,6 +35,10 @@ import (
 // fails with a message instead of the package timing out anonymously.
 const testTimeout = 60 * time.Second
 
+// intPtr lets a table case state an expected length of zero without it being
+// mistaken for "unset".
+func intPtr(n int) *int { return &n }
+
 // lockedBuffer collects a subprocess's stderr. os/exec writes to it from a
 // goroutine it owns, so the test cannot read it unguarded — under -race, that
 // is a failure, and without -race it is a lie.
@@ -246,23 +250,25 @@ func TestTools(t *testing.T) {
 		// Exactly one of these three says what the text must be: an exact
 		// match, a substring (for messages whose exact wording is not the
 		// contract), or a length (for results too big to compare).
+		//
+		// wantLen is a *int, not an int with a sentinel: 0 is a meaningful
+		// length, so any in-band "unset" value would make a case that forgot
+		// to set it silently assert len(got) == 0 instead of the text.
 		wantText     string
 		wantContains string
-		wantLen      int // when non-negative, the expected text length
+		wantLen      *int
 	}{
 		{
 			name:     "echo round-trips",
 			tool:     mcptest.ToolEcho,
 			args:     mcptest.EchoInput{Text: "hello, fixture"},
 			wantText: "hello, fixture",
-			wantLen:  -1,
 		},
 		{
 			name:     "echo of empty text",
 			tool:     mcptest.ToolEcho,
 			args:     mcptest.EchoInput{Text: ""},
 			wantText: "",
-			wantLen:  -1,
 		},
 		{
 			name:     "fail returns a tool error result",
@@ -270,7 +276,6 @@ func TestTools(t *testing.T) {
 			args:     mcptest.FailInput{},
 			wantErr:  true,
 			wantText: mcptest.DefaultFailMessage,
-			wantLen:  -1,
 		},
 		{
 			name:     "fail reports the given message",
@@ -278,19 +283,18 @@ func TestTools(t *testing.T) {
 			args:     mcptest.FailInput{Message: "boom"},
 			wantErr:  true,
 			wantText: "boom",
-			wantLen:  -1,
 		},
 		{
 			name:    "big returns the requested size",
 			tool:    mcptest.ToolBig,
 			args:    mcptest.BigInput{Bytes: 100_000},
-			wantLen: 100_000,
+			wantLen: intPtr(100_000),
 		},
 		{
 			name:    "big of zero bytes",
 			tool:    mcptest.ToolBig,
 			args:    mcptest.BigInput{Bytes: 0},
-			wantLen: 0,
+			wantLen: intPtr(0),
 		},
 		{
 			name:         "big beyond the cap is a tool error",
@@ -298,14 +302,12 @@ func TestTools(t *testing.T) {
 			args:         mcptest.BigInput{Bytes: mcptest.MaxBigBytes + 1},
 			wantErr:      true,
 			wantContains: "out of range",
-			wantLen:      -1,
 		},
 		{
 			name:     "slow with no delay replies",
 			tool:     mcptest.ToolSlow,
 			args:     mcptest.SlowInput{MS: 0},
 			wantText: "slept 0ms",
-			wantLen:  -1,
 		},
 		{
 			name:         "slow with a negative delay is a tool error",
@@ -313,7 +315,6 @@ func TestTools(t *testing.T) {
 			args:         mcptest.SlowInput{MS: -1},
 			wantErr:      true,
 			wantContains: "out of range",
-			wantLen:      -1,
 		},
 	}
 
@@ -328,9 +329,9 @@ func TestTools(t *testing.T) {
 			}
 			got := textOf(t, res)
 			switch {
-			case tt.wantLen >= 0:
-				if len(got) != tt.wantLen {
-					t.Errorf("len(text) = %d, want %d", len(got), tt.wantLen)
+			case tt.wantLen != nil:
+				if len(got) != *tt.wantLen {
+					t.Errorf("len(text) = %d, want %d", len(got), *tt.wantLen)
 				}
 			case tt.wantContains != "":
 				if !strings.Contains(got, tt.wantContains) {
@@ -377,28 +378,41 @@ func TestSlowRespectsCancellation(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	session, _ := connect(t, ctx, nil)
+	session, stderr := connect(t, ctx, nil)
 
-	// Long enough that returning early can only mean cancellation worked, and
-	// short enough that a broken cancellation fails inside testTimeout.
+	// The sleep is far longer than anything this test waits for, so the server
+	// can only stop sleeping by being told to.
 	callCtx, callCancel := context.WithTimeout(ctx, 200*time.Millisecond)
 	defer callCancel()
 
-	start := time.Now()
 	_, err := session.CallTool(callCtx, &mcp.CallToolParams{
 		Name:      mcptest.ToolSlow,
 		Arguments: mcptest.SlowInput{MS: 30_000},
 	})
-	elapsed := time.Since(start)
 
+	// The client side. Necessary, but on its own it proves nothing about the
+	// server: this deadline fires whether or not the fixture ever hears about
+	// it, which is exactly how a ctx-ignoring handler would pass.
 	if err == nil {
 		t.Fatal("CallTool returned nil error, want a cancellation error")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want context.DeadlineExceeded", err)
 	}
-	if elapsed > 10*time.Second {
-		t.Errorf("CallTool took %v to notice cancellation; the fixture is not honoring ctx", elapsed)
+
+	// The server side, and the actual claim under test: the fixture observed
+	// the cancellation and abandoned the sleep. The marker is the only
+	// evidence of it — the reply to a cancelled request is discarded.
+	//
+	// Polled rather than checked once: cancellation propagates over the wire,
+	// so the marker arrives shortly after CallTool returns, not before it.
+	deadline := time.Now().Add(10 * time.Second)
+	for !strings.Contains(stderr.String(), mcptest.SlowCancelledMarker) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the fixture never wrote %q: it did not observe the cancellation and is still sleeping.\nstderr: %q",
+				mcptest.SlowCancelledMarker, stderr.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	// The connection is still good: cancelling a request cancels a request.
@@ -705,11 +719,10 @@ func (c *rawClient) handshake(t *testing.T) string {
 
 // closeStdin ends the session the way the MCP spec says a client should.
 //
-// Closing stdin is a shutdown, not a flush: the server's connection treats the
-// resulting read EOF as "stop", and any reply it had not yet written is
-// dropped. A test must therefore read the replies it cares about *before*
-// calling this, or it will race the shutdown and conclude the server never
-// answered.
+// Read the replies you care about first. Closing stdin is a stop, not a flush,
+// and a reply not yet written is dropped — see "Shutdown: closing stdin is a
+// stop, not a flush" in the mcptest package doc for the full semantics and the
+// exit codes.
 func (c *rawClient) closeStdin(t *testing.T) {
 	t.Helper()
 	if err := c.stdin.Close(); err != nil {
