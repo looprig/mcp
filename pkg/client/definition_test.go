@@ -1,32 +1,20 @@
 package client
 
 import (
-	"context"
 	"errors"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/looprig/mcp/internal/protocol"
 )
 
-// fakeTransport is the minimal in-module TransportFactory used by tests.
-type fakeTransport struct{}
-
-func (fakeTransport) Kind() string           { return "stdio" }
-func (fakeTransport) RedactedOrigin() string { return "fake://origin" }
-
-func (fakeTransport) Connect(_ context.Context, _ protocol.ConnectConfig) (protocol.Conn, error) {
-	return nil, errors.New("fake transport does not connect")
-}
-
 // validDefinition returns a minimal Definition that passes Validate; tests
-// mutate single fields from this base.
+// mutate single fields from this base. The transport double lives in
+// fake_test.go, shared with the Connect tests.
 func validDefinition() Definition {
 	return Definition{
 		Name:      "srv-1",
-		Transport: fakeTransport{},
+		Transport: newFakeTransport(okConn()),
 	}
 }
 

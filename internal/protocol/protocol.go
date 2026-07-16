@@ -17,15 +17,89 @@ import (
 	"encoding/json"
 )
 
-// Conn is an established connection to an MCP server. Expanded by a later
-// task.
+// Conn is an established connection to an MCP server. A Conn is transport-
+// agnostic: everything it returns has already been converted to the neutral,
+// bounded types in this package, so no caller above it ever names an SDK type.
+//
+// A Conn is single-use for Initialize: the MCP handshake happens once per
+// connection. Close is idempotent from the caller's point of view — the client
+// guarantees it calls it at most once — and must never panic on a connection
+// that was never initialized.
 type Conn interface {
+	// Initialize performs the MCP handshake and reports what the server said
+	// about itself. Everything in the result is server-supplied and untrusted;
+	// implementations bound it against the ConnectConfig Bounds before
+	// returning it.
+	Initialize(ctx context.Context) (InitializeResult, error)
+	// Close releases the connection's resources.
 	Close(ctx context.Context) error
 }
 
-// ConnectConfig carries client-side connection parameters a transport needs.
-// Expanded by a later task.
-type ConnectConfig struct{}
+// ClientIdentity is what this client tells a server it is. It is cosmetic and
+// carries no authority; it must never carry a credential.
+type ClientIdentity struct {
+	Name    string
+	Version string
+	Title   string
+}
+
+// ClientCapabilities are the optional client-side capabilities to advertise on
+// a connection. The client only sets a field when the application both asked
+// for the capability and installed a handler able to serve it, so a transport
+// may advertise these verbatim.
+type ClientCapabilities struct {
+	Elicitation bool
+	Sampling    bool
+	Roots       bool
+}
+
+// ConnectConfig carries the client-side connection parameters a transport
+// needs. It is secret-free by construction: credentials reach a transport
+// through its own configuration, never through this struct.
+type ConnectConfig struct {
+	// Client identifies this client to the server.
+	Client ClientIdentity
+	// Capabilities are the client capabilities to advertise.
+	Capabilities ClientCapabilities
+	// Bounds caps everything the connection converts from server data. The
+	// client passes a normalized (all-positive) value.
+	Bounds Bounds
+}
+
+// ServerCapabilities is what a server advertised at initialize, reduced to the
+// presence flags this module acts on. The SDK models each capability as a
+// nillable struct whose only members are listChanged-style notification flags;
+// those are not modelled here until a task consumes them.
+type ServerCapabilities struct {
+	// Tools reports whether the server exposes tools.
+	Tools bool
+	// Prompts reports whether the server exposes prompts.
+	Prompts bool
+	// Resources reports whether the server exposes resources.
+	Resources bool
+	// ResourcesSubscribe reports whether the server supports subscribing to
+	// resource updates. It is only meaningful when Resources is set.
+	ResourcesSubscribe bool
+	// Logging reports whether the server sends log messages.
+	Logging bool
+	// Completions reports whether the server supports argument autocompletion.
+	Completions bool
+}
+
+// InitializeResult is the outcome of the MCP handshake, bounded and detached
+// from SDK memory. Every field is server-supplied: it describes a peer, it
+// never authorizes one.
+type InitializeResult struct {
+	// Server is what the server claims to be.
+	Server ServerIdentity
+	// ProtocolVersion is the version the server wants to speak.
+	ProtocolVersion ProtocolVersion
+	// Instructions is the server's usage hint, truncated to
+	// Bounds.MaxTextBytes.
+	Instructions string
+	// Capabilities is what the server advertised.
+	Capabilities ServerCapabilities
+}
 
 // ProtocolVersion is an MCP protocol version string as negotiated during
 // initialize (e.g. "2025-06-18"). It is server-supplied and untrusted.

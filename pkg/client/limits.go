@@ -8,6 +8,8 @@ package client
 import (
 	"fmt"
 	"time"
+
+	"github.com/looprig/mcp/internal/protocol"
 )
 
 // Default timeouts applied when the corresponding Timeouts field is zero.
@@ -157,6 +159,25 @@ func DefaultLimits() Limits {
 		MaxSamplingDepth:       2,
 		MaxSamplingConcurrency: 2,
 		MaxSamplingTokens:      8192,
+	}
+}
+
+// bounds projects the conversion-relevant limits onto the narrow view
+// internal/protocol needs. Call it on a normalized Limits: protocol treats a
+// non-positive bound as "reject everything", not "unbounded", so handing it a
+// zero field would fail closed on every conversion.
+//
+// The mapping is deliberately explicit rather than a shared struct: the client
+// bounds a connection, the protocol layer bounds a conversion, and only some of
+// the two overlap.
+func (l Limits) bounds() protocol.Bounds {
+	return protocol.Bounds{
+		MaxSchemaBytes:     l.MaxSchemaBytes,
+		MaxSchemaDepth:     l.MaxSchemaDepth,
+		MaxTextBytes:       l.MaxTextResultBytes,
+		MaxStructuredBytes: l.MaxStructuredBytes,
+		MaxBinaryItemBytes: l.MaxBinaryItemBytes,
+		MaxBinaryItems:     l.MaxBinaryItems,
 	}
 }
 
