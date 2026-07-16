@@ -84,6 +84,11 @@ func (b *boundedReader) Read(p []byte) (int, error) {
 // backslashes) do not count. The scan is a single O(1)-space byte pass — no
 // unmarshalling, no allocation proportional to input size.
 //
+// maxDepth <= 0 is not "unbounded": it rejects any input containing a
+// container (the first `{` or `[` takes depth to 1, already over the bound),
+// while bare scalars — depth 0 — still pass. Callers wanting to admit
+// containers must pass a positive bound.
+//
 // Validity is not this function's concern: malformed JSON never panics and
 // is judged only by the bracket depth it exhibits (fail-closed: unmatched
 // closers never reduce depth below zero, so stray opens still count).

@@ -237,6 +237,7 @@ func TestTruncateText(t *testing.T) {
 			want: "€", wantTruncated: true,
 		},
 		{name: "max zero", s: "abc", max: 0, want: "", wantTruncated: true},
+		{name: "max negative treated as zero", s: "abc", max: -5, want: "", wantTruncated: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -246,8 +247,11 @@ func TestTruncateText(t *testing.T) {
 				t.Fatalf("TruncateText(%q, %d) = (%q, %v), want (%q, %v)",
 					tt.s, tt.max, got, truncated, tt.want, tt.wantTruncated)
 			}
-			if len(got) > tt.max {
-				t.Errorf("result is %d bytes, exceeds max %d", len(got), tt.max)
+			// A negative max is documented as equivalent to 0, so the
+			// budget the result must respect is max clamped at zero.
+			budget := max(tt.max, 0)
+			if len(got) > budget {
+				t.Errorf("result is %d bytes, exceeds max %d", len(got), budget)
 			}
 			if !utf8.ValidString(got) {
 				t.Errorf("result %q is not valid UTF-8", got)
