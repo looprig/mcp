@@ -127,23 +127,39 @@ func TestFromSDKInitializeResult(t *testing.T) {
 	}
 }
 
-// TestFromSDKInitializeResultBoundsInstructions proves a hostile server cannot
-// make the client retain unbounded instruction text.
-func TestFromSDKInitializeResultBoundsInstructions(t *testing.T) {
+// TestFromSDKInitializeResultIsBounded proves a hostile server cannot make the
+// client retain unbounded text from the handshake. Everything here survives for
+// the life of the connection and is rendered freely afterwards, so every
+// server-supplied string must be capped — not just the obviously long one.
+func TestFromSDKInitializeResultIsBounded(t *testing.T) {
 	t.Parallel()
 
 	const max = 16
 	b := initBounds()
 	b.MaxTextBytes = max
+	huge := strings.Repeat("a", 4096)
 
 	got, err := protocol.FromSDKInitializeResult(&mcp.InitializeResult{
-		ProtocolVersion: "2025-06-18",
-		Instructions:    strings.Repeat("a", 4096),
+		ProtocolVersion: huge,
+		Instructions:    huge,
+		ServerInfo:      &mcp.Implementation{Name: huge, Version: huge, Title: huge},
 	}, b)
 	if err != nil {
 		t.Fatalf("FromSDKInitializeResult() error = %v", err)
 	}
-	if len(got.Instructions) > max {
-		t.Errorf("Instructions = %d bytes, want <= %d", len(got.Instructions), max)
+
+	for _, f := range []struct {
+		name  string
+		value string
+	}{
+		{"Instructions", got.Instructions},
+		{"ProtocolVersion", string(got.ProtocolVersion)},
+		{"Server.Name", got.Server.Name},
+		{"Server.Version", got.Server.Version},
+		{"Server.Title", got.Server.Title},
+	} {
+		if len(f.value) > max {
+			t.Errorf("%s = %d bytes, want <= %d", f.name, len(f.value), max)
+		}
 	}
 }

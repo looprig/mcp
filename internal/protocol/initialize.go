@@ -23,9 +23,11 @@ import (
 // both legal — because neither prevents the connection from working, and both
 // are already visible to the caller in the converted result.
 //
-// Instructions is truncated to b.MaxTextBytes rather than rejected: it is a
-// cosmetic hint, and a server padding it must not be able to fail the
-// connection, only to have its padding dropped.
+// Every string the server supplies — its identity, the protocol version and the
+// instructions — is truncated to b.MaxTextBytes rather than rejected. All three
+// are retained for the life of the connection and rendered freely afterwards,
+// so none may be unbounded; but a server padding one must not be able to fail
+// the connection, only to have its padding dropped.
 func FromSDKInitializeResult(r *mcp.InitializeResult, b Bounds) (InitializeResult, error) {
 	if r == nil {
 		return InitializeResult{}, fmt.Errorf("%w: initialize result", errNilInput)
@@ -33,10 +35,11 @@ func FromSDKInitializeResult(r *mcp.InitializeResult, b Bounds) (InitializeResul
 	if r.ProtocolVersion == "" {
 		return InitializeResult{}, errors.New("protocol: initialize result has no protocol version")
 	}
+	version, _ := limits.TruncateText(r.ProtocolVersion, b.MaxTextBytes)
 	instructions, _ := limits.TruncateText(r.Instructions, b.MaxTextBytes)
 	return InitializeResult{
-		Server:          FromSDKServerIdentity(r.ServerInfo),
-		ProtocolVersion: ProtocolVersion(r.ProtocolVersion),
+		Server:          FromSDKServerIdentity(r.ServerInfo, b),
+		ProtocolVersion: ProtocolVersion(version),
 		Instructions:    instructions,
 		Capabilities:    fromSDKServerCapabilities(r.Capabilities),
 	}, nil

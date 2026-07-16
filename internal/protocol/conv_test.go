@@ -796,9 +796,41 @@ func TestFromSDKServerIdentity(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			if got := protocol.FromSDKServerIdentity(tt.impl); got != tt.want {
+			if got := protocol.FromSDKServerIdentity(tt.impl, initBounds()); got != tt.want {
 				t.Errorf("FromSDKServerIdentity() = %+v, want %+v", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestFromSDKServerIdentityIsBounded proves a server cannot name itself
+// something unbounded. An identity is kept for the life of the connection and
+// rendered freely (client.Status documents itself as safe to log and ship to
+// telemetry as-is), so every field must be capped.
+func TestFromSDKServerIdentityIsBounded(t *testing.T) {
+	t.Parallel()
+
+	const max = 16
+	b := initBounds()
+	b.MaxTextBytes = max
+
+	huge := strings.Repeat("a", 4096)
+	got := protocol.FromSDKServerIdentity(&mcp.Implementation{
+		Name:    huge,
+		Version: huge,
+		Title:   huge,
+	}, b)
+
+	for _, f := range []struct {
+		name  string
+		value string
+	}{
+		{"Name", got.Name},
+		{"Version", got.Version},
+		{"Title", got.Title},
+	} {
+		if len(f.value) > max {
+			t.Errorf("%s = %d bytes, want <= %d", f.name, len(f.value), max)
+		}
 	}
 }

@@ -6,35 +6,63 @@ import (
 	"github.com/looprig/mcp/internal/lifecycle"
 )
 
-// TestStateMirrorsLifecycle pins the public State enum to the internal one:
-// every state the machine can report must have a public counterpart with the
-// same identifier, so internal/lifecycle never has to be exported. Sweeping the
-// whole uint8 range means a state appended internally fails here rather than
-// surfacing as "unknown" to a consumer.
+// publicStates is every State this package exports. It is hand-maintained on
+// purpose: deriving it from internal/lifecycle is what would make
+// TestStateMirrorsLifecycle agree with itself instead of checking anything.
+var publicStates = []State{
+	StateConfigured,
+	StateStarting,
+	StateAuthenticating,
+	StateDiscovering,
+	StateReady,
+	StateDegraded,
+	StateReconnecting,
+	StateFailed,
+	StateClosing,
+	StateClosed,
+}
+
+// TestStateMirrorsLifecycle checks that every state internal/lifecycle declares
+// has a public counterpart, so no state the machine can report reaches a
+// consumer as "unknown" and internal/lifecycle never has to be exported.
+//
+// It deliberately does NOT compare the two String methods: this package's State
+// delegates to lifecycle's, so such a check compares a function to itself and
+// cannot fail. Numeric drift is equally untestable, and equally unnecessary —
+// the constants in status.go are *defined* from lifecycle's, so the compiler
+// guarantees it. What is left, and all this test is for, is the one failure the
+// compiler cannot catch: a state added to internal/lifecycle that nobody
+// mirrored here. That shows up as a count mismatch.
 func TestStateMirrorsLifecycle(t *testing.T) {
 	t.Parallel()
 
 	declared := 0
 	for v := 0; v <= 255; v++ {
-		internal := lifecycle.State(v)
-		name := internal.String()
-		if name == "unknown" {
-			// Not a declared internal state; the mirror must not invent one.
-			if got := State(v).String(); got != "unknown" {
-				t.Errorf("State(%d).String() = %q, want %q: no internal state has this value", v, got, "unknown")
-			}
-			continue
-		}
-		declared++
-		if got := State(v).String(); got != name {
-			t.Errorf("State(%d).String() = %q, want %q to match lifecycle.State(%d)", v, got, name, v)
-		}
-		if got := fromLifecycle(internal); uint8(got) != uint8(v) {
-			t.Errorf("fromLifecycle(%s) = %d, want %d", name, got, v)
+		if lifecycle.State(v).String() != "unknown" {
+			declared++
 		}
 	}
 	if declared == 0 {
-		t.Fatal("no declared lifecycle states were checked: the mirror test would vacuously pass")
+		t.Fatal("no declared lifecycle states were found: the mirror test would vacuously pass")
+	}
+	if len(publicStates) != declared {
+		t.Errorf("this package exports %d states but internal/lifecycle declares %d: "+
+			"every internal state needs a public mirror in status.go and an entry in publicStates, "+
+			"or the machine can report a state a consumer only sees as %q",
+			len(publicStates), declared, "unknown")
+	}
+
+	// Each exported constant must name a real internal state, and no two may
+	// collide onto one.
+	seen := make(map[State]bool, len(publicStates))
+	for _, s := range publicStates {
+		if s.String() == "unknown" {
+			t.Errorf("exported State(%d) does not correspond to any declared lifecycle state", s)
+		}
+		if seen[s] {
+			t.Errorf("exported State(%d) (%s) is declared twice", s, s)
+		}
+		seen[s] = true
 	}
 	t.Logf("mirrored %d lifecycle state(s)", declared)
 }

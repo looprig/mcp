@@ -396,13 +396,23 @@ func binarySize(c Content) int {
 // FromSDKServerIdentity converts the server's self-description. A nil
 // Implementation yields the zero identity rather than an error: identity here
 // is cosmetic, and an anonymous server is not a protocol violation.
-func FromSDKServerIdentity(impl *mcp.Implementation) ServerIdentity {
+//
+// Every field is truncated to b.MaxTextBytes. An identity is the one piece of
+// server data this module keeps for the whole life of a connection and renders
+// freely — it reaches logs, telemetry and UIs through client.Status — so a
+// server must not be able to make its own name a memory or log-volume problem.
+// Truncation rather than rejection, for the same reason as Instructions: a
+// padded name is not a reason to refuse an otherwise-working server.
+func FromSDKServerIdentity(impl *mcp.Implementation, b Bounds) ServerIdentity {
 	if impl == nil {
 		return ServerIdentity{}
 	}
+	name, _ := limits.TruncateText(impl.Name, b.MaxTextBytes)
+	version, _ := limits.TruncateText(impl.Version, b.MaxTextBytes)
+	title, _ := limits.TruncateText(impl.Title, b.MaxTextBytes)
 	return ServerIdentity{
-		Name:    impl.Name,
-		Version: impl.Version,
-		Title:   impl.Title,
+		Name:    name,
+		Version: version,
+		Title:   title,
 	}
 }

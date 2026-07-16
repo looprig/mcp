@@ -62,6 +62,9 @@ type fakeTransport struct {
 	// block, when true, makes Connect wait for ctx to be done and then return
 	// ctx.Err().
 	block bool
+	// untypedNil, when true, makes Connect report success with a plain nil
+	// Conn, as opposed to the typed nil a nil conn field produces.
+	untypedNil bool
 	// beforeConnect runs at the top of Connect, before any blocking.
 	beforeConnect func()
 
@@ -94,13 +97,14 @@ func (t *fakeTransport) Connect(ctx context.Context, cfg protocol.ConnectConfig)
 	if t.err != nil {
 		return nil, t.err
 	}
-	if t.conn == nil {
-		// A broken transport: success with no connection. Returned as an
-		// untyped nil, which is the only nil a Conn interface can be checked
-		// for — a transport handing back a typed nil pointer would panic
-		// inside its own code long before the client saw it.
+	if t.untypedNil {
 		return nil, nil
 	}
+	// A nil t.conn is returned as the typed nil it is, yielding a NON-nil Conn
+	// interface holding a nil *fakeConn: the harder of the two "transport
+	// reported success with no connection" bugs, which a bare `conn == nil`
+	// check misses and which then panics inside Connect on the caller's
+	// goroutine.
 	return t.conn, nil
 }
 
@@ -182,11 +186,14 @@ func (r *eventRecorder) states() []State {
 	return out
 }
 
-// watcherCancelled reports whether Close has deregistered the client's
-// lifecycle watcher. It reads an internal detail deliberately: once the machine
-// is terminal no transition can prove the watcher is gone, and a leaked watcher
-// is exactly what would keep a closed binding alive.
-func (c *Client) watcherCancelled() bool { return c.unwatch == nil }
+// watcherCancelled reports whether the client's lifecycle watcher is actually
+// deregistered from the machine. It asks the machine rather than reading
+// c.unwatch, which would only prove the field was nilled next to the call and
+// not that the cancel ran. Nothing observable proves this otherwise: the
+// machine is terminal after Close, so no transition can be made to reveal a
+// surviving watcher, and a watcher spawns no goroutine for a leak check to
+// count.
+func (c *Client) watcherCancelled() bool { return c.machine.WatcherCount() == 0 }
 
 // Compile-time proof that the test stubs satisfy the handler interfaces, so a
 // change to one is a build failure here rather than a runtime surprise.

@@ -8,6 +8,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/looprig/mcp/internal/lifecycle"
+	"github.com/looprig/mcp/internal/protocol"
 )
 
 // mustClass fails unless err is an *Error of class want, bound to binding.
@@ -331,18 +334,72 @@ func TestConnectTransportError(t *testing.T) {
 }
 
 // TestConnectTransportReturnsNilConn covers a transport that violates its
-// contract by reporting success with no connection.
+// contract by reporting success with no connection. Both nils must become a
+// classified error rather than a panic out of Connect.
 func TestConnectTransportReturnsNilConn(t *testing.T) {
 	t.Parallel()
 
-	tr := newFakeTransport(nil)
-	def := okDefinition(tr)
-
-	c, err := Connect(context.Background(), def, Handlers{})
-	if c != nil {
-		t.Errorf("Connect returned a client alongside an error")
+	tests := []struct {
+		name       string
+		untypedNil bool
+	}{
+		{name: "untyped nil conn", untypedNil: true},
+		{name: "typed nil conn", untypedNil: false},
 	}
-	mustClass(t, err, FailureTransportClosed, def.Name)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			tr := newFakeTransport(nil)
+			tr.untypedNil = tt.untypedNil
+			def := okDefinition(tr)
+
+			c, err := Connect(context.Background(), def, Handlers{})
+			if c != nil {
+				t.Errorf("Connect returned a client alongside an error")
+			}
+			mustClass(t, err, FailureTransportClosed, def.Name)
+		})
+	}
+}
+
+// TestConnectShutdownOvertakesStartup drives the one path where startup is
+// interrupted by a legal, concurrent transition rather than by a failure of its
+// own: the machine is closed while the handshake is in flight, so the final
+// transition to ready is refused.
+//
+// The established conn must still be closed. Connect returns no Client on this
+// path, so a conn left open is owned by nobody and can never be reclaimed.
+// Connect cannot be used to reach this — a Client does not escape until it is
+// ready — so the sequence is driven directly, exactly as the machine's own
+// contract says a concurrent Close would drive it.
+func TestConnectShutdownOvertakesStartup(t *testing.T) {
+	t.Parallel()
+
+	conn := okConn()
+	c := newClient(okDefinition(newFakeTransport(conn)).normalized(), Handlers{})
+
+	// Close the machine while the handshake is in flight, which is what a
+	// concurrent Close does.
+	conn.beforeInit = func() {
+		if err := c.machine.To(lifecycle.StateClosing); err != nil {
+			t.Errorf("moving the machine to closing: %v", err)
+		}
+	}
+
+	err := c.start(context.Background(), protocol.ClientCapabilities{})
+	mustClass(t, err, FailureShutdown, "srv")
+
+	if got := conn.closeCount(); got != 1 {
+		t.Errorf("conn closed %d times after shutdown overtook startup, want exactly 1: "+
+			"Connect returns no client on this path, so an unclosed conn is unreachable forever", got)
+	}
+	if got := c.Status().State; got != StateClosing {
+		t.Errorf("State = %s, want %s: the overtaking transition must stand", got, StateClosing)
+	}
+	if got := c.Status().Failure; got == nil || got.Class != FailureShutdown {
+		t.Errorf("Failure = %+v, want a recorded %s", got, FailureShutdown)
+	}
 }
 
 func TestConnectInitializeError(t *testing.T) {
@@ -589,7 +646,10 @@ func TestConnectEmitsStateChanges(t *testing.T) {
 		t.Fatalf("states after Close = %v, want %v", got, wantAll)
 	}
 
-	// The watcher is deregistered by Close: nothing may arrive afterwards.
+	// Repeated Closes emit nothing further. This is a weak check on its own —
+	// StateClosed is terminal, so no transition could fire regardless — which
+	// is why the watcher's removal is proven against the machine below rather
+	// than inferred from the absence of events.
 	before := len(rec.snapshot())
 	for range 3 {
 		_ = c.Close(context.Background())
@@ -598,7 +658,9 @@ func TestConnectEmitsStateChanges(t *testing.T) {
 		t.Errorf("%d events arrived after Close, want none", after-before)
 	}
 	if !c.watcherCancelled() {
-		t.Errorf("state watcher still registered after Close; it must be cancelled")
+		t.Errorf("the lifecycle watcher is still registered on the machine after Close; "+
+			"it holds the callback and everything it captured, including this Client (watchers: %d)",
+			c.machine.WatcherCount())
 	}
 }
 

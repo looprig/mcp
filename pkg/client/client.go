@@ -12,6 +12,7 @@ package client
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"time"
 
@@ -51,9 +52,6 @@ type Client struct {
 	// closeOnce.
 	unwatch func()
 
-	// conn is the established connection. It is written once, before the
-	// Client escapes Connect.
-	conn protocol.Conn
 	// connOnce guards the single Close of conn. Both Connect's unwind path and
 	// Close go through it, so a conn can never be closed twice.
 	connOnce sync.Once
@@ -61,9 +59,14 @@ type Client struct {
 	// closeOnce guards the whole shutdown sequence, making Close idempotent.
 	closeOnce sync.Once
 
-	// mu guards the observable metadata below. The lifecycle state itself lives
-	// in the machine, which does its own locking.
-	mu              sync.Mutex
+	// mu guards the conn handle and the observable metadata below. The
+	// lifecycle state itself lives in the machine, which does its own locking.
+	mu sync.Mutex
+	// conn is the established connection, assigned once by startup. It is
+	// guarded because Close may read it from another goroutine — today only
+	// after Connect returned, but reconnection will re-run startup on a Client
+	// a caller already holds.
+	conn            protocol.Conn
 	server          ServerIdentity
 	protocolVersion string
 	failure         *Failure
@@ -146,12 +149,14 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)
 	}
-	if conn == nil {
+	if isNilConn(conn) {
 		// A transport that reports success with no connection is broken; there
 		// is nothing to close and nothing to initialize.
 		return c.fail(ctx, opConnect, nil, FailureTransportClosed)
 	}
+	c.mu.Lock()
 	c.conn = conn
+	c.mu.Unlock()
 
 	res, err := conn.Initialize(ctx)
 	if err != nil {
@@ -169,14 +174,38 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	c.protocolVersion = string(res.ProtocolVersion)
 	c.mu.Unlock()
 
-	return c.to(lifecycle.StateReady, opInitialize)
+	// A refused transition here means shutdown overtook startup after the
+	// handshake succeeded. The conn is established at this point, so this
+	// unwinds like any other failed step — the alternative is an open
+	// connection owned by nobody.
+	if err := c.to(lifecycle.StateReady, opInitialize); err != nil {
+		return c.unwind(ctx, err)
+	}
+	return nil
 }
 
-// to moves the machine, converting a refused transition into a shutdown error.
-// A *lifecycle.TransitionError here does not mean the sequence is wrong: it
-// means a concurrent Close legally moved the machine first, so the sequence has
-// been overtaken and must unwind.
-func (c *Client) to(next lifecycle.State, op string) error {
+// isNilConn reports whether a transport handed back no connection.
+//
+// A nil check alone is not enough: a transport returning a typed nil pointer
+// (var s *session; return s, nil) produces a non-nil interface holding nil,
+// which would panic on the first method call — inside Connect, on the caller's
+// goroutine. protocol.Conn is a sealed, module-internal boundary, so that is an
+// in-module transport bug rather than hostile input; it is still checked here,
+// because turning a transport's bug into a typed error the caller can classify
+// costs three lines, and a panic out of Connect costs the host its process.
+func isNilConn(conn protocol.Conn) bool {
+	if conn == nil {
+		return true
+	}
+	v := reflect.ValueOf(conn)
+	return v.Kind() == reflect.Ptr && v.IsNil()
+}
+
+// to moves the machine, converting a refused transition into a typed error. A
+// *lifecycle.TransitionError here does not mean the sequence is wrong: it means
+// a concurrent Close legally moved the machine first, so the sequence has been
+// overtaken and its caller must unwind.
+func (c *Client) to(next lifecycle.State, op string) *Error {
 	err := c.machine.To(next)
 	if err == nil {
 		return nil
@@ -188,21 +217,28 @@ func (c *Client) to(next lifecycle.State, op string) error {
 	return NewError(FailureIndeterminate, c.def.Name, op, "lifecycle transition failed", err)
 }
 
-// fail unwinds a startup step: it classifies err, records the failure, marks
-// the binding failed, and closes the transport. The returned *Error is what
-// Connect gives the caller.
-//
-// The transport is closed even when the transition to StateFailed is refused
-// (a concurrent Close won the race) — an open connection is not something to
-// leave behind on the strength of a lost race.
+// fail classifies a failed startup step and unwinds it.
 func (c *Client) fail(ctx context.Context, op string, err error, fallback FailureClass) error {
-	out := c.classify(ctx, op, err, fallback)
+	return c.unwind(ctx, c.classify(ctx, op, err, fallback))
+}
+
+// unwind abandons startup: it records the failure, marks the binding failed and
+// closes the transport, returning the *Error Connect gives the caller.
+//
+// Every failing path routes through here, including a refused transition — the
+// one path where the failure is that someone else is already closing. Skipping
+// the close there would be the worst version of the bug: the conn is
+// established, Connect returns nil, and nothing else holds a reference to it.
+// The transport is therefore closed regardless of what the machine says, and
+// closing it twice is impossible (connOnce), so racing Close is harmless.
+func (c *Client) unwind(ctx context.Context, out *Error) error {
 	c.recordFailure(out)
-	// A refused transition means shutdown is already running; either way the
+	// A refused transition means shutdown is already running. Either way the
 	// caller gets the failure that actually happened, not the transition's.
 	_ = c.machine.To(lifecycle.StateFailed)
-	// The startup context may already be done, which would stop a transport
-	// from closing cleanly; give the close its own bounded context.
+	// The startup context may already be done — indeed on the timeout and
+	// cancellation paths it always is — which would stop a transport from
+	// closing cleanly. Give the close its own bounded context.
 	closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.def.Timeouts.Startup)
 	defer cancel()
 	_ = c.closeConn(closeCtx)
@@ -251,8 +287,13 @@ func (c *Client) recordFailure(err *Error) {
 // closeConn closes the transport at most once, whichever path gets there first.
 func (c *Client) closeConn(ctx context.Context) error {
 	c.connOnce.Do(func() {
-		if c.conn != nil {
-			c.connErr = c.conn.Close(ctx)
+		// Read the conn under the lock — startup may still be assigning it —
+		// but never call into it while holding one.
+		c.mu.Lock()
+		conn := c.conn
+		c.mu.Unlock()
+		if conn != nil {
+			c.connErr = conn.Close(ctx)
 		}
 	})
 	if c.connErr != nil {

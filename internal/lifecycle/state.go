@@ -213,6 +213,20 @@ func (m *Machine) State() State {
 	return m.current
 }
 
+// WatcherCount reports how many watchers are currently registered.
+//
+// It exists so that a caller which registers a watcher can prove it
+// deregistered it. Nothing else can: a leaked watcher spawns no goroutine (see
+// Watch — delivery runs on the committing goroutine), and once a machine is in
+// a terminal state no transition can be made to reveal one. What a leak costs
+// is the callback and everything it captured, held for the machine's lifetime,
+// which is invisible until it matters.
+func (m *Machine) WatcherCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.watchers)
+}
+
 // To transitions the machine to next, returning *TransitionError if the
 // transition is illegal from the current state — including a self-transition
 // or a state outside the declared range — in which case the current state is
