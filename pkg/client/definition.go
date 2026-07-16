@@ -3,6 +3,7 @@
 // never live in a Definition — they arrive via providers at connect time. A
 // Definition is treated as immutable after Validate returns nil; validation
 // fails closed with FailureInvalidConfig.
+
 package client
 
 import (
@@ -18,7 +19,7 @@ const MaxNameBytes = 64
 
 // Name identifies a server binding (the configured name a server is mounted
 // under). A valid Name is 1..MaxNameBytes bytes of [a-z0-9_-] and starts
-// with a letter or digit (never '-' or '_').
+// with a lowercase letter or digit (never '-' or '_').
 type Name string
 
 // Validate reports whether n is a well-formed binding name. Violations are

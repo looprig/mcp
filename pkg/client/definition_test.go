@@ -178,21 +178,30 @@ func TestLimitsNegativeRejected(t *testing.T) {
 	}
 }
 
+// TestLimitsPositivePreserved sets every Limits field to a distinct positive
+// sentinel and asserts normalization returns each field's own sentinel. A
+// shared sentinel would miss a crossed mapping in withDefaults (for example
+// `MaxFrameBytes: pick(l.MaxBodyBytes, ...)`); distinct values catch it and
+// name the miswired field. It also asserts an all-zero Limits normalizes to
+// exactly DefaultLimits.
 func TestLimitsPositivePreserved(t *testing.T) {
 	t.Parallel()
 
 	def := validDefinition()
-	def.Limits.MaxConcurrentRequests = 3
-	def.Limits.MaxBinaryItems = 99
-	got := def.normalized().Limits
-	if got.MaxConcurrentRequests != 3 {
-		t.Errorf("MaxConcurrentRequests = %d, want 3 (positive value overwritten)", got.MaxConcurrentRequests)
+	limits := reflect.ValueOf(&def.Limits).Elem()
+	for i := 0; i < limits.NumField(); i++ {
+		limits.Field(i).SetInt(int64(1000 + i))
 	}
-	if got.MaxBinaryItems != 99 {
-		t.Errorf("MaxBinaryItems = %d, want 99 (positive value overwritten)", got.MaxBinaryItems)
+	got := reflect.ValueOf(def.normalized().Limits)
+	for i := 0; i < got.NumField(); i++ {
+		if want := int64(1000 + i); got.Field(i).Int() != want {
+			t.Errorf("field %s = %d, want sentinel %d (withDefaults maps it to the wrong source field)",
+				got.Type().Field(i).Name, got.Field(i).Int(), want)
+		}
 	}
-	if got.MaxCatalogPages != DefaultLimits().MaxCatalogPages {
-		t.Errorf("MaxCatalogPages = %d, want default %d", got.MaxCatalogPages, DefaultLimits().MaxCatalogPages)
+
+	if got := validDefinition().normalized().Limits; got != DefaultLimits() {
+		t.Errorf("normalized zero Limits = %+v, want DefaultLimits() %+v", got, DefaultLimits())
 	}
 }
 
