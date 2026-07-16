@@ -145,6 +145,7 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 		Client:       protocol.ClientIdentity{Name: ClientName, Version: ClientVersion, Title: ClientTitle},
 		Capabilities: caps,
 		Bounds:       c.def.Limits.bounds(),
+		Wire:         c.def.Limits.wire(),
 	})
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)

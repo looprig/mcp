@@ -64,6 +64,32 @@ type ConnectConfig struct {
 	// Bounds caps everything the connection converts from server data. The
 	// client passes a normalized (all-positive) value.
 	Bounds Bounds
+	// Wire caps what a transport buffers off the network, before any of it is
+	// parsed. The client passes a normalized (all-positive) value.
+	Wire WireLimits
+}
+
+// WireLimits bounds untrusted bytes at the point they arrive, which is a
+// different job from Bounds and is why it is a different type. Bounds governs
+// conversion — how much of a *decoded* value this module will retain — and can
+// only be applied to something already in memory. WireLimits governs what may
+// reach memory at all, so it is the only thing standing between a hostile
+// server and an unbounded allocation.
+//
+// It is separate from Bounds rather than folded into it because only a
+// byte-oriented transport can enforce it: there is nothing for a converter to
+// do with MaxBodyBytes.
+type WireLimits struct {
+	// MaxBodyBytes caps one whole non-streaming response body.
+	//
+	// It deliberately does not cap a long-lived stream: an SSE stream carries
+	// an entire session's worth of frames and is bounded per frame, by
+	// MaxFrameBytes, because a total on it is just a slow session's expiry
+	// date.
+	MaxBodyBytes int
+	// MaxFrameBytes caps one wire frame — one JSON-RPC message, or one SSE
+	// event — however long the stream carrying it lives.
+	MaxFrameBytes int
 }
 
 // ServerCapabilities is what a server advertised at initialize, reduced to the

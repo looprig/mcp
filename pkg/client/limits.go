@@ -181,6 +181,21 @@ func (l Limits) bounds() protocol.Bounds {
 	}
 }
 
+// wire projects the byte-level limits onto the narrow view a transport needs.
+// Call it on a normalized Limits, for the reason bounds documents: a transport
+// treats a non-positive bound as its own default rather than as "unbounded",
+// and a limit the caller set must not be silently replaced.
+//
+// It is separate from bounds because the two are enforced in different places
+// on different things: bounds caps a decoded value a converter is about to
+// retain, wire caps the bytes a transport is about to buffer.
+func (l Limits) wire() protocol.WireLimits {
+	return protocol.WireLimits{
+		MaxBodyBytes:  l.MaxBodyBytes,
+		MaxFrameBytes: l.MaxFrameBytes,
+	}
+}
+
 // validate reports the first negative field, naming it. Zero is valid (it
 // means "use the default"). Keep this table in sync with the struct; the
 // reflection sweep in tests fails if a field is missing here.
