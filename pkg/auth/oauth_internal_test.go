@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -626,7 +627,10 @@ func TestNewTokenSetFromResolvesRotation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := newTokenSetFrom(tt.body, []string{"read"}, tt.previous)
+			got, err := newTokenSetFrom(tt.body, []string{"read"}, tt.previous, time.Now())
+			if err != nil {
+				t.Fatalf("newTokenSetFrom() error = %v", err)
+			}
 			if got.Refresh() != tt.wantRefresh {
 				t.Errorf("Refresh() = %q, want %q", got.Refresh(), tt.wantRefresh)
 			}
@@ -637,28 +641,207 @@ func TestNewTokenSetFromResolvesRotation(t *testing.T) {
 	}
 }
 
-// expires_in becomes an absolute expiry; its absence means "no stated expiry",
-// which TokenSet treats as never expiring rather than as already dead.
+// seconds returns a pointer to n, for building an expires_in.
+func seconds(n int64) *int64 { return &n }
+
+// expires_in is four cases, not two, and the pairs that look alike mean
+// opposite things:
+//
+//   - absent vs zero: "no stated expiry" (never expires) vs "already dead".
+//     A plain int64 cannot tell these apart, which is why the field is a
+//     pointer. Conflating them yields a token that is never proactively
+//     refreshed and degrades into 401s from the resource instead.
+//   - huge vs normal: time.Duration is nanoseconds in an int64, so the naive
+//     multiply WRAPS past ~292 years. The wrapped values happen to land in the
+//     past — safe, but by arithmetic accident. The clamp makes it a decision.
+func TestExpiryFrom(t *testing.T) {
+	t.Parallel()
+
+	// A fixed instant: expiry arithmetic against time.Now() is a test that
+	// asserts on a moving target.
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+
+	tests := []struct {
+		name       string
+		expiresIn  *int64
+		wantErr    bool
+		wantZero   bool
+		wantExpiry time.Time
+		// wantExpiredNow is the property that actually matters to the ladder in
+		// Token: does this token get used, or refreshed?
+		wantExpiredNow bool
+	}{
+		{
+			name:      "absent means the server stated no expiry",
+			expiresIn: nil,
+			wantZero:  true,
+			// A token with no stated expiry never expires; treating it as dead
+			// would throw away a perfectly good credential.
+			wantExpiredNow: false,
+		},
+		{
+			name:           "normal",
+			expiresIn:      seconds(3600),
+			wantExpiry:     now.Add(time.Hour),
+			wantExpiredNow: false,
+		},
+		{
+			name:           "one second is inside the skew, so already unusable",
+			expiresIn:      seconds(1),
+			wantExpiry:     now.Add(time.Second),
+			wantExpiredNow: true,
+		},
+		{
+			name: "zero means already dead, and is NOT absent",
+			// The case the old `> 0` guard silently turned into "never
+			// expires".
+			expiresIn:      seconds(0),
+			wantExpiry:     now,
+			wantExpiredNow: true,
+		},
+		{
+			name:      "negative is a malformed response",
+			expiresIn: seconds(-1),
+			wantErr:   true,
+		},
+		{
+			name:      "large negative is a malformed response",
+			expiresIn: seconds(-3600),
+			wantErr:   true,
+		},
+		{
+			name:           "a year is at the ceiling and is not clamped",
+			expiresIn:      seconds(maxExpiresIn),
+			wantExpiry:     now.Add(maxExpiresIn * time.Second),
+			wantExpiredNow: false,
+		},
+		{
+			name: "beyond the ceiling is clamped, not wrapped",
+			// Without the clamp this wrapped to 1795.
+			expiresIn:      seconds(1099511627776),
+			wantExpiry:     now.Add(maxExpiresIn * time.Second),
+			wantExpiredNow: false,
+		},
+		{
+			name: "MaxInt64 is clamped, not wrapped",
+			// Without the clamp this wrapped to approximately now.
+			expiresIn:      seconds(math.MaxInt64),
+			wantExpiry:     now.Add(maxExpiresIn * time.Second),
+			wantExpiredNow: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := expiryFrom(tt.expiresIn, now)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("expiryFrom() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if class, ok := ClassOf(err); !ok || class != ClassFailed {
+					t.Errorf("expiryFrom() error class = %v (found %v), want %v", class, ok, ClassFailed)
+				}
+				return
+			}
+			if tt.wantZero {
+				if !got.IsZero() {
+					t.Fatalf("expiryFrom() = %v, want the zero time", got)
+				}
+			} else if !got.Equal(tt.wantExpiry) {
+				t.Fatalf("expiryFrom() = %v, want %v", got, tt.wantExpiry)
+			}
+
+			// The behavior the value exists for: a TokenSet built from it is
+			// either usable or refreshed. This is what the Minor was actually
+			// about — the arithmetic is only the mechanism.
+			set := NewTokenSet("access", "refresh", got, nil)
+			if set.Expired(now) != tt.wantExpiredNow {
+				t.Errorf("NewTokenSet(expiry=%v).Expired(now) = %v, want %v", got, set.Expired(now), tt.wantExpiredNow)
+			}
+		})
+	}
+}
+
+// The same four cases through the conversion a token response actually takes.
 func TestNewTokenSetFromExpiry(t *testing.T) {
 	t.Parallel()
 
-	withExpiry := newTokenSetFrom(tokenResponse{AccessToken: "a", ExpiresIn: 3600}, nil, TokenSet{})
-	if withExpiry.Expiry().IsZero() {
-		t.Fatal("Expiry() is zero, want an absolute time derived from expires_in")
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+
+	withExpiry, err := newTokenSetFrom(tokenResponse{AccessToken: "a", ExpiresIn: seconds(3600)}, nil, TokenSet{}, now)
+	if err != nil {
+		t.Fatalf("newTokenSetFrom() error = %v", err)
 	}
-	if delta := time.Until(withExpiry.Expiry()); delta < 59*time.Minute || delta > 61*time.Minute {
-		t.Errorf("Expiry() is %v from now, want about an hour", delta)
+	if !withExpiry.Expiry().Equal(now.Add(time.Hour)) {
+		t.Errorf("Expiry() = %v, want an hour after now", withExpiry.Expiry())
 	}
-	if withExpiry.Expired(time.Now()) {
+	if withExpiry.Expired(now) {
 		t.Error("Expired() = true for a token that expires in an hour")
 	}
 
-	without := newTokenSetFrom(tokenResponse{AccessToken: "a"}, nil, TokenSet{})
+	without, err := newTokenSetFrom(tokenResponse{AccessToken: "a"}, nil, TokenSet{}, now)
+	if err != nil {
+		t.Fatalf("newTokenSetFrom() error = %v", err)
+	}
 	if !without.Expiry().IsZero() {
 		t.Errorf("Expiry() = %v, want zero when the server stated no expiry", without.Expiry())
 	}
-	if without.Expired(time.Now()) {
+	if without.Expired(now) {
 		t.Error("Expired() = true for a token with no stated expiry; it must be treated as never expiring")
+	}
+
+	dead, err := newTokenSetFrom(tokenResponse{AccessToken: "a", ExpiresIn: seconds(0)}, nil, TokenSet{}, now)
+	if err != nil {
+		t.Fatalf("newTokenSetFrom() error = %v", err)
+	}
+	if !dead.Expired(now) {
+		t.Error("Expired() = false for expires_in=0; the server said the token is already dead")
+	}
+
+	if _, err := newTokenSetFrom(tokenResponse{AccessToken: "a", ExpiresIn: seconds(-1)}, nil, TokenSet{}, now); err == nil {
+		t.Error("newTokenSetFrom() = nil error for a negative expires_in, want a malformed-response failure")
+	}
+}
+
+// expires_in is decoded from real JSON, because the absent-vs-zero distinction
+// is a property of the decoding and a unit test that builds the struct by hand
+// cannot see it. This is the test that fails if the field goes back to int64.
+func TestTokenResponseDistinguishesAbsentFromZeroExpiresIn(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		body     string
+		wantNil  bool
+		wantSecs int64
+	}{
+		{name: "absent", body: `{"access_token":"a"}`, wantNil: true},
+		{name: "zero", body: `{"access_token":"a","expires_in":0}`, wantSecs: 0},
+		{name: "normal", body: `{"access_token":"a","expires_in":3600}`, wantSecs: 3600},
+		{name: "negative", body: `{"access_token":"a","expires_in":-1}`, wantSecs: -1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var body tokenResponse
+			if err := decodeBoundedJSON(strings.NewReader(tt.body), &body); err != nil {
+				t.Fatalf("decodeBoundedJSON() error = %v", err)
+			}
+			if tt.wantNil {
+				if body.ExpiresIn != nil {
+					t.Fatalf("ExpiresIn = %d, want nil: an absent expires_in must be distinguishable from zero", *body.ExpiresIn)
+				}
+				return
+			}
+			if body.ExpiresIn == nil {
+				t.Fatalf("ExpiresIn = nil, want %d", tt.wantSecs)
+			}
+			if *body.ExpiresIn != tt.wantSecs {
+				t.Errorf("ExpiresIn = %d, want %d", *body.ExpiresIn, tt.wantSecs)
+			}
+		})
 	}
 }
 

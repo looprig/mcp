@@ -576,15 +576,40 @@ func (p *OAuthProvider) authorizationURL(endpoint, redirectURI string, verifier 
 // discipline resumes. Do not return one of these, store one, or put one in an
 // error.
 type tokenResponse struct {
-	AccessToken  string `json:"access_token"`
-	TokenType    string `json:"token_type"`
-	ExpiresIn    int64  `json:"expires_in"`
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	// ExpiresIn is a pointer so that ABSENT is distinguishable from zero, which
+	// a plain int64 cannot do: both decode to 0, and the two mean opposite
+	// things. An absent expires_in means "the server stated no expiry", which
+	// TokenSet treats as never expiring; a zero one means "this token is
+	// already dead". Conflating them yields a token that is never proactively
+	// refreshed and instead degrades into 401s from the resource. See
+	// expiryFrom.
+	ExpiresIn    *int64 `json:"expires_in"`
 	RefreshToken string `json:"refresh_token"`
 	Scope        string `json:"scope"`
 
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description"`
 }
+
+// maxExpiresIn caps expires_in at one year, in seconds, before it is turned
+// into a duration.
+//
+// It exists for two reasons at once. The arithmetic one: time.Duration is an
+// int64 of nanoseconds, so time.Duration(n) * time.Second silently WRAPS for n
+// beyond ~292 years — expires_in of 1<<40 lands the expiry in 1795, and
+// math.MaxInt64 lands it back at roughly now. Both happen to fail safe (an
+// expiry in the past means we refresh), but by arithmetic luck rather than by
+// design, and luck is not a property worth depending on. The semantic one: an
+// access token good for longer than a year is not a thing, and a server
+// claiming one is broken or lying.
+//
+// Clamping is safe in exactly one direction, which is why it is a clamp and not
+// an error: capping expires_in DOWNWARDS can only make us refresh earlier than
+// necessary, which costs one request. Rounding up, or trusting the number,
+// could make us hold a token past its death.
+const maxExpiresIn = 365 * 24 * 60 * 60
 
 // exchange redeems an authorization code for tokens (RFC 6749 §4.1.3).
 func (p *OAuthProvider) exchange(ctx context.Context, endpoint string, code authCode, verifier pkce, redirectURI string, scopes []string) (TokenSet, error) {
@@ -703,12 +728,49 @@ func (p *OAuthProvider) postToken(ctx context.Context, endpoint string, form url
 		return fail(ClassFailed, fmt.Sprintf("token response has unsupported token_type %q", body.TokenType), nil)
 	}
 
-	return newTokenSetFrom(body, scopes, previous), nil
+	// now is read once, here, so that the expiry is computed against the same
+	// instant the response arrived rather than against whenever the conversion
+	// happens to run.
+	set, err := newTokenSetFrom(body, scopes, previous, time.Now())
+	if err != nil {
+		return TokenSet{}, err
+	}
+	return set, nil
+}
+
+// expiryFrom turns a wire expires_in into an absolute expiry as of now.
+//
+// The four cases are genuinely four, and collapsing any pair of them is a bug:
+//
+//   - ABSENT (nil): the server stated no expiry. Returns the zero time, which
+//     TokenSet reads as "never expires" — the correct reading, since some
+//     servers legitimately issue tokens without one.
+//   - NEGATIVE: not a thing. RFC 6749 §5.1 defines expires_in as "the lifetime
+//     in seconds", and a negative lifetime is a malformed response, so it is a
+//     typed error rather than a value to interpret. Guessing at what a broken
+//     server meant is how a client ends up trusting a token it should not.
+//   - ZERO: the server said this token is already dead. Returns now, which is
+//     immediately expired (and ExpirySkew makes it expired regardless). This is
+//     the case a plain int64 cannot see, because absent decodes to zero too.
+//   - POSITIVE: now + n seconds, clamped to maxExpiresIn.
+func expiryFrom(expiresIn *int64, now time.Time) (time.Time, error) {
+	if expiresIn == nil {
+		return time.Time{}, nil
+	}
+	seconds := *expiresIn
+	if seconds < 0 {
+		return time.Time{}, NewError(ClassFailed, "token",
+			fmt.Sprintf("token response has a negative expires_in (%d)", seconds), nil)
+	}
+	if seconds > maxExpiresIn {
+		seconds = maxExpiresIn
+	}
+	return now.Add(time.Duration(seconds) * time.Second), nil
 }
 
 // newTokenSetFrom converts a wire response into a TokenSet, resolving refresh
-// rotation and scope defaults.
-func newTokenSetFrom(body tokenResponse, requested []string, previous TokenSet) TokenSet {
+// rotation, expiry, and scope defaults.
+func newTokenSetFrom(body tokenResponse, requested []string, previous TokenSet, now time.Time) (TokenSet, error) {
 	// Rotation: a response carrying a refresh token replaces the old one — that
 	// is what rotation means, and keeping the old one would mean using a token
 	// the server has already invalidated. A response carrying none leaves the
@@ -720,9 +782,9 @@ func newTokenSetFrom(body tokenResponse, requested []string, previous TokenSet) 
 		refresh = previous.Refresh()
 	}
 
-	var expiry time.Time
-	if body.ExpiresIn > 0 {
-		expiry = time.Now().Add(time.Duration(body.ExpiresIn) * time.Second)
+	expiry, err := expiryFrom(body.ExpiresIn, now)
+	if err != nil {
+		return TokenSet{}, err
 	}
 
 	// The granted scopes are what the server says they are, not what we asked
@@ -732,7 +794,7 @@ func newTokenSetFrom(body tokenResponse, requested []string, previous TokenSet) 
 	if body.Scope != "" {
 		scopes = strings.Fields(body.Scope)
 	}
-	return NewTokenSet(body.AccessToken, refresh, expiry, scopes)
+	return NewTokenSet(body.AccessToken, refresh, expiry, scopes), nil
 }
 
 // tokenErrorClass maps an RFC 6749 §5.2 token error code to a Class.

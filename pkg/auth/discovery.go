@@ -28,6 +28,30 @@
 // resulting code at the attacker's endpoint — a mix-up attack (RFC 9207). The
 // check that the document's own issuer equals the identity we asked for is what
 // makes the document self-certifying.
+//
+// # Why RFC 9207's `iss` is not validated on the callback
+//
+// RFC 9207 has the authorization server return an `iss` parameter on the
+// redirect, so a client can tell WHICH server just answered. It is deliberately
+// not implemented here, and the reason is a precondition rather than an
+// oversight.
+//
+// A mix-up attack needs a client that is juggling more than one authorization
+// server at once: the attack is to make a response from server A look like a
+// response from server B, and `iss` is what distinguishes them. This client
+// never has two in play. One provider binds to exactly one resource, discovery
+// takes authorization_servers[0] and never falls back to another (see
+// discoverResource — trying each in turn is refused precisely because it would
+// blur which server we are talking to), the metadata is pinned to that issuer
+// by the §3.3 check above, and the endpoints are pinned by that metadata. A
+// callback can only be answering the single authorization request we sent to
+// the single server we selected, and the state parameter already binds it to
+// that request. There is no second server for `iss` to disambiguate from.
+//
+// What would change this: supporting several authorization servers per
+// resource, or reusing one redirect listener across providers. Either
+// reintroduces the precondition, and `iss` validation becomes load-bearing the
+// day it lands.
 
 package auth
 
