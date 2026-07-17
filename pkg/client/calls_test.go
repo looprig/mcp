@@ -528,10 +528,28 @@ func TestCallFailureClassification(t *testing.T) {
 	t.Run("a transport's typed error passes through", func(t *testing.T) {
 		t.Parallel()
 		conn := okConn()
-		conn.callErr = NewError(FailureTransportClosed, "srv", "call_tool", "the process exited", nil)
+		// A remote HTTP failure, not a closed transport: the connection is
+		// intact and the server answered badly. A class that means the
+		// connection itself is gone is the one case where a tool call does NOT
+		// pass the transport's class through — it becomes indeterminate, because
+		// the call's outcome is unknowable (see TestCallToolIndeterminate...).
+		conn.callErr = NewError(FailureRemoteHTTP, "srv", "call_tool", "the server returned 503", nil)
 		c := connectTo(t, conn, nil)
 
 		_, err := c.CallTool(context.Background(), "echo", nil, CallOpts{})
+		if class, _ := ClassOf(err); class != FailureRemoteHTTP {
+			t.Errorf("class = %v, want the transport's own %v", class, FailureRemoteHTTP)
+		}
+	})
+
+	t.Run("a transport's typed error passes through a read", func(t *testing.T) {
+		t.Parallel()
+		conn := okConn()
+		conn.initResult.Capabilities.Resources = true
+		conn.resourceErr = NewError(FailureTransportClosed, "srv", "read_resource", "the process exited", nil)
+		c := connectTo(t, conn, nil)
+
+		_, err := c.ReadResource(context.Background(), "x://a")
 		if class, _ := ClassOf(err); class != FailureTransportClosed {
 			t.Errorf("class = %v, want the transport's own %v", class, FailureTransportClosed)
 		}

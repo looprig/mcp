@@ -84,8 +84,18 @@ type fakeConn struct {
 	// is the correct path.
 	callProbeN      int32
 	callProbeWindow time.Duration
-	// callReleased, when non-nil, blocks every CallTool until it is closed.
+	// callReleased, when non-nil, blocks CallTool until it is closed: every
+	// call, or just one of them when holdCall names it.
 	callReleased chan struct{}
+	// holdCall, when positive, is the 1-based index of the only call that waits
+	// on callReleased; every other call runs straight through.
+	//
+	// It exists to build a straggler: a call still inside the old connection
+	// while a later call has already killed it, been reported, and had the
+	// binding rebuilt underneath. That interleaving is the whole point of the
+	// connection epoch, and it cannot be produced when every call is held or
+	// none is.
+	holdCall int
 
 	promptResult   protocol.PromptResult
 	promptErr      error
@@ -101,6 +111,10 @@ type fakeConn struct {
 	calls     []string
 	logLevel  string
 	logLevels int
+	// connectCfg is the ConnectConfig the transport was handed for this conn.
+	// A redialing test reads it to reach the callbacks the client installed on
+	// the connection it is actually using.
+	connectCfg protocol.ConnectConfig
 	// listErr, when set, fails tools/list — the discovery failure a Client has
 	// to unwind from, and the refresh failure it has to degrade on. It is
 	// guarded because a refresh test flips it on a live client.
@@ -211,6 +225,7 @@ func (c *fakeConn) ListTools(ctx context.Context, cursor string) (protocol.ToolP
 func (c *fakeConn) CallTool(ctx context.Context, rawName string, _ json.RawMessage, opts protocol.CallOptions) (protocol.ToolResult, error) {
 	c.mu.Lock()
 	c.calls = append(c.calls, rawName)
+	index := len(c.calls)
 	c.mu.Unlock()
 
 	live := c.live.Add(1)
@@ -226,7 +241,7 @@ func (c *fakeConn) CallTool(ctx context.Context, rawName string, _ json.RawMessa
 			return protocol.ToolResult{}, err
 		}
 	}
-	if c.callReleased != nil {
+	if c.callReleased != nil && (c.holdCall == 0 || c.holdCall == index) {
 		select {
 		case <-c.callReleased:
 		case <-ctx.Done():

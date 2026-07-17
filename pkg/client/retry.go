@@ -145,6 +145,41 @@ func jitter(d time.Duration) time.Duration {
 	return time.Duration(n.Int64())
 }
 
+// ReconnectPolicy governs whether and how hard a binding tries to rebuild a
+// connection that failed transiently. The zero value reconnects under the
+// default bounds, which is the useful default: a binding that gave up on the
+// first dropped socket would make every server restart an operator's problem.
+type ReconnectPolicy struct {
+	// Disabled refuses reconnection entirely. A binding whose connection is
+	// lost then stays degraded until its owner closes it.
+	//
+	// It is a negative flag because the zero value must mean "the default", as
+	// it does everywhere else in a Definition, and the default is to reconnect.
+	// An application disables this when re-establishing the connection costs
+	// something it would rather decide about itself — a subprocess with side
+	// effects at startup, a metered endpoint, an auth flow that prompts a human.
+	Disabled bool
+
+	// RetryPolicy bounds the attempts. Zero fields select their defaults.
+	//
+	// It is embedded rather than named because a reconnect policy *is* a retry
+	// policy plus the decision to retry at all; there is no second dimension for
+	// a field name to distinguish.
+	RetryPolicy
+}
+
+// validate reports the first invalid field.
+func (p ReconnectPolicy) validate(field string) error {
+	return p.RetryPolicy.validate(field)
+}
+
+// withDefaults returns a copy with every zero bound replaced by its default.
+// Disabled is a decision, not a bound, and is left as the application set it.
+func (p ReconnectPolicy) withDefaults() ReconnectPolicy {
+	p.RetryPolicy = p.RetryPolicy.withDefaults()
+	return p
+}
+
 // retrySchedule tracks one bounded retry loop's budget.
 //
 // It is a value with an explicit start time rather than a closure over

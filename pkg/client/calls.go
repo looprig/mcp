@@ -152,7 +152,7 @@ type ResourceContent struct {
 // Cancelling ctx cancels the call at the protocol level — the server is told to
 // stop, not merely abandoned.
 func (c *Client) CallTool(ctx context.Context, rawName string, args json.RawMessage, opts CallOpts) (ToolResult, error) {
-	conn, err := c.serving(opCallTool)
+	conn, epoch, err := c.serving(opCallTool)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -191,7 +191,7 @@ func (c *Client) CallTool(ctx context.Context, rawName string, args json.RawMess
 		Progress: c.progressAdapter(opts.Progress),
 	})
 	if err != nil {
-		return ToolResult{}, c.callFailure(ctx, callCtx, opCallTool, err)
+		return ToolResult{}, c.toolCallFailure(ctx, callCtx, epoch, err)
 	}
 	return ToolResult{
 		IsError:    res.IsError,
@@ -203,7 +203,7 @@ func (c *Client) CallTool(ctx context.Context, rawName string, args json.RawMess
 
 // GetPrompt fetches a prompt's messages, substituting args.
 func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]string) (Prompt, error) {
-	conn, err := c.serving(opGetPrompt)
+	conn, epoch, err := c.serving(opGetPrompt)
 	if err != nil {
 		return Prompt{}, err
 	}
@@ -221,7 +221,7 @@ func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]str
 
 	res, err := conn.GetPrompt(callCtx, name, args)
 	if err != nil {
-		return Prompt{}, c.callFailure(ctx, callCtx, opGetPrompt, err)
+		return Prompt{}, c.requestFailure(ctx, callCtx, opGetPrompt, epoch, err)
 	}
 	out := Prompt{Description: res.Description}
 	if len(res.Messages) > 0 {
@@ -238,7 +238,7 @@ func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]str
 // The URI is an opaque protocol identifier the server issued — not a host path.
 // Nothing here resolves it against a filesystem.
 func (c *Client) ReadResource(ctx context.Context, uri string) (Resource, error) {
-	conn, err := c.serving(opReadResource)
+	conn, epoch, err := c.serving(opReadResource)
 	if err != nil {
 		return Resource{}, err
 	}
@@ -256,7 +256,7 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (Resource, error)
 
 	res, err := conn.ReadResource(callCtx, uri)
 	if err != nil {
-		return Resource{}, c.callFailure(ctx, callCtx, opReadResource, err)
+		return Resource{}, c.requestFailure(ctx, callCtx, opReadResource, epoch, err)
 	}
 	out := Resource{}
 	if len(res.Contents) > 0 {
@@ -280,7 +280,7 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (Resource, error)
 // subscribing is a separate capability from reading, and a server that only
 // advertised resources has not promised resources/subscribe exists.
 func (c *Client) Subscribe(ctx context.Context, uri string) error {
-	conn, err := c.serving(opSubscribe)
+	conn, epoch, err := c.serving(opSubscribe)
 	if err != nil {
 		return err
 	}
@@ -298,7 +298,7 @@ func (c *Client) Subscribe(ctx context.Context, uri string) error {
 	defer release()
 
 	if err := conn.Subscribe(callCtx, uri); err != nil {
-		return c.callFailure(ctx, callCtx, opSubscribe, err)
+		return c.requestFailure(ctx, callCtx, opSubscribe, epoch, err)
 	}
 	return nil
 }
@@ -309,26 +309,29 @@ func (c *Client) Subscribe(ctx context.Context, uri string) error {
 // known fault", and refusing calls on it would make a partial fault a total
 // outage. Everything else — starting, discovering, failed, closing, closed —
 // has no business carrying one.
-func (c *Client) serving(op string) (protocol.Conn, error) {
+// It returns the connection together with its epoch, and the two must travel
+// together: everything the caller later says about this connection failing is
+// only meaningful about the connection it actually used (see Client.connEpoch).
+func (c *Client) serving(op string) (protocol.Conn, uint64, error) {
 	state := c.machine.State()
 	switch state {
 	case lifecycle.StateReady, lifecycle.StateDegraded:
 	case lifecycle.StateClosing, lifecycle.StateClosed:
-		return nil, NewError(FailureShutdown, c.def.Name, op, "the binding is closed", nil)
+		return nil, 0, NewError(FailureShutdown, c.def.Name, op, "the binding is closed", nil)
 	default:
-		return nil, NewError(FailureIndeterminate, c.def.Name, op,
+		return nil, 0, NewError(FailureIndeterminate, c.def.Name, op,
 			"the binding is not serving calls (state: "+state.String()+")", nil)
 	}
 
 	c.mu.Lock()
-	conn := c.conn
+	conn, epoch := c.conn, c.connEpoch
 	c.mu.Unlock()
 	if conn == nil {
 		// A ready binding always has a conn; this is defence in depth against a
 		// startup path that ever changed.
-		return nil, NewError(FailureIndeterminate, c.def.Name, op, "the binding has no connection", nil)
+		return nil, 0, NewError(FailureIndeterminate, c.def.Name, op, "the binding has no connection", nil)
 	}
-	return conn, nil
+	return conn, epoch, nil
 }
 
 // admit puts a request through the binding's scheduler, classifying a refusal.
@@ -430,6 +433,48 @@ func (c *Client) callFailure(ctx, callCtx context.Context, op string, err error)
 		return NewError(FailureDeadline, c.def.Name, op, "the call exceeded its deadline", nil)
 	}
 	return NewError(FailureServerProtocol, c.def.Name, op, "", err)
+}
+
+// toolCallFailure classifies a failed tool call, and is where the design's
+// indeterminacy rule lives.
+//
+// A tool call that was in flight when the connection died has no known outcome.
+// The request may never have arrived; it may have arrived and run; it may have
+// run and had its reply lost with the connection. Nothing here can tell those
+// apart — the evidence is on the other side of a connection that no longer
+// exists — so the caller is told exactly that, and is never told the call failed.
+//
+// The distinction is the whole point. "Failed" invites a retry, and a retried
+// tool call is a second effect: a second branch deleted, a second payment sent.
+// FailureIndeterminate is a class a caller cannot handle by reflex, which is
+// correct, because the situation cannot be handled by reflex.
+//
+// A lost connection also starts a reconnect, if policy permits (see
+// reconnect.go). That is separate from what this call is told: the binding may
+// recover in a second, and this call's outcome is still unknown.
+func (c *Client) toolCallFailure(ctx, callCtx context.Context, epoch uint64, err error) error {
+	out := c.callFailure(ctx, callCtx, opCallTool, err)
+	class, ok := ClassOf(out)
+	if !ok || !transientConnectionLoss(class) {
+		return out
+	}
+	c.connectionLost(epoch, class, out)
+	return NewError(FailureIndeterminate, c.def.Name, opCallTool,
+		"the connection failed with the call in flight: the tool may or may not have run, and it is not retried", out)
+}
+
+// requestFailure classifies a failed non-call request.
+//
+// It reports the connection loss like a tool call does, but keeps the class it
+// was given. A read that was lost is a read that did not happen: re-reading has
+// no second effect, so there is nothing indeterminate to warn a caller about,
+// and dressing a closed transport up as an indeterminate outcome would only make
+// the class meaningless where it matters.
+//
+// It does not re-issue the request either. Whether re-reading is wanted is the
+// caller's decision, made with knowledge this layer does not have.
+func (c *Client) requestFailure(ctx, callCtx context.Context, op string, epoch uint64, err error) error {
+	return c.noteFailure(epoch, c.callFailure(ctx, callCtx, op, err))
 }
 
 // adopted returns the generation this binding has adopted, or nil.

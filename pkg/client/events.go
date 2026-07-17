@@ -110,6 +110,62 @@ type CatalogRejected struct {
 	At time.Time
 }
 
+// ConnectionLost reports that a binding's connection failed for a reason that
+// means it is gone: a transport that closed, a stream that desynchronized.
+//
+// It does not mean the binding is unusable. What it means is that every request
+// in flight when it happened has failed — tool calls indeterminately, since the
+// connection took the evidence with it — and that the binding is degraded until
+// it reconnects.
+type ConnectionLost struct {
+	// Binding names the binding.
+	Binding Name
+	// Class classifies the failure that ended the connection.
+	Class FailureClass
+	// Message is the failure's bounded, normalized text.
+	Message string
+	// Adopted is the ordinal of the generation still in force. It survives a
+	// lost connection.
+	Adopted uint64
+	// Retrying reports whether the binding will try to reconnect. It is false
+	// when policy forbids it, and false on the last report when the retry
+	// budget is spent.
+	Retrying bool
+	// At is when the loss was observed.
+	At time.Time
+}
+
+// ConnectionRestored reports that a binding has a new logical connection, with
+// its own handshake and its own freshly discovered catalog.
+//
+// It is not an adoption. The catalog that came with the new connection is a
+// candidate like any other: the caller adopts it at a safe boundary, because a
+// socket reconnecting is not a reason to change what a model was told mid-turn.
+type ConnectionRestored struct {
+	// Binding names the binding.
+	Binding Name
+	// Server is what the reconnected server claims to be. Cosmetic: it names a
+	// peer, it never authorizes one.
+	Server ServerIdentity
+	// Drift is bounded text describing how the server's identity differs from
+	// the one this binding first connected to, or empty when it is the same
+	// server. It is reported, never enforced — a restarted server with a new
+	// version is the ordinary reason to be reconnecting.
+	Drift string
+	// Adopted is the ordinal of the generation still in force, which the
+	// reconnect did not touch.
+	Adopted uint64
+	// Generation is the ordinal of the generation discovered over the new
+	// connection. It is a candidate unless it was identical to the adopted one,
+	// in which case there is nothing to adopt.
+	Generation uint64
+	// At is when the connection was restored.
+	At time.Time
+}
+
+func (ConnectionLost) event()     {}
+func (ConnectionRestored) event() {}
+
 func (CatalogStale) event()     {}
 func (CatalogCandidate) event() {}
 func (CatalogRefreshed) event() {}

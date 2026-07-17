@@ -122,4 +122,11 @@ type Status struct {
 	// answers it. A family that stays here is a binding whose refreshes are
 	// failing — which State (degraded) and Failure describe.
 	StaleFamilies []string
+
+	// ReconnectAttempt is the reconnect attempt currently in flight, counting
+	// from 1, or 0 when the binding is not reconnecting. It is the retry state
+	// an operator reads to tell "trying" from "stuck": a binding that stays on
+	// attempt 1 is dialing a server that never answers, and one whose attempts
+	// climb is being refused repeatedly.
+	ReconnectAttempt int
 }

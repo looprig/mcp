@@ -76,21 +76,41 @@ type Client struct {
 	stopRefresher context.CancelFunc
 	refresherDone chan struct{}
 
-	// connOnce guards the single Close of conn. Both Connect's unwind path and
-	// Close go through it, so a conn can never be closed twice.
-	connOnce sync.Once
-	connErr  error
+	// reconnectCh carries a request for a reconnect pass, buffered to one for
+	// the same reason as refreshCh: every request that observes one lost
+	// connection reports the same loss, and they collapse onto one pass.
+	reconnectCh chan struct{}
+	// stopReconnector ends the reconnect worker; reconnectorDone is closed when
+	// it has. See stopRefresher for why both are nil before the binding is
+	// ready.
+	stopReconnector context.CancelFunc
+	reconnectorDone chan struct{}
+
 	// closeOnce guards the whole shutdown sequence, making Close idempotent.
 	closeOnce sync.Once
+	// caps are the client capabilities settled at Connect. A reconnect
+	// re-advertises exactly these: what the host can serve is a property of the
+	// host, so it must not drift across a reconnection.
+	caps protocol.ClientCapabilities
 
 	// mu guards the conn handle and the observable metadata below. The
 	// lifecycle state itself lives in the machine, which does its own locking.
 	mu sync.Mutex
-	// conn is the established connection, assigned once by startup. It is
-	// guarded because Close may read it from another goroutine — today only
-	// after Connect returned, but reconnection will re-run startup on a Client
-	// a caller already holds.
-	conn            protocol.Conn
+	// conn is the binding's current connection. It is guarded because Close and
+	// the reconnect worker both reach for it from other goroutines.
+	conn protocol.Conn
+	// connEpoch identifies which connection conn is: it is incremented every
+	// time one replaces another.
+	//
+	// It exists because a request outlives the connection it was issued on. A
+	// call that started on connection 1, and reports its death after connection
+	// 2 is already serving, is describing a connection that is already gone —
+	// and without an epoch to say so, that stale report degrades a healthy
+	// binding and starts a reconnect against a connection nothing is wrong
+	// with. The epoch is what makes "this connection is lost" a claim about a
+	// specific connection rather than about whatever is current when the report
+	// lands.
+	connEpoch       uint64
 	server          ServerIdentity
 	protocolVersion string
 	failure         *Failure
@@ -113,6 +133,9 @@ type Client struct {
 	// stale holds the catalog families a server has announced a change to and
 	// which have not been refetched since.
 	stale map[catalog.Family]struct{}
+	// reconnectAttempt is the reconnect attempt currently in flight, or 0 when
+	// the binding is not reconnecting.
+	reconnectAttempt int
 }
 
 // Connect establishes a binding: it validates def, opens a transport, performs
@@ -137,6 +160,7 @@ func Connect(ctx context.Context, def Definition, h Handlers) (*Client, error) {
 	}
 
 	c := newClient(def.normalized(), h)
+	c.caps = caps
 
 	startCtx, cancel := context.WithTimeout(ctx, c.def.Timeouts.Startup)
 	defer cancel()
@@ -159,6 +183,7 @@ func newClient(def Definition, h Handlers) *Client {
 		logHandler:   h.Log,
 		eventHandler: h.Event,
 		refreshCh:    make(chan struct{}, 1),
+		reconnectCh:  make(chan struct{}, 1),
 		stale:        make(map[catalog.Family]struct{}),
 		sched: sched.New(sched.Config{
 			MaxConcurrent: def.Limits.MaxConcurrentRequests,
@@ -253,6 +278,7 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	// had to remember to stop, and the only work it has is on a live connection
 	// anyway. From here the goroutine's lifetime is exactly Close's.
 	c.startRefresher()
+	c.startReconnector()
 	return nil
 }
 
@@ -464,20 +490,28 @@ func (c *Client) recordFailure(err *Error) {
 	c.mu.Unlock()
 }
 
-// closeConn closes the transport at most once, whichever path gets there first.
+// closeConn closes the binding's current connection, at most once however many
+// paths race for it.
+//
+// The guard is ownership, not a sync.Once: the conn is taken out of the Client
+// under the lock, and whoever takes it is the one who closes it. Everyone else
+// finds nothing and returns. That is what a Once cannot do here — a binding may
+// have several connections over its life (reconnect retires one and installs
+// another), and a Once would let the first close swallow every later one,
+// leaking every connection after the first.
 func (c *Client) closeConn(ctx context.Context) error {
-	c.connOnce.Do(func() {
-		// Read the conn under the lock — startup may still be assigning it —
-		// but never call into it while holding one.
-		c.mu.Lock()
-		conn := c.conn
-		c.mu.Unlock()
-		if conn != nil {
-			c.connErr = conn.Close(ctx)
-		}
-	})
-	if c.connErr != nil {
-		return NewError(FailureTransportClosed, c.def.Name, opClose, "closing the transport failed", c.connErr)
+	c.mu.Lock()
+	conn := c.conn
+	c.conn = nil
+	c.mu.Unlock()
+
+	if conn == nil {
+		return nil
+	}
+	// Never call into a transport while holding the lock: it is foreign code and
+	// its close may take as long as its peer does.
+	if err := conn.Close(ctx); err != nil {
+		return NewError(FailureTransportClosed, c.def.Name, opClose, "closing the transport failed", err)
 	}
 	return nil
 }
@@ -509,6 +543,7 @@ func (c *Client) Status() Status {
 		s.CandidateGeneration = c.candidate.Number()
 		s.CandidateDigest = c.candidate.Digest().String()
 	}
+	s.ReconnectAttempt = c.reconnectAttempt
 	if c.failure != nil {
 		// Copy: a caller must not be able to rewrite the client's own record.
 		f := *c.failure
@@ -541,6 +576,7 @@ func (c *Client) Close(ctx context.Context) error {
 		// peer exit on a read error rather than a clean stop.
 		c.sched.Shutdown()
 		c.stopRefreshing(ctx)
+		c.stopReconnecting(ctx)
 		err = c.closeConn(ctx)
 		_ = c.machine.To(lifecycle.StateClosed)
 		c.unwatch()

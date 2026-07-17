@@ -181,7 +181,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // new generation to compare, or an error and nothing else. There is no path here
 // that half-updates anything.
 func (c *Client) refreshOnce(ctx context.Context) error {
-	conn, err := c.serving(opRefresh)
+	conn, epoch, err := c.serving(opRefresh)
 	if err != nil {
 		return err
 	}
@@ -219,7 +219,9 @@ func (c *Client) refreshOnce(ctx context.Context) error {
 		Limits:    c.def.Limits.catalog(),
 	})
 	if err != nil {
-		return c.classify(fetchCtx, opRefresh, err, discoveryClass(err))
+		// A refresh is how a binding with no traffic finds out its connection
+		// died: nothing else touches the wire until a caller makes a call.
+		return c.noteFailure(epoch, c.classify(fetchCtx, opRefresh, err, discoveryClass(err)))
 	}
 	c.publish(gen)
 	return nil

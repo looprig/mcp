@@ -146,6 +146,9 @@ type Definition struct {
 	ToolFilter ToolFilter
 	// AllowParallelCalls opts in to bounded parallel tool calls.
 	AllowParallelCalls bool
+	// Reconnect governs rebuilding a connection that failed transiently. The
+	// zero value reconnects under the default bounds.
+	Reconnect ReconnectPolicy
 	// Refresh bounds the retries of a catalog refresh that failed. Zero fields
 	// select their defaults.
 	//
@@ -188,6 +191,7 @@ func (d Definition) Validate() error {
 		d.ToolFilter.validate(),
 		d.LogLevel.validate(),
 		d.Refresh.validate("Refresh"),
+		d.Reconnect.validate("Reconnect"),
 	} {
 		if err != nil {
 			return NewError(FailureInvalidConfig, d.Name, "validate", err.Error(), nil)
@@ -205,6 +209,7 @@ func (d Definition) normalized() Definition {
 	d.Limits = d.Limits.withDefaults()
 	d.ToolFilter = d.ToolFilter.clone()
 	d.Refresh = d.Refresh.withDefaults()
+	d.Reconnect = d.Reconnect.withDefaults()
 	if d.LogLevel == "" {
 		d.LogLevel = DefaultLogLevel
 	}
