@@ -195,6 +195,14 @@ type Manager struct {
 	// field rather than a constant for the same reason retireIn is: a test must
 	// be able to drive the deadline without waiting out DefaultElicitationTimeout.
 	elicitIn time.Duration
+
+	// afterReplaceConnect, when non-nil, is called by applyReplace after a
+	// replacement's dial has settled and before the install decision. It is nil
+	// in production; a concurrency test uses it to land a Close (or another op)
+	// in the one window that decision must survive, so the guard is exercised
+	// deterministically rather than by hoping the race lands. It is set once,
+	// before the Reconfigure that reads it, so it carries no lock.
+	afterReplaceConnect func()
 }
 
 // NewManager validates the bindings and returns a Manager that has not connected

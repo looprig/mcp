@@ -192,6 +192,7 @@ func (c *scriptedConn) ReadResource(context.Context, string) (protocol.ResourceR
 }
 
 func (c *scriptedConn) Subscribe(context.Context, string) error   { return nil }
+func (c *scriptedConn) Unsubscribe(context.Context, string) error { return nil }
 func (c *scriptedConn) SetLogLevel(context.Context, string) error { return nil }
 
 func (c *scriptedConn) Close(context.Context) error {

@@ -195,38 +195,125 @@ func (m *Manager) applyAdd(ctx context.Context, op BindingOp) error {
 }
 
 // applyReplace connects the replacement before retiring the prior route.
+//
+// Two races make this the sharpest edge in the package, and both are closed
+// here structurally rather than by timing luck:
+//
+//   - The dial runs on the Manager's context, so it outlives the caller. A
+//     caller that gives up — its reconfigure deadline expires — leaves the dial
+//     still running; it will settle a LIVE client into next. A guardian tracked
+//     by m.wg closes that client whenever it lands, so an abandoned replacement
+//     can never leak its subprocess/socket, whether it lands before or after the
+//     caller returned, and Close waits for the guardian before it returns.
+//   - Install is a compare-and-swap on the binding's identity: next replaces the
+//     route only if the slot STILL holds the exact prior state this op set out
+//     to replace, and only if the Manager has not closed. A remove, a newer
+//     replace, or a Close that landed while next was dialing revokes the
+//     authority to install — so a slow replacement can never resurrect a binding
+//     a remove deliberately revoked, nor install a live client into a closed
+//     Manager. bindingState pointer identity is the generation token: every op
+//     installs a fresh state, and a removed one is never reinstalled, so there is
+//     no ABA to defeat the comparison.
 func (m *Manager) applyReplace(ctx context.Context, op BindingOp) error {
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return ErrManagerClosed
+	}
 	prior, exists := m.states[op.name]
-	m.mu.Unlock()
 	if !exists {
+		m.mu.Unlock()
 		return fmt.Errorf("binding does not exist")
 	}
-
 	next := newBindingState(op.binding)
+	// keep is resolved once, with true when next is installed and false when it
+	// is abandoned; the guardian closes next's client iff abandoned. Adding the
+	// guardian to m.wg here, under m.mu with the closed check, is what lets Close
+	// account for an in-flight replacement: a guardian only exists when it was
+	// registered before Close set closed, so Close's wait always covers it.
+	keep := make(chan bool, 1)
+	m.wg.Add(1)
+	go m.guardReplacement(next, keep)
+	m.mu.Unlock()
+
 	err := m.connectNow(ctx, next)
-	if err != nil {
-		if !op.failClosed {
-			// The prior binding is untouched and still installed: a failed
-			// upgrade must not cost the server that was working.
-			return fmt.Errorf("replacement failed; prior binding remains active: %w", err)
-		}
-		m.mu.Lock()
-		delete(m.states, op.name)
-		m.mu.Unlock()
-		m.retire(prior)
-		return fmt.Errorf("replacement failed and policy is fail-closed; prior binding retired: %w", err)
+
+	if m.afterReplaceConnect != nil {
+		m.afterReplaceConnect()
 	}
 
 	m.mu.Lock()
-	m.states[op.name] = next
+	stillOurs := m.states[op.name] == prior
+	install := err == nil && !m.closed && stillOurs
+	retirePrior := err != nil && op.failClosed && stillOurs
+	switch {
+	case install:
+		m.states[op.name] = next
+	case retirePrior:
+		delete(m.states, op.name)
+	}
 	m.mu.Unlock()
-	// Retire only after the new route is installed. Between these two lines a
-	// new call finds the new route and an in-flight one still holds the old:
-	// that overlap is the point (design §Binding reconfiguration — "a new
-	// logical client before the old route is retired").
-	m.retire(prior)
-	return nil
+
+	// Resolve the guardian before anything else: on the abandon path it is what
+	// closes next, and it must not be left waiting.
+	keep <- install
+
+	if install {
+		// Retire only after the new route is installed. Between these two lines a
+		// new call finds the new route and an in-flight one still holds the old:
+		// that overlap is the point (design §Binding reconfiguration — "a new
+		// logical client before the old route is retired").
+		m.retire(prior)
+		return nil
+	}
+	if retirePrior {
+		m.retire(prior)
+	}
+	switch {
+	case err != nil && op.failClosed:
+		return fmt.Errorf("replacement failed and policy is fail-closed; prior binding retired: %w", err)
+	case err != nil:
+		// The prior binding is untouched and still installed: a failed upgrade
+		// must not cost the server that was working.
+		return fmt.Errorf("replacement failed; prior binding remains active: %w", err)
+	default:
+		// The replacement connected, but the binding was removed, replaced again,
+		// or the Manager closed while it dialed. Installing now would resurrect a
+		// revoked binding or plant a live client in a closed Manager; the
+		// guardian closes the new client instead.
+		return fmt.Errorf("replacement connected but the binding was removed, replaced, or closed before it could install; the new client was closed")
+	}
+}
+
+// guardReplacement closes a replacement's client if the replacement was
+// abandoned rather than installed.
+//
+// It exists because a replacement dials on the Manager's context, not the
+// caller's: the dial can settle a live client after the caller that asked for it
+// has given up (its deadline expired), after a remove or newer replace
+// superseded the binding, or after Close. Whoever made that client is gone, so
+// this closes it. It waits for keep so it can never race the install that hands
+// next to the route table, and it is tracked by m.wg so Close waits for it —
+// making "a connected replacement is always reachable by shutdown" a structural
+// property, not a timing-dependent one.
+func (m *Manager) guardReplacement(next *bindingState, keep <-chan bool) {
+	defer m.wg.Done()
+	if <-keep {
+		// Installed: the route table owns next now, and Close or a later
+		// retirement closes it through the table.
+		return
+	}
+	// Abandoned. The dial always settles — startConnect runs connect to
+	// completion, which closes ready regardless of outcome — so wait for the
+	// client it produces and close it. A dial that failed produced no client.
+	<-next.ready
+	cl := next.client()
+	if cl == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(m.ctx), m.retireIn)
+	defer cancel()
+	_ = cl.Close(ctx)
 }
 
 func (m *Manager) applyRemove(_ context.Context, op BindingOp) error {
