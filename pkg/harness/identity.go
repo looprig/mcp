@@ -237,6 +237,44 @@ func (m *Manager) ConfigIdentity() []BindingIdentity {
 // no preimage for the empty string is known, because it is not a digest.
 //
 // See ConfigIdentity for why this is taken after Start.
+//
+// # The restore flow
+//
+// Harness does not call this. Nothing in this module knows what a Session is, so
+// the composition root — which owns both the Manager and the Session — is what
+// joins them, and the whole protocol is:
+//
+//  1. Recreate the Manager from the CURRENT application configuration. Never
+//     from journal bytes: MCP connections are live resources, and a stdio child
+//     or an OAuth token from last week is not a thing to reconstitute (design
+//     §Session restore).
+//  2. Start it, so the negotiated half of the identity is real — the servers'
+//     catalogs are what they are today, not what they were.
+//  3. Take ConfigDigest and stamp it into the ConfigFingerprint's
+//     ExternalCapabilityRev, alongside the model, prompt and tool-policy revs the
+//     application already supplies.
+//  4. Restore the Session. Harness compares the whole fingerprint against the one
+//     stamped at SessionStarted and rejects a mismatch with a typed
+//     *ConfigMismatchError. An application that means to resume across a change
+//     passes sessionruntime's WithAllowConfigMismatch.
+//
+// Step 4 is the entire drift report, and it is deliberately blunt: one boolean
+// decision over one equality. There is no per-binding drift here, no adopted
+// epoch, and no "which server changed" — the design that specifies those
+// (2026-07-16-session-versioning-migration-design.md) is not implemented, and a
+// richer report from this module would be a shape Harness has nothing to do
+// with. ConfigIdentity is what an application renders when it wants to TELL a
+// human what moved; the digest is what the machine decides on.
+//
+// # What drift does not do
+//
+// It does not make the journal unreadable. Changing servers, tools, schemas,
+// auth posture, transports, or filters is a configuration change, not a
+// migration: historical MCP calls in the journal remain data, and a tool that no
+// longer exists yields a structured ToolUnavailable result on the next call
+// rather than an unrestorable Session (design §Session restore). Accepting drift
+// is therefore a normal thing to do, which is why the override is a boolean and
+// not a repair.
 func (m *Manager) ConfigDigest() string {
 	return digestConfig(m.ConfigIdentity())
 }
