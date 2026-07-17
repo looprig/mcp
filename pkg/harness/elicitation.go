@@ -558,13 +558,38 @@ func (e *elicitor) translateURL(req client.ElicitRequest) (*translation, error) 
 		return nil, err
 	}
 
+	// The Prompt of an open-url gate is HOST-AUTHORED, end to end. req.Message is
+	// not read here, and that is the security property — not an omission.
+	//
+	// The Prompt is the public gate envelope: it rides event.GateOpened into a
+	// journal. gate.OpenURLPayload excludes the action URL structurally (its URL
+	// field is `json:"-"`, the durable codec type has no URL field, and a strict
+	// decode rejects a `url` key) because that URL is a CREDENTIAL — it carries
+	// the PKCE challenge, the `state` token, sometimes a bearer token. All of
+	// that is worth nothing if the server can hand the host the same secrets as
+	// prose and have the host render them into the envelope itself.
+	//
+	// And it could: req.Message is chosen by the server and bounded only in
+	// length. Scanning it for a URL would not fix this. The leak is not "a URL
+	// appears in the message", it is "server-authored ephemeral text reaches a
+	// durable record" — a server needs no URL to write "state=..." into a
+	// journal, and any scanner would be a rule about the inputs someone thought
+	// of rather than a property of every input a server can send. So the message
+	// is not sanitized, not truncated, and not carried: it is never read on this
+	// path at all. That is structural — there is no string here for a server to
+	// choose.
+	//
+	// Nothing is lost that a human needs. The trust decision on an open-url gate
+	// is made on the ORIGIN, and the origin is validated (bareOrigin) and stated
+	// below; the renderer labels it and adds its own trust caution. A server's
+	// account of why it wants authorization is exactly the text a hostile server
+	// would forge, and it is not evidence for the decision being asked.
+	//
+	// This is the opposite of KindForm, where req.Message is the QUESTION and is
+	// journaled deliberately (see translateForm): a form gate has no
+	// durably-excluded secret for a message to re-introduce.
 	title := fmt.Sprintf("%s asks you to open a link", e.bs.binding.Name)
-	// Body names the ORIGIN, never the URL. The Prompt is the public gate
-	// envelope — it rides event.GateOpened into a journal — so a URL in it would
-	// defeat OpenURLPayload's whole structural exclusion by the back door. The
-	// action target travels in the payload's URL field alone, which no codec
-	// serializes.
-	body := fmt.Sprintf("%s\n\nThis will open %s in your browser.", req.Message, origin)
+	body := fmt.Sprintf("This will open %s in your browser.", origin)
 	return &translation{
 		mode: client.ElicitModeURL,
 		request: GateRequest{

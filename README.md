@@ -165,12 +165,20 @@ reaches an origin string or an error.
   `internal/secrettest` is a deliberately hostile reflector — it defeats
   `CanInterface` via `unsafe`, recurses through pointers and unexported fields,
   and ignores `String()`/`Format()` — and cannot reach them.
-- **The open-url `URL` is structurally excluded from the gate _payload_.**
+- **The open-url `URL` reaches no durable record, by any route.**
   `gate.OpenURLPayload.URL` is `json:"-"`: the durable codec type has no URL
   field at all, so the payload journals only a bare `scheme://host` origin.
   `javascript:`, `data:`, and `file:` are refused, and userinfo is dropped.
-  This covers the URL *the adapter handles* — see the caveat below for the URL
-  *a server writes into its own message*.
+
+  The *public envelope* is closed by the same kind of construction rather than by
+  a scan: an open-url gate's `Prompt` is **host-authored end to end**.
+  `translateURL` does not read `req.Message` at all, so there is no
+  server-chosen string anywhere in the durable envelope for a URL — or a bare
+  `state=…` — to arrive in. A human's trust decision is made on the validated
+  bare origin, which the adapter derives itself; a renderer labels it and adds
+  its own trust caution. This is the one place a server's prose is dropped rather
+  than journaled, because it is the one place the design excludes a secret the
+  prose could otherwise re-introduce.
 - **Origins and events are redacted on every transport**, proven per-transport
   rather than by one shared helper. Event payloads carry no server-authored text
   into a status; `ConnectionRestored` deliberately drops server-claimed drift
@@ -210,22 +218,21 @@ Read this section as carefully as the one above.
   answer is journaled, or a per-binding policy refusing free-text from untrusted
   servers — **do not exist**; they are an owner's decision.
 
-  The open-url **payload** `URL` remains structurally excluded regardless — but
-  see the next point before reading that as "the URL cannot be journaled".
+  The open-url path is not subject to this: nothing a server authors reaches an
+  open-url gate's durable envelope at all.
 
-- **A server's own elicitation `Message` is journaled verbatim, including an
-  open-url one.** `translateURL` builds the gate `Prompt.Body` as
-  `req.Message + "\n\nThis will open <origin> in your browser."`, and
-  `gate.Prompt.Body` is `json:"body,omitempty"` — it rides `event.GateOpened`
-  into the journal. `req.Message` is server-authored and only length-bounded.
+- **A server's own elicitation `Message` is journaled verbatim on a _form_
+  gate.** `translateForm` puts `req.Message` in the gate's `Body`, and it rides
+  `event.GateOpened` into the journal. That is deliberate — on a form gate the
+  message is the *question*, and a journaled answer whose question was dropped is
+  a record nobody can read. It is bounded (4 KiB) and, for free-text forms,
+  scanned by the same credential heuristic described above, with that heuristic's
+  same limits: it stops a careless server, not a hostile one.
 
-  So the payload's structural exclusion of `URL` protects the URL the *adapter*
-  puts there; it does **not** stop a server from writing its full authorization
-  URL — `state`, `code_challenge` and all — into its own message, where it is
-  journaled in the clear. The in-code comment asserting that `Prompt.Body`
-  closes this "back door" is establishing the property for only one of `Body`'s
-  two inputs. Treat an open-url elicitation's *message* as untrusted,
-  server-controlled text with a durable destination.
+  A form gate has no durably-excluded secret for a message to re-introduce, which
+  is what makes this different from the open-url case rather than an instance of
+  it. It remains true that a form gate's body is untrusted, server-controlled
+  text with a durable destination — treat it as such.
 
 - **Sampling depth counts one observable causal link.** A chain is attributed
   only when the host's handler calls back into *this* client *with the handler's

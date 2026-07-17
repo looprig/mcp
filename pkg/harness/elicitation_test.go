@@ -797,6 +797,17 @@ func TestFormActionsMap(t *testing.T) {
 // token and a PKCE challenge. None of it may reach a durable record.
 const secretURL = "https://idp.example.com/authorize?state=CANARY-STATE-SECRET&code_challenge=CANARY-PKCE-SECRET#frag"
 
+// hostileMessage is the message a MALICIOUS server sends: prose that restates
+// the action URL, secrets and all.
+//
+// This is the input that matters, and the input the first version of this test
+// never drove. req.Message is server-authored and only length-bounded, so a
+// server that wants its `state` and PKCE challenge in the host's journal does
+// not need to defeat OpenURLPayload's structural exclusion — it only needs the
+// host to render its message into the public Prompt. A fake that sends
+// "authorize this app" proves nothing about a server that sends this.
+const hostileMessage = "Please authorize: " + secretURL + " (open it now)"
+
 // TestURLElicitationKeepsTheURLOutOfDurableRecords is the other security guard.
 //
 // Design §Elicitation: "the full action URL and query parameters are not written
@@ -805,6 +816,10 @@ const secretURL = "https://idp.example.com/authorize?state=CANARY-STATE-SECRET&c
 // field at all — but the PROMPT is the public envelope that rides
 // event.GateOpened into a journal, so a URL rendered into Prompt.Body would
 // defeat the whole design by the back door. This is that test.
+//
+// It drives a HOSTILE message deliberately. The property under test is not "this
+// adapter does not leak the URL" — it is "this adapter does not leak the URL FOR
+// EVERY INPUT A SERVER CAN CHOOSE", and the server chooses the message.
 func TestURLElicitationKeepsTheURLOutOfDurableRecords(t *testing.T) {
 	t.Parallel()
 	gates := &scriptedGates{
@@ -817,7 +832,7 @@ func TestURLElicitationKeepsTheURLOutOfDurableRecords(t *testing.T) {
 	res, err := e.Elicit(context.Background(), client.ElicitRequest{
 		Binding:       "github",
 		Mode:          client.ElicitModeURL,
-		Message:       "authorize this app",
+		Message:       hostileMessage,
 		URL:           secretURL,
 		ElicitationID: "elicit-1",
 	})
@@ -867,12 +882,19 @@ func TestURLElicitationKeepsTheURLOutOfDurableRecords(t *testing.T) {
 	}
 
 	// Now the canary sweep: the secrets must appear NOWHERE but Payload.URL.
-	for _, secret := range []string{"CANARY-STATE-SECRET", "CANARY-PKCE-SECRET"} {
-		if strings.Contains(req.Prompt.Title, secret) {
-			t.Errorf("Prompt.Title carries %s", secret)
-		}
-		if strings.Contains(req.Prompt.Body, secret) {
-			t.Errorf("Prompt.Body carries %s: %q", secret, req.Prompt.Body)
+	//
+	// The Prompt is swept as MARSHALLED JSON, not field by field. It is the
+	// public envelope — it rides event.GateOpened into a journal exactly as it
+	// serializes — so serializing it is the only sweep that covers every field it
+	// has, including any added later. A field-by-field sweep only ever tests the
+	// fields whoever wrote it thought of.
+	promptJSON, err := json.Marshal(req.Prompt)
+	if err != nil {
+		t.Fatalf("Marshal(Prompt) error = %v", err)
+	}
+	for _, secret := range []string{"CANARY-STATE-SECRET", "CANARY-PKCE-SECRET", "authorize?", "code_challenge", "state="} {
+		if strings.Contains(string(promptJSON), secret) {
+			t.Errorf("the DURABLE Prompt envelope carries %s: %s", secret, promptJSON)
 		}
 		if strings.Contains(payload.DisplayOrigin, secret) {
 			t.Errorf("DisplayOrigin carries %s", secret)
@@ -882,6 +904,13 @@ func TestURLElicitationKeepsTheURLOutOfDurableRecords(t *testing.T) {
 				t.Errorf("a Notice carries %s: %q", secret, n.Message)
 			}
 		}
+	}
+
+	// And the positive half: the body must still be the host's own words, naming
+	// the validated origin. A body that leaked nothing because it was empty would
+	// pass every check above while telling the human nothing.
+	if !strings.Contains(req.Prompt.Body, "https://idp.example.com") {
+		t.Errorf("Prompt.Body = %q, want the host's own text naming the validated origin", req.Prompt.Body)
 	}
 
 	// And the payload, once through the codec that a journal uses, must have
