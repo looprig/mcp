@@ -395,3 +395,78 @@ func TestElicitActionString(t *testing.T) {
 		}
 	}
 }
+
+// FuzzFromSDKElicitParams drives arbitrary server-controlled bytes through the
+// elicitation converter — the mode, the prompt and the requested schema are all
+// chosen by an untrusted peer.
+//
+// The invariants are the ones a human's safety rests on: the converter must
+// never panic, and anything it *accepts* must be a declared mode, a prompt
+// within the bound, and (in form mode) a schema that is valid JSON within its
+// own bound. An accepted request is one this module is about to show a person,
+// so "accepted" is the claim worth checking.
+func FuzzFromSDKElicitParams(f *testing.F) {
+	seeds := []struct {
+		mode, message, schema, url, id string
+	}{
+		{"", "confirm?", "", "", ""},
+		{"form", "your name?", `{"type":"object"}`, "", ""},
+		{"form", "", "", "", ""},
+		{"url", "authorize", "", "https://example.com/a?token=x", "e-1"},
+		{"voice", "speak", "", "", ""},
+		{"FORM", "case", "", "", ""},
+		{"form", strings.Repeat("m", 65), "", "", ""},
+		{"form", "ok", `{"unterminated":`, "", ""},
+		{"form", "ok", `[]`, "", ""},
+		{"form", "ok", `null`, "", ""},
+		{"form", "ok", deepObject(64), "", ""},
+		{"form", "ok", `{"pad":"` + strings.Repeat("x", 200) + `"}`, "", ""},
+		{"url", "ok", "", "https://example.com/" + strings.Repeat("p", 64), ""},
+		{"form", "\xff\xfe", "", "", ""},
+	}
+	for _, s := range seeds {
+		f.Add(s.mode, s.message, s.schema, s.url, s.id)
+	}
+
+	f.Fuzz(func(t *testing.T, mode, message, schema, url, id string) {
+		b := elicitBounds()
+		params := &mcp.ElicitParams{Mode: mode, Message: message, URL: url, ElicitationID: id}
+		if schema != "" {
+			params.RequestedSchema = json.RawMessage(schema)
+		}
+
+		got, err := protocol.FromSDKElicitParams(params, b)
+		if err != nil {
+			return
+		}
+
+		// Accepted: every promise this boundary makes must hold.
+		if got.Mode != protocol.ElicitModeForm && got.Mode != protocol.ElicitModeURL {
+			t.Fatalf("accepted an undeclared mode %d from %q", got.Mode, mode)
+		}
+		if len(got.Message) > b.MaxElicitMessageBytes {
+			t.Fatalf("accepted a %d byte prompt, over the %d byte bound",
+				len(got.Message), b.MaxElicitMessageBytes)
+		}
+		switch got.Mode {
+		case protocol.ElicitModeForm:
+			if got.URL != "" || got.ElicitationID != "" {
+				t.Fatalf("a form carries url fields: %+v", got)
+			}
+			if len(got.Schema) > b.MaxElicitSchemaBytes {
+				t.Fatalf("accepted a %d byte schema, over the %d byte bound",
+					len(got.Schema), b.MaxElicitSchemaBytes)
+			}
+			if len(got.Schema) > 0 && !json.Valid(got.Schema) {
+				t.Fatalf("accepted an invalid JSON schema: %s", got.Schema)
+			}
+		case protocol.ElicitModeURL:
+			if got.Schema != nil {
+				t.Fatalf("a url elicitation carries a schema: %+v", got)
+			}
+			if len(got.URL) > b.MaxElicitMessageBytes {
+				t.Fatalf("accepted a %d byte url, over the %d byte bound", len(got.URL), b.MaxElicitMessageBytes)
+			}
+		}
+	})
+}
