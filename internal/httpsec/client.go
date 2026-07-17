@@ -371,6 +371,14 @@ type RoundTripper struct {
 
 // RoundTrip implements http.RoundTripper.
 func (rt *RoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	// A new request must not inherit a *previous* request's response status. If a
+	// prior request's status had ended the session there would be no request now,
+	// so a status that outlived it did not end the session and cannot be the
+	// reason a later request — a genuine transport loss, say — fails. Only the
+	// status is cleared here; the stream-scoped and session-scoped causes are
+	// left, see resetPerRequest.
+	rt.Diags.resetPerRequest()
+
 	// Cloned before anything is written: RoundTrip must not modify the request
 	// it is given, and the SDK builds requests it may still be holding.
 	req = req.Clone(req.Context())
@@ -590,9 +598,20 @@ func (rr *recordingReader) Read(p []byte) (int, error) {
 // past, at the point where the cause was still a value.
 //
 // It is a record and not a channel: nothing waits on it, and nothing acts on it
-// except classify, after something has already failed. That is why the
-// last-writer-wins fields below are honest — there is exactly one failure being
-// explained, and it is the reason the session is over.
+// except classify, after something has already failed.
+//
+// Its fields fall into two lifetimes, because a failure describes either one
+// request or the whole session. The status is request-scoped: it is written
+// synchronously for a single request's response line and cleared at the head of
+// the next request (see resetPerRequest), so a later transport loss is never
+// labelled with an earlier request's 401. The limit, stall and auth causes are
+// session-scoped and first-writer-wins: a stall or over-limit body ends the
+// session it streams on, and a refused credential recurs on every request until
+// it changes — so the first of each is the one that explains why the session is
+// over, and it is kept. (The limit and stall are also written asynchronously,
+// from the SDK's body-read goroutines, which is the second reason not to clear
+// them per request: doing so would erase a live stream's genuine cause the
+// moment a concurrent request began.)
 //
 // It is safe for concurrent use: the SDK reads its streams on goroutines of its
 // own, so a status and a body can be recorded from two places at once.
@@ -608,6 +627,31 @@ type Diagnostics struct {
 	authErr    error
 	limitErr   error
 	stallErr   error
+}
+
+// resetPerRequest clears the status a single request's response recorded, so a
+// fresh request starts explaining nothing but itself.
+//
+// Only the status is cleared, and the reason is where each cause is recorded.
+// The status is written synchronously in RoundTrip, for this request's own
+// response line, before the request returns — so clearing it at the head of the
+// next request is coherent: no other request is writing it. The limit and stall
+// are written asynchronously, from the goroutines on which the SDK reads
+// response bodies, and those reads outlive the RoundTrip that started them and
+// overlap the next request's; clearing them here would erase a *live* stream's
+// genuine mid-frame stall the moment a second request began, which is a real
+// regression, not a hypothetical. They are session-scoped instead: a stall or an
+// over-limit body ends the session it is read on, and first-writer-wins keeps
+// that first fatal cause.
+//
+// The auth failure is likewise session-scoped, but for a different reason: a
+// refused credential is not a property of one request, and every request until
+// the credential changes fails the same way. Clearing it would make a chain of
+// requests each re-discover the same lockout as a fresh mystery.
+func (d *Diagnostics) resetPerRequest() {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.lastStatus = 0
 }
 
 // RecordStallError keeps the first stalled frame. Like the others it is a
