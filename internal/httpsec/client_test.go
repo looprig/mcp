@@ -4,7 +4,12 @@
 package httpsec
 
 import (
+	"context"
+	"errors"
+	"net"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/looprig/mcp/internal/protocol"
 )
@@ -57,4 +62,50 @@ func TestNewWireLimits(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestVetTransportBoundsTheDial pins Timeouts.Dial on the supplied-client path.
+//
+// It was applied only by DefaultTransport, so a caller who supplied a transport
+// — the very path VetTransport exists to serve — got no dial bound at all when
+// their transport had no DialContext, which is the usual shape for someone
+// cloning a transport just to pin a CA. The doc said the timeouts always
+// applied; for Dial it was true of one path out of two.
+//
+// The timeout VALUE is not observable through a DialContext func, so this
+// asserts the two things that are: that a bound is installed where there was
+// none, and that a caller's own dialer is left alone.
+func TestVetTransportBoundsTheDial(t *testing.T) {
+	t.Parallel()
+	timeouts := Timeouts{Dial: time.Second, TLSHandshake: time.Second, ResponseHeader: time.Second, IdleConn: time.Second}
+
+	t.Run("a nil DialContext is filled in", func(t *testing.T) {
+		t.Parallel()
+		got, err := VetTransport(&http.Client{Transport: &http.Transport{}}, timeouts)
+		if err != nil {
+			t.Fatalf("VetTransport() error = %v", err)
+		}
+		if got.DialContext == nil {
+			t.Fatal("DialContext is nil: the connect is bounded only by the OS TCP stack")
+		}
+	})
+
+	t.Run("a caller's own dialer is kept", func(t *testing.T) {
+		t.Parallel()
+		called := false
+		mine := func(ctx context.Context, network, addr string) (net.Conn, error) {
+			called = true
+			return nil, errors.New("mine")
+		}
+		got, err := VetTransport(&http.Client{Transport: &http.Transport{DialContext: mine}}, timeouts)
+		if err != nil {
+			t.Fatalf("VetTransport() error = %v", err)
+		}
+		if _, err := got.DialContext(context.Background(), "tcp", "example.invalid:80"); err == nil {
+			t.Fatal("DialContext() error = nil, want the caller's dialer's error")
+		}
+		if !called {
+			t.Error("the caller's DialContext was replaced; a supplied dialer is theirs to own")
+		}
+	})
 }

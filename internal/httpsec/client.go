@@ -65,6 +65,12 @@ const MaxRedirects = 5
 // Every field is expected positive; a transport passes a defaulted value.
 type Timeouts struct {
 	// Dial bounds the TCP connect.
+	//
+	// It is applied to every transport this package builds, and to a supplied
+	// transport that has no DialContext of its own. A caller who installs a
+	// DialContext owns its timeout: that field is how a proxy or a custom
+	// resolver is configured, so this package fills it in when it is absent
+	// rather than overwriting a dialing policy someone chose on purpose.
 	Dial time.Duration
 	// TLSHandshake bounds the TLS handshake.
 	TLSHandshake time.Duration
@@ -278,6 +284,24 @@ func VetTransport(c *http.Client, t Timeouts) (*http.Transport, error) {
 	base.TLSHandshakeTimeout = t.TLSHandshake
 	base.ResponseHeaderTimeout = t.ResponseHeader
 	base.IdleConnTimeout = t.IdleConn
+	if base.DialContext == nil {
+		// A nil DialContext is not a caller's dialing policy — it is net/http's
+		// zero-value fallback, which has no timeout at all and would leave the
+		// connect bounded only by the OS TCP stack. That is the common shape
+		// here: someone clones http.DefaultTransport's idea to pin a CA and
+		// never thinks about dialing. Filling it in is what makes Timeouts.Dial
+		// true on this path rather than only on DefaultTransport's.
+		//
+		// A caller who DID supply a DialContext keeps it, timeout and all. It is
+		// the one field a caller has a real reason to own — a proxy, a custom
+		// resolver, a test dialer — and overwriting it would break the use case
+		// VetTransport exists to permit. See Timeouts.Dial, which states this
+		// split.
+		base.DialContext = (&net.Dialer{
+			Timeout:   t.Dial,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+	}
 	return base, nil
 }
 
