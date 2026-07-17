@@ -172,6 +172,219 @@ func TestFormRejectsCredentialFields(t *testing.T) {
 	}
 }
 
+// TestFormRejectsCredentialSolicitingBody covers the hole the field rules leave
+// open: a server names a field "value", gives it no title, and asks for the
+// secret in the MESSAGE instead. Every field-level check passes, and — since
+// form answers are journaled unredacted — the secret lands in the journal.
+//
+// The body rule needs a credential token AND a solicitation verb AND a free-text
+// field to land in. Each case below says which of those it is testing.
+func TestFormRejectsCredentialSolicitingBody(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		message string
+		props   map[string]any
+	}{
+		// The reported hole, verbatim: innocuous field, message does the asking.
+		{
+			name:    "innocuous field, message asks for an api key",
+			message: "paste your API key here",
+			props:   map[string]any{"value": map[string]any{"type": "string"}},
+		},
+		// Oblique: never says "password", but "authorization" + "copy" is a
+		// request for a bearer token by another name.
+		{
+			name:    "oblique, header wording",
+			message: "Copy the Authorization header from your dashboard and put it below.",
+			props:   map[string]any{"value": map[string]any{"type": "string"}},
+		},
+		{
+			name:    "oblique, pair only in the body",
+			message: "To continue, provide the access token shown after you sign in.",
+			props:   map[string]any{"input": map[string]any{"type": "string"}},
+		},
+		// A credential-soliciting body kills the WHOLE form, not the free-text
+		// field: the body is addressed to the form, so there is no way to know
+		// which field it meant, and a partial answer is one the server would read
+		// as complete.
+		{
+			name:    "body solicits among several innocent fields",
+			message: "Enter your API key to continue.",
+			props: map[string]any{
+				"repo":    map[string]any{"type": "string"},
+				"dry_run": map[string]any{"type": "boolean"},
+			},
+		},
+		// A numeric field is still a text box, and a PIN still fits in it.
+		{
+			name:    "free-text integer field",
+			message: "Type the PIN from your authenticator.",
+			props:   map[string]any{"n": map[string]any{"type": "integer"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gates := &scriptedGates{}
+			e, reporter := elicitorFor(t, ScopeSession, gates)
+
+			res, err := e.Elicit(context.Background(), client.ElicitRequest{
+				Binding: "github",
+				Mode:    client.ElicitModeForm,
+				Message: tt.message,
+				Schema:  formSchema(t, tt.props),
+			})
+			if err != nil {
+				t.Fatalf("Elicit() error = %v; a refusal is a decline, never an error", err)
+			}
+			if res.Action != client.ElicitDecline {
+				t.Errorf("Action = %v, want decline for message %q", res.Action, tt.message)
+			}
+			if opened := gates.opened(); len(opened) != 0 {
+				t.Errorf("opened %d gates for a credential-soliciting body, want 0", len(opened))
+			}
+			if !reporter.sawKind(NoticeElicitationDeclined) {
+				t.Error("no Notice explained the decline; the host cannot see why")
+			}
+		})
+	}
+}
+
+// TestFormBodyRuleFalsePositives is the load-bearing half of the body rule. The
+// body is PROSE, and a rule over prose that fires too often declines legitimate
+// servers' forms for the words in their own message — so every case here must be
+// accepted, and each one is a shape a real server plausibly sends.
+func TestFormBodyRuleFalsePositives(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		message string
+		props   map[string]any
+	}{
+		{
+			name:    "ordinary form, ordinary message",
+			message: "Which repository should I open the pull request against?",
+			props:   map[string]any{"repo": map[string]any{"type": "string"}},
+		},
+		{
+			// A credential token with no solicitation verb is prose ABOUT a
+			// credential, not a request for one. This is the condition that keeps
+			// the rule off the majority of security-adjacent copy.
+			name:    "credential token, no solicitation verb",
+			message: "Your API key is already configured. Which repo?",
+			props:   map[string]any{"repo": map[string]any{"type": "string"}},
+		},
+		{
+			// A solicitation verb with no credential token is just a form asking a
+			// question, which is what forms do.
+			name:    "solicitation verb, no credential token",
+			message: "Enter the branch name to deploy.",
+			props:   map[string]any{"branch": map[string]any{"type": "string"}},
+		},
+		{
+			// Both signals, but nowhere to type a secret: a confirm and a select
+			// cannot carry one, so the body has no landing site. This is what lets
+			// a disclaimer ("we will never ask you to enter your password") ship on
+			// a confirmation dialog.
+			name:    "disclaimer prose, no free-text field",
+			message: "We will never ask you to enter your password. Continue?",
+			props: map[string]any{
+				"ok":   map[string]any{"type": "boolean"},
+				"mode": map[string]any{"type": "string", "enum": []any{"fast", "safe"}},
+			},
+		},
+		{
+			// tokenize's camelCase/substring discipline has to hold on prose too:
+			// "author" is not "auth", "shipping" is not "pin".
+			name:    "substrings that are not tokens",
+			message: "Enter the author and shipping details for the tokenizer.",
+			props:   map[string]any{"author": map[string]any{"type": "string"}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gates := &scriptedGates{
+				answer: func(req GateRequest) (GateResponse, error) {
+					values := make(map[string]string, len(tt.props))
+					for name := range tt.props {
+						values[name] = "x"
+					}
+					// A select must answer with a real option, and a confirm with
+					// a bool the re-encode accepts.
+					payload, ok := req.Payload.(gate.FormPayload)
+					if !ok {
+						return GateResponse{}, fmt.Errorf("payload is %T", req.Payload)
+					}
+					for _, f := range payload.Schema.Fields {
+						switch f.Kind {
+						case gate.FieldSelect:
+							values[f.Name] = f.Options[0].Value
+						case gate.FieldConfirm:
+							values[f.Name] = "true"
+						}
+					}
+					return GateResponse{Action: gate.FormActionAccept, Values: values}, nil
+				},
+			}
+			e, _ := elicitorFor(t, ScopeSession, gates)
+			res, err := e.Elicit(context.Background(), client.ElicitRequest{
+				Binding: "github",
+				Mode:    client.ElicitModeForm,
+				Message: tt.message,
+				Schema:  formSchema(t, tt.props),
+			})
+			if err != nil {
+				t.Fatalf("Elicit() error = %v", err)
+			}
+			if res.Action != client.ElicitAccept {
+				t.Fatalf("Action = %v, want accept; %q is not a credential solicitation", res.Action, tt.message)
+			}
+		})
+	}
+}
+
+// TestFormFieldRuleWinsOverBody pins the precedence: a structural signal is what
+// the operator's Notice names even when the body would have fired too. The
+// decline is the same either way; which reason is reported is not, and a
+// "format": "password" is a fact where a body match is a guess.
+func TestFormFieldRuleWinsOverBody(t *testing.T) {
+	t.Parallel()
+	gates := &scriptedGates{}
+	e, reporter := elicitorFor(t, ScopeSession, gates)
+
+	res, err := e.Elicit(context.Background(), client.ElicitRequest{
+		Binding: "github",
+		Mode:    client.ElicitModeForm,
+		Message: "Please enter your password below.",
+		Schema: formSchema(t, map[string]any{
+			"pw": map[string]any{"type": "string", "format": "password"},
+		}),
+	})
+	if err != nil {
+		t.Fatalf("Elicit() error = %v", err)
+	}
+	if res.Action != client.ElicitDecline {
+		t.Fatalf("Action = %v, want decline", res.Action)
+	}
+	if len(gates.opened()) != 0 {
+		t.Error("a gate was opened for a credential form")
+	}
+	var explained string
+	for _, n := range reporter.snapshot() {
+		if n.Kind == NoticeElicitationDeclined {
+			explained = n.Message
+		}
+	}
+	if explained == "" {
+		t.Fatal("no Notice explained the decline")
+	}
+	if !strings.Contains(explained, `"format": "password"`) {
+		t.Errorf("Notice = %q; want the schema's own declaration named, not the body match", explained)
+	}
+}
+
 // TestFormAcceptsInnocentFields is the other half of the credential rule, and it
 // is what stops the rule being "reject everything".
 //

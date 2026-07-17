@@ -411,6 +411,7 @@ func (e *elicitor) translateForm(req client.ElicitRequest) (*translation, error)
 
 	fields := make([]gate.Field, 0, len(names))
 	types := make(map[string]string, len(names))
+	freeText := false
 	for _, name := range names {
 		prop := schema.Properties[name]
 		if reason, solicits := solicitsCredential(name, prop); solicits {
@@ -430,8 +431,23 @@ func (e *elicitor) translateForm(req client.ElicitRequest) (*translation, error)
 		}
 		_, isRequired := required[name]
 		field.Required = isRequired
+		if field.Kind == gate.FieldText {
+			freeText = true
+		}
 		fields = append(fields, field)
 		types[name] = jsonType
+	}
+
+	// The body rule, applied after the fields so a structural signal — a
+	// "format": "password", a field named "apiKey" — is what the Notice names
+	// when both would fire. Only free-text forms are scanned: a secret cannot be
+	// typed into a confirm or a select, so a body's request has nowhere to land.
+	if freeText {
+		if reason, solicits := bodySolicitsCredential(req.Message); solicits {
+			return nil, fmt.Errorf("the request's message solicits a credential (%s); "+
+				"sensitive authorization must go through URL elicitation or the auth package, "+
+				"never through durable form values", reason)
+		}
 	}
 
 	schemaOut := gate.PromptSchema{Fields: fields}
@@ -632,6 +648,38 @@ func bareOrigin(raw string) (string, error) {
 // form values". This is where that is decided, and the rule is stated here in
 // full because a security rule nobody can find is one nobody can review.
 //
+// # What this rule IS, and what it is NOT
+//
+// It is a good-faith guardrail against ACCIDENTAL solicitation by a COOPERATIVE
+// server: the integrator who adds an "api_key" field without thinking about
+// where the answer ends up. Against that, it works, and it is worth having.
+//
+// It is NOT a security boundary against a HOSTILE server, and must never be
+// relied on as one. Three reasons, all structural and none fixable by adding
+// words to a list:
+//
+//   - It is a denylist over English tokens. Intent is not recoverable from a
+//     third-party-authored schema; the rule can only recognize the shapes a
+//     server chose to write down.
+//   - "format": "password" and "writeOnly": true are the only RELIABLE signals
+//     here, and they are reliable only because a server volunteered them. A
+//     server that wants the value journaled simply does not declare them.
+//   - Non-English, transliterated, or oblique naming walks past it. A field
+//     named "mot_de_passe", or "value" under a message reading "the string from
+//     your dashboard's top-right panel", tokenizes to nothing on either list.
+//
+// # The residual risk, stated plainly
+//
+// Form answers are journaled UNREDACTED — they are user-authored content, the
+// same as command.UserInput. Redaction is not a second layer behind this check;
+// there is no second layer. So: a determined server CAN still get a secret into
+// the durable journal, by naming a field innocuously and asking for the secret
+// in words this rule does not recognize. What this rule buys is that it has to
+// be determined and deliberate, not careless. That is the whole claim. Anything
+// stronger — a human confirmation before a free-text answer is journaled, or a
+// per-binding policy refusing free-text fields from untrusted servers — is a
+// control that does not exist yet and is an owner's decision, not this file's.
+//
 // A field solicits a credential when ANY of:
 //
 //  1. its JSON Schema says so: "format": "password", or "writeOnly": true. Both
@@ -640,10 +688,42 @@ func bareOrigin(raw string) (string, error) {
 //  3. its TITLE does the same. The title is what a person actually reads, so a
 //     field named "f1" titled "API Key" is caught by this and not by (2).
 //
-// Description is deliberately NOT matched. It is prose, and prose about
-// credentials is mostly prose telling a person NOT to enter one — "this is not
-// your password" would reject itself. A rule that fires on that is one an
-// integrator learns to work around by deleting their own safety text.
+// A field's Description is deliberately NOT matched. It is per-field prose, and
+// prose about credentials is mostly prose telling a person NOT to enter one —
+// "this is not your password" would reject itself. A rule that fires on that is
+// one an integrator learns to work around by deleting their own safety text.
+//
+// # The body rule
+//
+// The form's MESSAGE is matched, under a narrower rule, because the field
+// signals alone left an obvious hole: a server can name a field "value", give it
+// no title, and put "paste your API key here" in the message. Every check above
+// passes, and the answer is journaled. bodySolicitsCredential closes that
+// particular shape.
+//
+// The body is prose, so the Description argument applies to it too — which is
+// why the body rule is not "contains a credential token". Two conditions bound
+// the false positives, and a false positive here is expensive: it declines a
+// legitimate server's form for the words in its own message.
+//
+//  1. The body must pair a credential token with a SOLICITATION VERB — "enter",
+//     "paste", "provide". "We never ask for your password" carries the token but
+//     no verb, and is not a solicitation.
+//  2. The form must have at least one FREE-TEXT field. A secret cannot be typed
+//     into a confirm or a select, so a form whose every field is one of those has
+//     nowhere for the body's request to land, whatever the body says.
+//
+// Those bounds are honest about what they leave: "we will never ask you to enter
+// your password" alongside a free-text field still trips condition 1, because
+// negation is not something a token list can see. That is a known, accepted
+// false positive — it declines, an operator reads the Notice, and no secret is
+// journaled. Fail closed.
+//
+// When the body solicits, the WHOLE form is rejected — the same rule as a bad
+// field, for the same reason. There is no narrower unit available: the body is
+// addressed to the form, not to a field, so there is no way to know WHICH
+// free-text field it meant. Dropping every free-text field and rendering the
+// rest would hand the server a partial answer it never asked for.
 //
 // Tokenization splits on non-alphanumerics AND camelCase boundaries, which is
 // what makes the word list safe to keep short: "apiKey", "api_key", and
@@ -675,9 +755,31 @@ var credentialPairs = [][2]string{
 	{"session", "key"}, {"security", "code"}, {"card", "number"},
 }
 
-// solicitsCredential reports whether a field is asking for a secret, and which
+// solicitationVerbs are the verbs that turn prose ABOUT a credential into a
+// request FOR one. The list is short and imperative on purpose: it is the only
+// thing standing between the body rule and rejecting every form whose message
+// mentions security at all. "submit" and "send" are absent deliberately — they
+// are what every form's own button says.
+var solicitationVerbs = map[string]struct{}{
+	"enter": {}, "paste": {}, "provide": {}, "supply": {}, "type": {},
+	"input": {}, "insert": {}, "copy": {}, "give": {},
+}
+
+// solicitsCredential reports whether a FIELD is asking for a secret, and which
 // rule caught it. The reason is for the host's Reporter; it never reaches the
 // server.
+//
+// This is a good-faith guardrail against accidental solicitation by a
+// cooperative server, NOT a security boundary against a hostile one. It cannot
+// be one: it is a denylist over English tokens, and intent is not inferable from
+// a schema a third party wrote. "format": "password" and "writeOnly": true are
+// dependable only where a server chose to declare them, and a server that wants
+// the answer journaled will not; non-English or oblique naming ("mot_de_passe",
+// a field called "value") reads as innocent to every rule below.
+//
+// Since form answers are journaled unredacted, with no redaction layer behind
+// this check, a determined server can still put a secret in the durable journal.
+// See "The credential rule" above for the full statement of the limit.
 func solicitsCredential(name string, prop elicitProp) (string, bool) {
 	if strings.EqualFold(prop.Format, "password") {
 		return `the schema declares "format": "password"`, true
@@ -690,6 +792,27 @@ func solicitsCredential(name string, prop elicitProp) (string, bool) {
 	}
 	if reason, ok := credentialWords(prop.Title); ok {
 		return "its label " + reason, true
+	}
+	return "", false
+}
+
+// bodySolicitsCredential reports whether the form's MESSAGE asks a person for a
+// secret, and which words caught it.
+//
+// Unlike the field rule this requires TWO signals — a credential token and a
+// solicitation verb — because the body is prose and a bare token in prose is far
+// more often a disclaimer than a request. The caller applies the third
+// condition: only a form with a free-text field is scanned at all. See "The body
+// rule" above.
+func bodySolicitsCredential(body string) (string, bool) {
+	reason, ok := credentialWords(body)
+	if !ok {
+		return "", false
+	}
+	for _, token := range tokenize(body) {
+		if _, isVerb := solicitationVerbs[token]; isVerb {
+			return fmt.Sprintf("%s alongside the solicitation verb %q", reason, token), true
+		}
 	}
 	return "", false
 }
