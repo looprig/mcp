@@ -58,6 +58,8 @@ type Conn interface {
 	ReadResource(ctx context.Context, uri string) (ResourceResult, error)
 	// Subscribe asks the server to report changes to a resource.
 	Subscribe(ctx context.Context, uri string) error
+	// Unsubscribe asks the server to stop reporting changes to a resource.
+	Unsubscribe(ctx context.Context, uri string) error
 	// SetLogLevel asks the server to send logs at or above level. A server
 	// sends none until this is called.
 	SetLogLevel(ctx context.Context, level string) error
@@ -115,6 +117,17 @@ type ConnectConfig struct {
 	// goroutine and blocks it: an implementation must record the change and
 	// return, never fetch.
 	OnListChanged func(ListChange)
+
+	// OnResourceUpdated receives the server's resource-update notifications: a
+	// server telling a subscriber that a resource it subscribed to has changed.
+	// Nil drops them.
+	//
+	// Like OnListChanged it is a callback for want of a request to return it
+	// from, and it is invoked on the connection's notification goroutine and
+	// blocks it: an implementation must record the update and return, never
+	// re-read the resource here. The URI it carries is server-supplied and
+	// bounded before it arrives.
+	OnResourceUpdated func(ResourceUpdate)
 
 	// OnElicit serves the server's requests for human input, already bounded
 	// and validated. Nil means no elicitation is served — and, because a
@@ -210,6 +223,19 @@ func (f ListFamily) String() string {
 		return "unknown"
 	}
 	return listFamilyNames[f]
+}
+
+// ResourceUpdate is a server's announcement that a subscribed resource changed.
+//
+// It carries only the URI of the resource the server says changed, bounded
+// before it reaches this type. Like a list-change notification it is a claim,
+// not content: the resource's new value is not here, and a subscriber that wants
+// it re-reads the resource, which is the only way to learn what changed from an
+// untrusted peer rather than trusting its account of the delta.
+type ResourceUpdate struct {
+	// URI names the resource the server says changed. It may be a sub-resource
+	// of the one that was subscribed to.
+	URI string
 }
 
 // ListChange is a server's announcement that a catalog family changed.

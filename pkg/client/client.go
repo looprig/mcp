@@ -257,15 +257,16 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	}
 
 	conn, err := c.def.Transport.Connect(ctx, protocol.ConnectConfig{
-		Client:        protocol.ClientIdentity{Name: ClientName, Version: ClientVersion, Title: ClientTitle},
-		Capabilities:  caps,
-		Bounds:        c.def.Limits.bounds(),
-		Wire:          c.def.Limits.wire(),
-		OnLog:         c.logAdapter(),
-		OnListChanged: c.onListChanged,
-		OnElicit:      c.elicitAdapter(),
-		OnSample:      c.sampleAdapter(),
-		OnRoots:       c.rootsAdapter(),
+		Client:            protocol.ClientIdentity{Name: ClientName, Version: ClientVersion, Title: ClientTitle},
+		Capabilities:      caps,
+		Bounds:            c.def.Limits.bounds(),
+		Wire:              c.def.Limits.wire(),
+		OnLog:             c.logAdapter(),
+		OnListChanged:     c.onListChanged,
+		OnResourceUpdated: c.onResourceUpdated,
+		OnElicit:          c.elicitAdapter(),
+		OnSample:          c.sampleAdapter(),
+		OnRoots:           c.rootsAdapter(),
 	})
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)

@@ -121,6 +121,14 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 		ResourceListChangedHandler: func(_ context.Context, _ *mcp.ResourceListChangedRequest) {
 			s.onListChanged(ListFamilyResources)
 		},
+		// The resource-update notification, for a resource this client subscribed
+		// to. Registered unconditionally for the same reason as the list-change
+		// handlers above: an update with no OnResourceUpdated installed is dropped
+		// in onResourceUpdated, where declining to register it would leave the SDK
+		// logging an unhandled notification instead.
+		ResourceUpdatedHandler: func(_ context.Context, req *mcp.ResourceUpdatedNotificationRequest) {
+			s.onResourceUpdated(req.Params)
+		},
 	}
 
 	// Elicitation, unlike every handler above, is registered conditionally —

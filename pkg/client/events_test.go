@@ -20,6 +20,7 @@ func eventUnion() []Event {
 	return []Event{
 		StateChanged{},
 		CatalogStale{},
+		ResourceUpdated{},
 		CatalogCandidate{},
 		CatalogRefreshed{},
 		CatalogAdopted{},

@@ -33,6 +33,7 @@ const (
 	opGetPrompt    = "get_prompt"
 	opReadResource = "read_resource"
 	opSubscribe    = "subscribe"
+	opUnsubscribe  = "unsubscribe"
 )
 
 // Progress is one progress report from an in-flight call. Every field is
@@ -301,6 +302,50 @@ func (c *Client) Subscribe(ctx context.Context, uri string) error {
 		return c.requestFailure(ctx, callCtx, opSubscribe, epoch, err)
 	}
 	return nil
+}
+
+// Unsubscribe asks the server to stop reporting changes to a resource.
+//
+// It is the counterpart to Subscribe and is gated the same way: a server that
+// never advertised resource subscription cannot have a subscription to end, so
+// the call is refused rather than sent. After it returns, no further
+// ResourceUpdated events arrive for uri.
+//
+// Unsubscribing a resource that was never subscribed is the server's to judge,
+// not this client's: MCP has no local record of what is subscribed, so the
+// request is forwarded and whatever the server answers is returned.
+func (c *Client) Unsubscribe(ctx context.Context, uri string) error {
+	conn, epoch, err := c.serving(opUnsubscribe)
+	if err != nil {
+		return err
+	}
+	caps, ok := c.serverCapabilities()
+	if !ok || !caps.Resources || !caps.ResourcesSubscribe {
+		return c.unsupported(opUnsubscribe, "resource subscription")
+	}
+
+	callCtx, cancel := c.withDeadline(ctx, time.Time{})
+	defer cancel()
+	callCtx, release, err := c.admit(ctx, callCtx, opUnsubscribe, sched.ClassRequest)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if err := conn.Unsubscribe(callCtx, uri); err != nil {
+		return c.requestFailure(ctx, callCtx, opUnsubscribe, epoch, err)
+	}
+	return nil
+}
+
+// onResourceUpdated surfaces a server's resource-update notification to the
+// application as a ResourceUpdated event.
+//
+// It mirrors onListChanged: the notification is a claim, not content, so nothing
+// is refetched here — a caller that wants the new value re-reads the resource.
+// The URI arrives already bounded from internal/protocol.
+func (c *Client) onResourceUpdated(u protocol.ResourceUpdate) {
+	c.emit(ResourceUpdated{Binding: c.def.Name, URI: u.URI, At: time.Now()})
 }
 
 // serving returns the connection if the binding can carry a call right now.

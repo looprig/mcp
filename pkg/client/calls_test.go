@@ -483,6 +483,95 @@ func TestSubscribe(t *testing.T) {
 	}
 }
 
+// TestUnsubscribe mirrors TestSubscribe: unsubscribing is the same separate
+// capability as subscribing, so a server that never advertised subscription has
+// no subscription to end and the call is refused rather than sent.
+func TestUnsubscribe(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		caps    protocol.ServerCapabilities
+		wantErr bool
+	}{
+		{
+			name: "negotiated",
+			caps: protocol.ServerCapabilities{Tools: true, Resources: true, ResourcesSubscribe: true},
+		},
+		{
+			name:    "resources without subscribe",
+			caps:    protocol.ServerCapabilities{Tools: true, Resources: true},
+			wantErr: true,
+		},
+		{
+			name:    "no resources at all",
+			caps:    protocol.ServerCapabilities{Tools: true},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			conn := okConn()
+			conn.initResult.Capabilities = tt.caps
+			if tt.caps.Resources {
+				conn.resources = []protocol.ResourceSpec{{URI: "x://a"}}
+			}
+			c := connectTo(t, conn, nil)
+
+			err := c.Unsubscribe(context.Background(), "x://a")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("Unsubscribe() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				if class, _ := ClassOf(err); class != FailureUnsupportedProtocol {
+					t.Errorf("class = %v, want %v", class, FailureUnsupportedProtocol)
+				}
+			}
+		})
+	}
+}
+
+// TestResourceUpdateEmitsEvent is the pkg/client half of Fix #4b: a server's
+// resource-update notification, delivered through the callback the client
+// installed on the connection, surfaces to the application as a ResourceUpdated
+// event carrying the resource's URI. The SDK round-trip that feeds this callback
+// is proven in internal/protocol's TestResourceUpdateReachesTheCallback.
+func TestResourceUpdateEmitsEvent(t *testing.T) {
+	t.Parallel()
+
+	tr := newFakeTransport(allCapsConn())
+	rec := &eventRecorder{}
+	def := okDefinition(tr)
+	c, err := Connect(context.Background(), def, Handlers{Event: rec.handle})
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close(context.Background()) })
+
+	onUpdate := tr.lastConfig().OnResourceUpdated
+	if onUpdate == nil {
+		t.Fatal("the client installed no OnResourceUpdated callback: a server's update has nowhere to go")
+	}
+	onUpdate(protocol.ResourceUpdate{URI: "x://changed"})
+
+	var seen int
+	for _, e := range rec.snapshot() {
+		if ev, ok := e.(ResourceUpdated); ok {
+			seen++
+			if ev.URI != "x://changed" {
+				t.Errorf("ResourceUpdated.URI = %q, want %q", ev.URI, "x://changed")
+			}
+			if ev.Binding != "srv" {
+				t.Errorf("ResourceUpdated.Binding = %q, want %q", ev.Binding, "srv")
+			}
+		}
+	}
+	if seen != 1 {
+		t.Errorf("observed %d ResourceUpdated events, want 1", seen)
+	}
+}
+
 // TestCallsAfterCloseAreRefused: every call path must refuse a closed binding,
 // which is what makes it safe for Catalog to keep reporting the last catalog.
 func TestCallsAfterCloseAreRefused(t *testing.T) {
@@ -502,6 +591,7 @@ func TestCallsAfterCloseAreRefused(t *testing.T) {
 		{"GetPrompt", func() error { _, err := c.GetPrompt(context.Background(), "greet", nil); return err }},
 		{"ReadResource", func() error { _, err := c.ReadResource(context.Background(), "x://a"); return err }},
 		{"Subscribe", func() error { return c.Subscribe(context.Background(), "x://a") }},
+		{"Unsubscribe", func() error { return c.Unsubscribe(context.Background(), "x://a") }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

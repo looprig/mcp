@@ -75,6 +75,7 @@ const (
 	opGetPrompt    = "get_prompt"
 	opReadResource = "read_resource"
 	opSubscribe    = "subscribe"
+	opUnsubscribe  = "unsubscribe"
 	opSetLogLevel  = "set_log_level"
 )
 
@@ -642,6 +643,13 @@ func (c *conn) ReadResource(ctx context.Context, uri string) (protocol.ResourceR
 func (c *conn) Subscribe(ctx context.Context, uri string) error {
 	if err := c.session.Subscribe(ctx, uri); err != nil {
 		return c.classify(ctx, opSubscribe, err)
+	}
+	return nil
+}
+
+func (c *conn) Unsubscribe(ctx context.Context, uri string) error {
+	if err := c.session.Unsubscribe(ctx, uri); err != nil {
+		return c.classify(ctx, opUnsubscribe, err)
 	}
 	return nil
 }

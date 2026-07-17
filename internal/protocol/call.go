@@ -345,6 +345,23 @@ func (s *Session) Subscribe(ctx context.Context, uri string) error {
 	return nil
 }
 
+// Unsubscribe asks the server to stop reporting changes to a resource. It is the
+// counterpart to Subscribe: after it returns, the server sends no further
+// resource-update notifications for uri.
+func (s *Session) Unsubscribe(ctx context.Context, uri string) error {
+	cs, err := s.established()
+	if err != nil {
+		return err
+	}
+	if uri == "" {
+		return errors.New("protocol: resource URI is empty")
+	}
+	if err := cs.Unsubscribe(ctx, &mcp.UnsubscribeParams{URI: uri}); err != nil {
+		return fmt.Errorf("resources/unsubscribe %q: %w", uri, err)
+	}
+	return nil
+}
+
 // SetLogLevel asks the server to send log messages at or above level.
 //
 // It is required, not optional: an MCP server sends nothing until the client
@@ -443,6 +460,22 @@ func (s *Session) onListChanged(f ListFamily) {
 		return
 	}
 	s.cfg.OnListChanged(ListChange{Family: f})
+}
+
+// onResourceUpdated routes a resource-update notification to the config's
+// callback, bounding the server-supplied URI first.
+//
+// The URI is the one field an update carries, and it is untrusted like every
+// other server-supplied string here: it is truncated to Bounds.MaxTextBytes so
+// a hostile server cannot turn a notification into an unbounded allocation. A
+// nil params, or an update with no callback installed, is dropped — there is no
+// failure a caller could act on and nothing to deliver.
+func (s *Session) onResourceUpdated(params *mcp.ResourceUpdatedNotificationParams) {
+	if params == nil || s.cfg.OnResourceUpdated == nil {
+		return
+	}
+	uri, _ := limits.TruncateText(params.URI, s.cfg.Bounds.MaxTextBytes)
+	s.cfg.OnResourceUpdated(ResourceUpdate{URI: uri})
 }
 
 // FromSDKLogParams converts a logging notification, bounding its text.

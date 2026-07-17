@@ -115,6 +115,7 @@ type fakeConn struct {
 	resourceResult protocol.ResourceResult
 	resourceErr    error
 	subscribeErr   error
+	unsubscribeErr error
 
 	logLevelErr error
 
@@ -303,6 +304,8 @@ func (c *fakeConn) ReadResource(_ context.Context, _ string) (protocol.ResourceR
 }
 
 func (c *fakeConn) Subscribe(_ context.Context, _ string) error { return c.subscribeErr }
+
+func (c *fakeConn) Unsubscribe(_ context.Context, _ string) error { return c.unsubscribeErr }
 
 func (c *fakeConn) SetLogLevel(_ context.Context, level string) error {
 	c.mu.Lock()

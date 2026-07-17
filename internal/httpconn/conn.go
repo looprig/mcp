@@ -47,6 +47,7 @@ const (
 	OpGetPrompt    = "get_prompt"
 	OpReadResource = "read_resource"
 	OpSubscribe    = "subscribe"
+	OpUnsubscribe  = "unsubscribe"
 	OpSetLogLevel  = "set_log_level"
 )
 
@@ -171,6 +172,14 @@ func (c *Conn) ReadResource(ctx context.Context, uri string) (protocol.ResourceR
 func (c *Conn) Subscribe(ctx context.Context, uri string) error {
 	if err := c.session.Subscribe(ctx, uri); err != nil {
 		return c.classify(ctx, OpSubscribe, err)
+	}
+	return nil
+}
+
+// Unsubscribe asks the server to stop reporting changes to a resource.
+func (c *Conn) Unsubscribe(ctx context.Context, uri string) error {
+	if err := c.session.Unsubscribe(ctx, uri); err != nil {
+		return c.classify(ctx, OpUnsubscribe, err)
 	}
 	return nil
 }

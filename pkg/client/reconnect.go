@@ -311,6 +311,9 @@ func (c *Client) reconnectOnce(ctx context.Context) error {
 		// The new connection's notifications must reach the same binding: a
 		// reconnected server that changes its tools is no less a change.
 		OnListChanged: c.onListChanged,
+		// And its resource-update notifications: a subscription's deliveries must
+		// survive a reconnect no differently from list-change notifications.
+		OnResourceUpdated: c.onResourceUpdated,
 		// And so must its requests: what this host can serve is a property of
 		// the host, not of which socket the server is on. A binding that served
 		// elicitation before a reconnect and not after would advertise a

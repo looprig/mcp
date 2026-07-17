@@ -33,6 +33,25 @@ type CatalogStale struct {
 	At time.Time
 }
 
+// ResourceUpdated reports that a server announced a change to a resource this
+// binding subscribed to (see Client.Subscribe). It arrives only for a
+// subscribed resource, and only until Client.Unsubscribe.
+//
+// Like CatalogStale it carries no delta: MCP's resource-update notification says
+// only that a resource changed, never how, and a server's account of its own
+// change would be untrusted input. A caller that wants the new value re-reads
+// the resource with ReadResource. The URI is server-supplied and bounded before
+// it gets here — it names what changed, it is not an instruction.
+type ResourceUpdated struct {
+	// Binding names the binding whose subscribed resource changed.
+	Binding Name
+	// URI names the resource the server says changed. It may be a sub-resource
+	// of the one that was subscribed to.
+	URI string
+	// At is when the notification was observed.
+	At time.Time
+}
+
 // CatalogCandidate reports that a complete, validated generation was fetched and
 // differs from the adopted one. It is the event a caller waits for before
 // choosing a safe boundary at which to Adopt.
@@ -312,6 +331,7 @@ func (ElicitationResolved) event()  {}
 // them).
 
 func (CatalogStale) event()     {}
+func (ResourceUpdated) event()  {}
 func (CatalogCandidate) event() {}
 func (CatalogRefreshed) event() {}
 func (CatalogAdopted) event()   {}
