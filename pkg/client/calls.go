@@ -24,6 +24,7 @@ import (
 	"github.com/looprig/mcp/internal/catalog"
 	"github.com/looprig/mcp/internal/lifecycle"
 	"github.com/looprig/mcp/internal/protocol"
+	"github.com/looprig/mcp/internal/sched"
 )
 
 // Operation names carried by the errors in this file.
@@ -177,6 +178,15 @@ func (c *Client) CallTool(ctx context.Context, rawName string, args json.RawMess
 	callCtx, cancel := c.withDeadline(ctx, opts.Deadline)
 	defer cancel()
 
+	// Admission last, after every gate: a call that policy refuses must not
+	// queue behind the binding's other calls first, and must not consume a slot
+	// to be told no.
+	callCtx, release, err := c.admit(ctx, callCtx, opCallTool, sched.ClassCall)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	defer release()
+
 	res, err := conn.CallTool(callCtx, rawName, args, protocol.CallOptions{
 		Progress: c.progressAdapter(opts.Progress),
 	})
@@ -203,6 +213,11 @@ func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]str
 
 	callCtx, cancel := c.withDeadline(ctx, time.Time{})
 	defer cancel()
+	callCtx, release, err := c.admit(ctx, callCtx, opGetPrompt, sched.ClassRequest)
+	if err != nil {
+		return Prompt{}, err
+	}
+	defer release()
 
 	res, err := conn.GetPrompt(callCtx, name, args)
 	if err != nil {
@@ -233,6 +248,11 @@ func (c *Client) ReadResource(ctx context.Context, uri string) (Resource, error)
 
 	callCtx, cancel := c.withDeadline(ctx, time.Time{})
 	defer cancel()
+	callCtx, release, err := c.admit(ctx, callCtx, opReadResource, sched.ClassRequest)
+	if err != nil {
+		return Resource{}, err
+	}
+	defer release()
 
 	res, err := conn.ReadResource(callCtx, uri)
 	if err != nil {
@@ -271,6 +291,11 @@ func (c *Client) Subscribe(ctx context.Context, uri string) error {
 
 	callCtx, cancel := c.withDeadline(ctx, time.Time{})
 	defer cancel()
+	callCtx, release, err := c.admit(ctx, callCtx, opSubscribe, sched.ClassRequest)
+	if err != nil {
+		return err
+	}
+	defer release()
 
 	if err := conn.Subscribe(callCtx, uri); err != nil {
 		return c.callFailure(ctx, callCtx, opSubscribe, err)
@@ -304,6 +329,31 @@ func (c *Client) serving(op string) (protocol.Conn, error) {
 		return nil, NewError(FailureIndeterminate, c.def.Name, op, "the binding has no connection", nil)
 	}
 	return conn, nil
+}
+
+// admit puts a request through the binding's scheduler, classifying a refusal.
+//
+// It returns the request's own context: derived from the call's, cancelled by
+// its release, and cancelled by shutdown — and by nothing else, which is what
+// makes one caller's cancellation invisible to every other call on the same
+// connection.
+//
+// The wait counts against the deadline that callCtx already carries. That is
+// deliberate: a caller's deadline is wall-clock, and a call that spent it queued
+// behind the binding's other calls has missed it just as surely as one that
+// spent it waiting on the server. It also keeps the deadline computed exactly
+// once, before the send, with nothing after that point able to move it.
+func (c *Client) admit(ctx, callCtx context.Context, op string, class sched.Class) (context.Context, func(), error) {
+	reqCtx, release, err := c.sched.Begin(callCtx, class)
+	if err == nil {
+		return reqCtx, release, nil
+	}
+	if errors.Is(err, sched.ErrShutdown) {
+		return nil, nil, NewError(FailureShutdown, c.def.Name, op, "the binding is shutting down", nil)
+	}
+	// Everything else is the context ending: the caller gave up, or the call
+	// ran out of time while queued. callFailure already tells those apart.
+	return nil, nil, c.callFailure(ctx, callCtx, op, err)
 }
 
 // unsupported reports a method the server never promised. It is the design's

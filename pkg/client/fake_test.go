@@ -63,6 +63,30 @@ type fakeConn struct {
 	// CallTool blocks or returns.
 	callProgress []protocol.ProgressUpdate
 
+	// live and maxLive track how many CallTools are in flight at once, and the
+	// peak. They are what the scheduler's bounds are measured against at the
+	// client's own boundary: the conn is where a request actually is in flight.
+	live    atomic.Int32
+	maxLive atomic.Int32
+	// callProbeN and callProbeWindow make CallTool linger: each call waits until
+	// callProbeN of them are in flight together, or the window elapses,
+	// whichever comes first.
+	//
+	// Without it every concurrency assertion here is vacuous. A fake CallTool
+	// returns in nanoseconds, so eight goroutines calling one never overlap by
+	// chance, and maxLive reads 1 whether the client serializes them or not —
+	// the test would pass against a client with no scheduler at all. The probe
+	// is what gives a client that *would* run them concurrently the time to be
+	// caught doing it: it makes the overlap happen if it can happen.
+	//
+	// It costs the window per serialized call, and nothing at all when the calls
+	// do overlap (the probe is satisfied as soon as they do), so the fast path
+	// is the correct path.
+	callProbeN      int32
+	callProbeWindow time.Duration
+	// callReleased, when non-nil, blocks every CallTool until it is closed.
+	callReleased chan struct{}
+
 	promptResult   protocol.PromptResult
 	promptErr      error
 	resourceResult protocol.ResourceResult
@@ -81,6 +105,27 @@ type fakeConn struct {
 	// to unwind from, and the refresh failure it has to degrade on. It is
 	// guarded because a refresh test flips it on a live client.
 	listErr error
+}
+
+// probeConcurrency waits for callProbeN calls to be in flight together, giving
+// up after callProbeWindow. See the field comment for why an instant fake makes
+// every concurrency assertion vacuous without it.
+func (c *fakeConn) probeConcurrency(ctx context.Context) error {
+	deadline := time.NewTimer(c.callProbeWindow)
+	defer deadline.Stop()
+	tick := time.NewTicker(200 * time.Microsecond)
+	defer tick.Stop()
+
+	for c.live.Load() < c.callProbeN {
+		select {
+		case <-tick.C:
+		case <-deadline.C:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // setTools replaces the tool list the conn serves. It is what makes a server's
@@ -167,6 +212,27 @@ func (c *fakeConn) CallTool(ctx context.Context, rawName string, _ json.RawMessa
 	c.mu.Lock()
 	c.calls = append(c.calls, rawName)
 	c.mu.Unlock()
+
+	live := c.live.Add(1)
+	defer c.live.Add(-1)
+	for {
+		max := c.maxLive.Load()
+		if live <= max || c.maxLive.CompareAndSwap(max, live) {
+			break
+		}
+	}
+	if c.callProbeN > 1 {
+		if err := c.probeConcurrency(ctx); err != nil {
+			return protocol.ToolResult{}, err
+		}
+	}
+	if c.callReleased != nil {
+		select {
+		case <-c.callReleased:
+		case <-ctx.Done():
+			return protocol.ToolResult{}, ctx.Err()
+		}
+	}
 
 	for _, u := range c.callProgress {
 		if opts.Progress != nil {

@@ -43,6 +43,7 @@ import (
 	"github.com/looprig/mcp/internal/catalog"
 	"github.com/looprig/mcp/internal/lifecycle"
 	"github.com/looprig/mcp/internal/protocol"
+	"github.com/looprig/mcp/internal/sched"
 )
 
 // Operation names carried by the errors and events in this file.
@@ -124,9 +125,9 @@ func (c *Client) runRefresher(ctx context.Context) {
 // refreshWithRetry runs one refresh pass, retrying under the binding's bounded
 // policy until it succeeds, the budget runs out, or the client shuts down.
 func (c *Client) refreshWithRetry(ctx context.Context) {
-	sched := newRetrySchedule(c.def.Refresh, time.Now())
+	budget := newRetrySchedule(c.def.Refresh, time.Now())
 	for {
-		delay, ok := sched.next(time.Now())
+		delay, ok := budget.next(time.Now())
 		if !ok {
 			return
 		}
@@ -147,7 +148,7 @@ func (c *Client) refreshWithRetry(ctx context.Context) {
 		// Whether this failure is the last one is part of what the application is
 		// told, so it is answered before the report rather than after: a copy of
 		// the schedule is asked what it would do next, without consuming it.
-		peek := sched
+		peek := budget
 		_, retrying := peek.next(time.Now())
 		c.reportRefreshFailure(err, retrying)
 	}
@@ -196,6 +197,20 @@ func (c *Client) refreshOnce(ctx context.Context) error {
 	// allowed to take.
 	fetchCtx, cancel := context.WithTimeout(ctx, c.def.Timeouts.Startup)
 	defer cancel()
+
+	// A refresh is a control operation: it is serialized against the binding's
+	// other ordering-sensitive work, and it is counted against the binding's
+	// concurrency budget like any other request. A background refetch that
+	// ignored the budget would be a request the operator's limit does not
+	// cover, arriving exactly when a server is already misbehaving.
+	fetchCtx, release, err := c.sched.Begin(fetchCtx, sched.ClassControl)
+	if err != nil {
+		if errors.Is(err, sched.ErrShutdown) {
+			return NewError(FailureShutdown, c.def.Name, opRefresh, "the binding is shutting down", nil)
+		}
+		return c.classify(fetchCtx, opRefresh, err, FailureCatalogStale)
+	}
+	defer release()
 
 	gen, err := catalog.Discover(fetchCtx, conn, catalog.Config{
 		Binding:   string(c.def.Name),

@@ -20,6 +20,7 @@ import (
 	"github.com/looprig/mcp/internal/lifecycle"
 	"github.com/looprig/mcp/internal/limits"
 	"github.com/looprig/mcp/internal/protocol"
+	"github.com/looprig/mcp/internal/sched"
 )
 
 // The identity this module presents to servers. It is cosmetic — a server
@@ -60,6 +61,10 @@ type Client struct {
 	// eventHandler is the application's event callback, captured at
 	// construction and read-only afterwards. See Client.emit.
 	eventHandler EventHandler
+	// sched admits this binding's requests: it serializes what must be
+	// serialized and bounds everything. It is created with the Client and is
+	// immutable afterwards (it does its own locking).
+	sched *sched.Scheduler
 
 	// refreshCh carries a request for a catalog refresh pass. It is buffered to
 	// one: that buffer is what coalesces duplicate notifications (see
@@ -155,6 +160,15 @@ func newClient(def Definition, h Handlers) *Client {
 		eventHandler: h.Event,
 		refreshCh:    make(chan struct{}, 1),
 		stale:        make(map[catalog.Family]struct{}),
+		sched: sched.New(sched.Config{
+			MaxConcurrent: def.Limits.MaxConcurrentRequests,
+			// The application's decision, and only ever the application's. A
+			// server's tool annotations may inform it — an application is free
+			// to read them and configure accordingly — but nothing a server
+			// says reaches this field, so no server can widen its own
+			// concurrency by claiming to be safe.
+			AllowParallel: def.AllowParallelCalls,
+		}),
 	}
 	c.unwatch = c.machine.Watch(func(from, to lifecycle.State) {
 		now := time.Now()
@@ -521,9 +535,11 @@ func (c *Client) Close(ctx context.Context) error {
 		// terminal). Shutdown is best-effort by design: the transport must be
 		// released regardless of what the machine says.
 		_ = c.machine.To(lifecycle.StateClosing)
-		// Background work first, connection second: a refresh in flight against
-		// a conn that is about to close would fail, degrade the binding, and
-		// report a catalog rejection for a binding the caller is shutting down.
+		// Reject new work, then cancel what is in flight, then release what
+		// they were using. Closing the conn first would tear the transport out
+		// from under live requests, which loses their replies and makes the
+		// peer exit on a read error rather than a clean stop.
+		c.sched.Shutdown()
 		c.stopRefreshing(ctx)
 		err = c.closeConn(ctx)
 		_ = c.machine.To(lifecycle.StateClosed)
