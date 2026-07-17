@@ -264,6 +264,45 @@ func TestProfileDigestIsCanonical(t *testing.T) {
 	})
 }
 
+// TestProfileDigestIsGolden pins the profile encoding to a known answer.
+//
+// It is the guard the canonicality and difference tests structurally cannot be:
+// with every value length-delimited, no reordering of fields and no change of
+// domain string can make two profiles collide, so neither of those tests can see
+// an encoding change. What such a change does do is silently give existing
+// profiles new digests — and a profile digest is now part of a binding's
+// configuration identity (pkg/harness), so a drifted encoding means a restore
+// reporting drift on a policy nobody touched.
+//
+// If this fails, the encoding changed. That is allowed — but it costs a
+// profileDigestVersion bump and these constants, together, deliberately. It is
+// not a test to "just update".
+func TestProfileDigestIsGolden(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		profile Profile
+		want    string
+	}{
+		{"default", ProfileDefault, "118175c29c30a4606b21d48e21790762c86c71f61de243b0fc1ab61aee10f88f"},
+		{"legacy", ProfileLegacy, "826a7612e5f3f8d196507c0c49a8466ff473f314b7408bbe404a50dadcefe408"},
+		{"strict", ProfileStrict, "3981209efa03132092dc91ae7fdccfdd475de5d71e86ca1e383e5cd61b449892"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := tt.profile.Digest(); got != tt.want {
+				t.Errorf("%s profile digest = %s, want %s\n"+
+					"The canonical encoding changed. If that was deliberate, bump "+
+					"profileDigestVersion and update this constant in the same change; "+
+					"if it was not, the encoding has drifted and every digest an older "+
+					"build computed is now wrong.", tt.name, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestProfileDigestDistinguishesEveryDifference: two profiles that differ in any
 // way a manifest would care about must digest differently. A digest that misses
 // a difference reports no drift when a policy changed.

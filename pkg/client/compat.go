@@ -33,11 +33,11 @@ package client
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"slices"
 
+	"github.com/looprig/mcp/internal/canonical"
 	"github.com/looprig/mcp/internal/catalog"
 )
 
@@ -264,7 +264,9 @@ const (
 // It is canonical. The tolerances are sorted and deduplicated first, so two
 // profiles that permit the same things digest the same however they were
 // written; and every value is length-delimited, so no two different profiles can
-// encode to the same bytes.
+// encode to the same bytes. The framing is internal/canonical's, shared with the
+// catalog and binding-identity digests: one encoder, so the three cannot drift
+// apart into disagreeing about what a canonical encoding is.
 //
 // It covers the whole profile, name and version included. Two profiles that
 // permit the same deviations under different names are different policies: the
@@ -273,41 +275,31 @@ const (
 // quietly swapped for "default" with the same contents.
 func (p Profile) Digest() string {
 	h := sha256.New()
-	write := func(b []byte) {
-		var length [8]byte
-		binary.BigEndian.PutUint64(length[:], uint64(len(b)))
-		_, _ = h.Write(length[:])
-		_, _ = h.Write(b)
-	}
-	writeUint := func(u uint64) {
-		var buf [8]byte
-		binary.BigEndian.PutUint64(buf[:], u)
-		_, _ = h.Write(buf[:])
-	}
+	e := canonical.NewEncoder(h)
 
-	write([]byte(profileDigestDomain))
-	writeUint(profileDigestVersion)
-	write([]byte(p.Name))
+	e.Str(profileDigestDomain)
+	e.Uint(profileDigestVersion)
+	e.Str(p.Name)
 	// A version is signed in the struct (it is an ordinary count) but negative
 	// values never reach here: validate refuses them. The conversion is still
 	// done on the absolute value's own terms rather than by casting a possibly
 	// negative int, so an unvalidated Profile digests to something stable rather
 	// than to a wrapped enormity.
 	if p.Version > 0 {
-		writeUint(uint64(p.Version))
+		e.Uint(uint64(p.Version))
 	} else {
-		writeUint(0)
+		e.Uint(0)
 	}
 
 	sorted := slices.Clone(p.Tolerances)
 	slices.Sort(sorted)
 	sorted = slices.Compact(sorted)
-	writeUint(uint64(len(sorted)))
+	e.Count(len(sorted))
 	for _, t := range sorted {
 		// The stable identifier, not the numeric value: an enum's numbers are an
 		// implementation detail that a later insertion could renumber, and a
 		// digest must not change because a constant moved.
-		write([]byte(t.String()))
+		e.Str(t.String())
 	}
 
 	return hex.EncodeToString(h.Sum(nil))

@@ -2,31 +2,24 @@
 // canonical encoding the catalog digest is computed over.
 //
 // The encoding exists to make one question cheap and exact: is this catalog the
-// same catalog as that one? Everything about it is in service of two properties
-// that a naive hash of a struct does not have.
+// same catalog as that one? The framing that makes it deterministic and
+// unambiguous lives in internal/canonical, which every identity digest in this
+// module shares; what lives here is what the framing is applied to — this
+// digest's domain, its schema version, and its field order, which are the parts
+// that define what a catalog digest *means*.
 //
-//   - Determinism. The same catalog content must produce the same digest
-//     however it arrived — whatever order the server paginated its tools in,
-//     whatever order a map happened to iterate. Collections are therefore
-//     ordered canonically before they are encoded (see catalog.go), and no map
-//     is ever ranged over here.
-//   - Unambiguity. No two *different* catalogs may encode to the same bytes.
-//     Every value is length-delimited and preceded by a field tag, so the
-//     fields cannot be slid into one another: {Name:"ab", Title:""} and
-//     {Name:"a", Title:"b"} are distinct encodings, where a naive
-//     concatenation would render both as "ab".
-//
-// The scheme follows the fingerprint guidance in the session-versioning design:
-// explicit domain, explicit schema version, stable field ordering,
-// length-delimited values, deterministic collection ordering.
+// The one property this file owns rather than borrows is determinism of
+// ordering: collections are ordered canonically before they are encoded (see
+// catalog.go), and no map is ever ranged over here.
 
 package catalog
 
 import (
 	"crypto/sha256"
-	"encoding/binary"
 	"encoding/hex"
 	"hash"
+
+	"github.com/looprig/mcp/internal/canonical"
 )
 
 // Digest is a SHA-256 digest. It is a value type, so it can be compared with
@@ -58,10 +51,10 @@ const ShortDigestBytes = 4
 // catalog that happens to contain the same bytes.
 func DigestBytes(b []byte) Digest {
 	h := sha256.New()
-	e := encoder{h: h}
-	e.str(domainSchema)
-	e.uint(digestSchemaVersion)
-	e.bytes(b)
+	e := canonical.NewEncoder(h)
+	e.Str(domainSchema)
+	e.Uint(digestSchemaVersion)
+	e.Bytes(b)
 	return sum(h)
 }
 
@@ -70,11 +63,11 @@ func DigestBytes(b []byte) Digest {
 // to share bytes must not share a digest.
 func digestName(binding, rawName string) Digest {
 	h := sha256.New()
-	e := encoder{h: h}
-	e.str(domainName)
-	e.uint(digestSchemaVersion)
-	e.str(binding)
-	e.str(rawName)
+	e := canonical.NewEncoder(h)
+	e.Str(domainName)
+	e.Uint(digestSchemaVersion)
+	e.Str(binding)
+	e.Str(rawName)
 	return sum(h)
 }
 
@@ -146,108 +139,108 @@ const (
 // schema to a new tool.
 func (g *Generation) computeDigest() Digest {
 	h := sha256.New()
-	e := encoder{h: h}
+	e := canonical.NewEncoder(h)
 
-	e.str(domainCatalog)
-	e.uint(digestSchemaVersion)
+	e.Str(domainCatalog)
+	e.Uint(digestSchemaVersion)
 
-	e.field(tagBinding)
-	e.str(g.binding)
+	e.Field(tagBinding)
+	e.Str(g.binding)
 
-	e.field(tagProtocolVersion)
-	e.str(string(g.protocolVersion))
+	e.Field(tagProtocolVersion)
+	e.Str(string(g.protocolVersion))
 
-	e.field(tagCapabilities)
+	e.Field(tagCapabilities)
 	c := g.capabilities
-	e.bool(c.Tools)
-	e.bool(c.Prompts)
-	e.bool(c.Resources)
-	e.bool(c.ResourcesSubscribe)
-	e.bool(c.Logging)
-	e.bool(c.Completions)
+	e.Bool(c.Tools)
+	e.Bool(c.Prompts)
+	e.Bool(c.Resources)
+	e.Bool(c.ResourcesSubscribe)
+	e.Bool(c.Logging)
+	e.Bool(c.Completions)
 
-	e.field(tagServer)
-	e.str(g.server.Name)
-	e.str(g.server.Version)
-	e.str(g.server.Title)
+	e.Field(tagServer)
+	e.Str(g.server.Name)
+	e.Str(g.server.Version)
+	e.Str(g.server.Title)
 
-	e.field(tagInstructions)
-	e.str(g.instructions)
+	e.Field(tagInstructions)
+	e.Str(g.instructions)
 
-	e.field(tagTools)
-	e.count(len(g.tools))
+	e.Field(tagTools)
+	e.Count(len(g.tools))
 	for _, t := range g.tools {
-		e.str(t.RawName)
-		e.str(t.ModelName)
-		e.str(t.Title)
-		e.str(t.Description)
-		e.bytes(t.InputSchemaDigest[:])
+		e.Str(t.RawName)
+		e.Str(t.ModelName)
+		e.Str(t.Title)
+		e.Str(t.Description)
+		e.Bytes(t.InputSchemaDigest[:])
 		// Presence is encoded explicitly rather than implied by a zero digest,
 		// so that "no output schema" is a distinct encoding from any digest.
-		e.bool(!t.OutputSchemaDigest.IsZero())
-		e.bytes(t.OutputSchemaDigest[:])
-		e.field(tagAnnotations)
-		e.annotations(t)
+		e.Bool(!t.OutputSchemaDigest.IsZero())
+		e.Bytes(t.OutputSchemaDigest[:])
+		e.Field(tagAnnotations)
+		encodeAnnotations(e, t)
 	}
 
-	e.field(tagPrompts)
-	e.count(len(g.prompts))
+	e.Field(tagPrompts)
+	e.Count(len(g.prompts))
 	for _, p := range g.prompts {
-		e.str(p.RawName)
-		e.str(p.Title)
-		e.str(p.Description)
-		e.field(tagArguments)
+		e.Str(p.RawName)
+		e.Str(p.Title)
+		e.Str(p.Description)
+		e.Field(tagArguments)
 		// Argument order is content, not incidental ordering: it comes from one
 		// prompt object the server sent, so a server that reorders its
 		// arguments has changed the prompt. It is encoded as sent.
-		e.count(len(p.Arguments))
+		e.Count(len(p.Arguments))
 		for _, a := range p.Arguments {
-			e.str(a.Name)
-			e.str(a.Title)
-			e.str(a.Description)
-			e.bool(a.Required)
+			e.Str(a.Name)
+			e.Str(a.Title)
+			e.Str(a.Description)
+			e.Bool(a.Required)
 		}
 	}
 
-	e.field(tagResources)
-	e.count(len(g.resources))
+	e.Field(tagResources)
+	e.Count(len(g.resources))
 	for _, r := range g.resources {
-		e.str(r.URI)
-		e.str(r.Name)
-		e.str(r.Title)
-		e.str(r.Description)
-		e.str(r.MIMEType)
+		e.Str(r.URI)
+		e.Str(r.Name)
+		e.Str(r.Title)
+		e.Str(r.Description)
+		e.Str(r.MIMEType)
 	}
 
-	e.field(tagTemplates)
-	e.count(len(g.templates))
+	e.Field(tagTemplates)
+	e.Count(len(g.templates))
 	for _, t := range g.templates {
-		e.str(t.URITemplate)
-		e.str(t.Name)
-		e.str(t.Title)
-		e.str(t.Description)
-		e.str(t.MIMEType)
+		e.Str(t.URITemplate)
+		e.Str(t.Name)
+		e.Str(t.Title)
+		e.Str(t.Description)
+		e.Str(t.MIMEType)
 	}
 
-	e.field(tagEnd)
+	e.Field(tagEnd)
 	return sum(h)
 }
 
-// annotations encodes a tool's hints. A nil Annotations is encoded as a
+// encodeAnnotations encodes a tool's hints. A nil Annotations is encoded as a
 // distinct absence rather than as an all-false struct: "the server said
 // nothing" and "the server said no to everything" are different claims.
-func (e *encoder) annotations(t Tool) {
+func encodeAnnotations(e *canonical.Encoder, t Tool) {
 	if t.Annotations == nil {
-		e.bool(false)
+		e.Bool(false)
 		return
 	}
-	e.bool(true)
+	e.Bool(true)
 	a := t.Annotations
-	e.str(a.Title)
-	e.bool(a.ReadOnlyHint)
-	e.bool(a.IdempotentHint)
-	e.triState(a.DestructiveHint)
-	e.triState(a.OpenWorldHint)
+	e.Str(a.Title)
+	e.Bool(a.ReadOnlyHint)
+	e.Bool(a.IdempotentHint)
+	e.TriState(a.DestructiveHint)
+	e.TriState(a.OpenWorldHint)
 }
 
 // sum finalizes a hash into a Digest.
@@ -257,82 +250,4 @@ func sum(h hash.Hash) Digest {
 	// backing store writes the digest straight into d.
 	h.Sum(d[:0])
 	return d
-}
-
-// encoder writes the canonical encoding into a hash. Every method is
-// length-delimited or fixed-width, so the concatenation of any sequence of
-// calls is unambiguous.
-//
-// It writes to a hash.Hash, which never errors (hash.Hash's Write contract
-// forbids it), so no method here returns one. That is the reason the encoder
-// is not an io.Writer wrapper with error plumbing nobody could act on.
-type encoder struct {
-	h hash.Hash
-}
-
-// field writes a field tag. It is a length-delimited string like any other,
-// which is enough to separate fields: a tag can never be confused with a value
-// because the reader (there is none — this is one-way) would need the same
-// framing either way, and the hash sees a different byte sequence regardless.
-func (e *encoder) field(tag string) { e.str(tag) }
-
-// str writes a length-delimited string.
-func (e *encoder) str(s string) {
-	e.length(len(s))
-	_, _ = e.h.Write([]byte(s))
-}
-
-// bytes writes a length-delimited byte string.
-func (e *encoder) bytes(b []byte) {
-	e.length(len(b))
-	_, _ = e.h.Write(b)
-}
-
-// uint writes a fixed-width unsigned integer. Fixed-width rather than varint:
-// the width is then never a function of the value, so no encoding of one
-// integer can be a prefix of the encoding of another.
-func (e *encoder) uint(u uint64) {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], u)
-	_, _ = e.h.Write(buf[:])
-}
-
-// count writes a collection's length.
-func (e *encoder) count(n int) { e.length(n) }
-
-// length writes a value's byte length: the delimiter every str and bytes call
-// depends on, and the collection size every loop depends on.
-//
-// Every caller passes a len(), which is never negative, so the guard below is
-// unreachable. It is written as a guard rather than asserted in a comment
-// because the conversion to uint64 is the one place a negative would not fail
-// loudly — it would wrap to an enormous length and silently produce a digest
-// for a framing that never existed.
-func (e *encoder) length(n int) {
-	if n < 0 {
-		n = 0
-	}
-	e.uint(uint64(n))
-}
-
-// bool writes a single byte.
-func (e *encoder) bool(b bool) {
-	var v byte
-	if b {
-		v = 1
-	}
-	_, _ = e.h.Write([]byte{v})
-}
-
-// triState writes an optional bool in one byte, keeping "absent" distinct from
-// "false" — which is the whole reason the SDK models these hints as pointers.
-func (e *encoder) triState(p *bool) {
-	switch {
-	case p == nil:
-		_, _ = e.h.Write([]byte{0})
-	case *p:
-		_, _ = e.h.Write([]byte{2})
-	default:
-		_, _ = e.h.Write([]byte{1})
-	}
 }
