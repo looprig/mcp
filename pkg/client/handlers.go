@@ -53,18 +53,62 @@ func (a ElicitAction) String() string {
 	}
 }
 
-// ElicitRequest is a server's request for human input. Message and Schema are
-// server-supplied and untrusted: the message is bounded text to show a person,
-// and the schema constrains the answer — neither may be treated as an
-// instruction to the host.
+// ElicitMode is which kind of elicitation a server sent. The zero value is not
+// a mode: a request the client cannot classify never reaches a handler, so a
+// handler that switches on this may treat an unknown value as unreachable —
+// but must still fail closed if it ever sees one.
+type ElicitMode uint8
+
+// The elicitation modes MCP defines. They ask a person for different things, so
+// a handler must branch: a form is answered, a URL is *visited*.
+const (
+	// ElicitModeForm is a bounded schema of typed fields to fill in. Schema is
+	// set (or nil for a bare confirmation); URL is empty.
+	ElicitModeForm ElicitMode = iota + 1
+	// ElicitModeURL is an out-of-band action at a URL. URL is set; Schema is
+	// nil.
+	ElicitModeURL
+)
+
+// String returns a stable lowercase identifier, or "unknown".
+func (m ElicitMode) String() string {
+	switch m {
+	case ElicitModeForm:
+		return "form"
+	case ElicitModeURL:
+		return "url"
+	default:
+		return "unknown"
+	}
+}
+
+// ElicitRequest is a server's request for human input. Every field but Binding
+// is server-supplied and untrusted: the message is bounded text to show a
+// person, the schema constrains the answer, and the URL is somewhere a server
+// would like a human to go — none of them may be treated as an instruction to
+// the host.
+//
+// Which fields are meaningful is Mode's to say. The client enforces that:
+// exactly the fields of the mode that arrived are populated, and the others are
+// zero, so a handler cannot be led to act on a URL that came with a form.
 type ElicitRequest struct {
 	// Binding names the server that asked.
 	Binding Name
+	// Mode is the kind of elicitation. It is always a declared mode.
+	Mode ElicitMode
 	// Message is the bounded prompt to show the human.
 	Message string
-	// Schema is the JSON Schema the answer must satisfy. It is raw JSON
-	// because a schema is a serialization-boundary document, not domain data.
+	// Schema is the JSON Schema the answer must satisfy, in form mode only; nil
+	// otherwise. It is raw JSON because a schema is a serialization-boundary
+	// document, not domain data.
 	Schema json.RawMessage
+	// URL is the action's URL, in url mode only; empty otherwise. It is bounded
+	// but not otherwise vetted: whether it is safe to show, or to open, is the
+	// host's decision and nothing the server says can make it.
+	URL string
+	// ElicitationID is the server's correlation id, in url mode only. It may be
+	// empty even there: MCP does not require one.
+	ElicitationID string
 }
 
 // ElicitResult is the human's answer. Content is meaningful only when Action is

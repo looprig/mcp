@@ -66,6 +66,10 @@ type bindingState struct {
 	// cancels the turns still holding it.
 	inflight int
 	idle     chan struct{}
+
+	// eliciting counts this binding's pending elicitations. A server drives it,
+	// so it is bounded: see maxPendingElicitations.
+	eliciting int
 }
 
 func newBindingState(b Binding) *bindingState {
@@ -161,6 +165,10 @@ type Manager struct {
 	started  bool
 	closed   bool
 	retireIn time.Duration
+	// elicitIn is the overall wall-clock bound on one elicitation. It is a
+	// field rather than a constant for the same reason retireIn is: a test must
+	// be able to drive the deadline without waiting out DefaultElicitationTimeout.
+	elicitIn time.Duration
 }
 
 // NewManager validates the bindings and returns a Manager that has not connected
@@ -194,6 +202,7 @@ func NewManager(bindings []Binding, deps Deps) (*Manager, error) {
 		cancel:   cancel,
 		states:   states,
 		retireIn: DefaultRetirementTimeout,
+		elicitIn: DefaultElicitationTimeout,
 	}, nil
 }
 
@@ -578,17 +587,4 @@ func (m *Manager) waitBackground(ctx context.Context) error {
 	case <-ctx.Done():
 		return fmt.Errorf("mcp: shutdown did not finish within the bound: %w", ctx.Err())
 	}
-}
-
-// handlersFor builds the connection callbacks for one binding: the
-// server-initiated requests this host is prepared to serve, and the event
-// stream it observes.
-//
-// It is a method on Manager, and the binding is passed rather than closed over
-// by name, because a callback must be able to find its binding's state without
-// consulting the Manager's table — the table's lock is held during
-// reconfiguration, and a server that elicits at that moment must still be
-// answerable.
-func (m *Manager) handlersFor(bs *bindingState) client.Handlers {
-	return client.Handlers{}
 }

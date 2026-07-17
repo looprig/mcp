@@ -95,6 +95,7 @@ func parseFlags() mcptest.Config {
 	flag.IntVar(&cfg.CrashExitCode, "crash-exit-code", mcptest.DefaultCrashExitCode, "exit status for the crash tool")
 	flag.IntVar(&cfg.NoiseBytes, "noise-bytes", 0, "bytes of chatter to write to stderr at startup")
 	flag.BoolVar(&cfg.ElicitOnInitialize, "elicit-on-initialize", false, "send an elicitation request once the client reports initialized")
+	flag.BoolVar(&cfg.Elicit, "elicit", false, "add the elicit tool, which asks the client a question while answering a tool call")
 	flag.IntVar(&cfg.PageSize, "page-size", 0, "maximum items per list page (0 uses the SDK default)")
 	flag.IntVar(&cfg.ExtraTools, "extra-tools", 0, "number of filler tools to expose, for exercising pagination and item bounds")
 	flag.Parse()

@@ -115,6 +115,23 @@ type ConnectConfig struct {
 	// goroutine and blocks it: an implementation must record the change and
 	// return, never fetch.
 	OnListChanged func(ListChange)
+
+	// OnElicit serves the server's requests for human input, already bounded
+	// and validated. Nil means no elicitation is served — and, because a
+	// capability with nothing behind it must never reach the wire, nil also
+	// means the elicitation capability is not advertised however Capabilities
+	// is set (see Session.Initialize).
+	//
+	// Unlike OnLog and OnListChanged this one answers: it is the only callback
+	// here whose return value goes to the server, and the only one that may
+	// block. It is invoked on the connection's request-dispatch goroutine with
+	// the caller's elicitation deadline already on ctx; returning an error
+	// refuses the request, which is a complete and honest answer.
+	//
+	// It is a callback rather than a Conn method for the same reason as the
+	// others: it belongs to no request this module made, so there is nothing to
+	// return it from.
+	OnElicit func(context.Context, ElicitRequest) (ElicitResult, error)
 }
 
 // ListFamily names the catalog family a list-change notification refers to. It
@@ -257,6 +274,16 @@ type Bounds struct {
 	MaxBinaryItems int
 	// MaxLogBytes caps one server log message's text.
 	MaxLogBytes int
+	// MaxElicitMessageBytes caps one elicitation prompt: its message, and in
+	// url mode the URL and correlation id shown with it. It is separate from
+	// MaxTextBytes because it bounds what a *person* is shown, not what a model
+	// consumes — a tool result may reasonably be a megabyte; a prompt may not.
+	MaxElicitMessageBytes int
+	// MaxElicitSchemaBytes caps one elicitation's requested schema. It is
+	// separate from MaxSchemaBytes because a form a human fills in is a
+	// different thing from a tool's interface; sizing them together would mean
+	// raising one to raise the other.
+	MaxElicitSchemaBytes int
 }
 
 // MaxWarnings caps the Warnings a single conversion may report, so a hostile

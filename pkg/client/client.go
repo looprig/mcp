@@ -61,6 +61,10 @@ type Client struct {
 	// eventHandler is the application's event callback, captured at
 	// construction and read-only afterwards. See Client.emit.
 	eventHandler EventHandler
+	// elicitHandler is the application's elicitation handler, captured at
+	// construction and read-only afterwards. Nil means this binding serves no
+	// elicitation and advertises no such capability. See Client.elicitAdapter.
+	elicitHandler ElicitationHandler
 	// sched admits this binding's requests: it serializes what must be
 	// serialized and bounds everything. It is created with the Client and is
 	// immutable afterwards (it does its own locking).
@@ -192,13 +196,14 @@ func Connect(ctx context.Context, def Definition, h Handlers) (*Client, error) {
 // event handler.
 func newClient(def Definition, h Handlers) *Client {
 	c := &Client{
-		def:          def,
-		machine:      lifecycle.NewMachine(),
-		logHandler:   h.Log,
-		eventHandler: h.Event,
-		refreshCh:    make(chan struct{}, 1),
-		reconnectCh:  make(chan struct{}, 1),
-		stale:        make(map[catalog.Family]struct{}),
+		def:           def,
+		machine:       lifecycle.NewMachine(),
+		logHandler:    h.Log,
+		eventHandler:  h.Event,
+		elicitHandler: h.Elicitation,
+		refreshCh:     make(chan struct{}, 1),
+		reconnectCh:   make(chan struct{}, 1),
+		stale:         make(map[catalog.Family]struct{}),
 		sched: sched.New(sched.Config{
 			MaxConcurrent: def.Limits.MaxConcurrentRequests,
 			// The application's decision, and only ever the application's. A
@@ -242,6 +247,7 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 		Wire:          c.def.Limits.wire(),
 		OnLog:         c.logAdapter(),
 		OnListChanged: c.onListChanged,
+		OnElicit:      c.elicitAdapter(),
 	})
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)

@@ -311,6 +311,11 @@ func (c *Client) reconnectOnce(ctx context.Context) error {
 		// The new connection's notifications must reach the same binding: a
 		// reconnected server that changes its tools is no less a change.
 		OnListChanged: c.onListChanged,
+		// And so must its requests: what this host can serve is a property of
+		// the host, not of which socket the server is on. A binding that served
+		// elicitation before a reconnect and not after would advertise a
+		// capability (c.caps is re-advertised verbatim) with nothing behind it.
+		OnElicit: c.elicitAdapter(),
 	})
 	if err != nil {
 		return c.classify(dialCtx, opReconnect, err, FailureTransportClosed)

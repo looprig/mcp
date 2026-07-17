@@ -72,16 +72,22 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 	s.started = true
 	s.mu.Unlock()
 
-	client := mcp.NewClient(&mcp.Implementation{
-		Name:    s.cfg.Client.Name,
-		Version: s.cfg.Client.Version,
-		Title:   s.cfg.Client.Title,
-	}, &mcp.ClientOptions{
+	// Advertising is the intersection of "asked for" and "able to serve", and
+	// this is where the second half is known: the capability flags say what the
+	// application asked for, and the callbacks say what can actually answer.
+	// servesElicit is computed once and governs both the advertisement and the
+	// handler registration below, so the two cannot drift apart into a client
+	// that claims a capability nothing serves, or serves one it never claimed.
+	caps := s.cfg.Capabilities
+	servesElicit := caps.Elicitation && s.cfg.OnElicit != nil
+	caps.Elicitation = servesElicit
+
+	opts := &mcp.ClientOptions{
 		// Explicit, always: a nil Capabilities makes the SDK advertise roots
 		// on the client's behalf. Advertising a capability nobody asked for
 		// and nothing here can serve is exactly the fail-open this module
 		// does not do.
-		Capabilities: sdkClientCapabilities(s.cfg.Capabilities),
+		Capabilities: sdkClientCapabilities(caps),
 		// The two server-initiated streams that belong to a request rather than
 		// to a capability. Both are registered unconditionally: progress routes
 		// only to a call that asked for it, and a log with no OnLog installed is
@@ -106,7 +112,34 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 		ResourceListChangedHandler: func(_ context.Context, _ *mcp.ResourceListChangedRequest) {
 			s.onListChanged(ListFamilyResources)
 		},
-	})
+	}
+
+	// Elicitation, unlike every handler above, is registered conditionally —
+	// and the condition is the whole point.
+	//
+	// The SDK auto-advertises the elicitation capability whenever this field is
+	// non-nil, overriding the explicit Capabilities set just above (see its
+	// Client.clientCapabilities). So registering it unconditionally, the way a
+	// notification handler is registered, would put a capability on the wire for
+	// a client that never asked for one — the same fail-open the explicit
+	// Capabilities exists to prevent, arriving through a different door.
+	//
+	// Both halves are required and neither implies the other: the config's
+	// Capabilities is what the application *asked* for, and OnElicit is what can
+	// actually serve it. A capability is only honorable when it is both — which
+	// is why servesElicit, and not either fact alone, is what governs here and
+	// what was advertised above.
+	if servesElicit {
+		opts.ElicitationHandler = func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
+			return s.onElicit(ctx, req.Params)
+		}
+	}
+
+	client := mcp.NewClient(&mcp.Implementation{
+		Name:    s.cfg.Client.Name,
+		Version: s.cfg.Client.Version,
+		Title:   s.cfg.Client.Title,
+	}, opts)
 
 	cs, err := client.Connect(ctx, s.transport, nil)
 	if err != nil {

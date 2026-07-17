@@ -37,6 +37,16 @@ func (r *recordingReporter) snapshot() []Notice {
 	return append([]Notice(nil), r.notices...)
 }
 
+// sawKind reports whether a notice of this kind was reported.
+func (r *recordingReporter) sawKind(kind NoticeKind) bool {
+	for _, n := range r.snapshot() {
+		if n.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
 // waitFor polls until cond holds. A refresh is asynchronous by design — the
 // notification returns before the fetch starts — so a test either polls or races.
 func waitFor(t *testing.T, what string, cond func() bool) {

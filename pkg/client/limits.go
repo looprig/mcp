@@ -104,6 +104,16 @@ type Limits struct {
 
 	// MaxLogMessageBytes caps one server log notification's payload.
 	MaxLogMessageBytes int
+	// MaxElicitMessageBytes caps one elicitation prompt: its message, and in
+	// url mode the URL and correlation id shown with it. A server that exceeds
+	// it has its request refused, not trimmed — see internal/protocol's
+	// FromSDKElicitParams for why a prompt is the one server text this module
+	// will not truncate.
+	MaxElicitMessageBytes int
+	// MaxElicitSchemaBytes caps the schema an elicitation may request. It is
+	// separate from MaxSchemaBytes because a form a person fills in is not a
+	// tool's interface, and raising one must not raise the other.
+	MaxElicitSchemaBytes int
 	// MaxPromptCount caps prompts accepted from one server.
 	MaxPromptCount int
 	// MaxResourceCount caps resources accepted from one server.
@@ -151,6 +161,12 @@ func DefaultLimits() Limits {
 
 		// 8 KiB per log line: diagnostics, not a data channel.
 		MaxLogMessageBytes: 8 << 10,
+		// 4 KiB of prompt is already far more than a person will read, and
+		// 16 KiB of schema describes a far larger form than one they will
+		// fill in. Both are deliberately much smaller than their tool-facing
+		// counterparts: the consumer here is human.
+		MaxElicitMessageBytes: 4 << 10,
+		MaxElicitSchemaBytes:  16 << 10,
 		// Generous catalog caps; servers exceeding these are misbehaving.
 		MaxPromptCount:   256,
 		MaxResourceCount: 4096,
@@ -180,6 +196,9 @@ func (l Limits) bounds() protocol.Bounds {
 		MaxBinaryItemBytes: l.MaxBinaryItemBytes,
 		MaxBinaryItems:     l.MaxBinaryItems,
 		MaxLogBytes:        l.MaxLogMessageBytes,
+
+		MaxElicitMessageBytes: l.MaxElicitMessageBytes,
+		MaxElicitSchemaBytes:  l.MaxElicitSchemaBytes,
 	}
 }
 
@@ -234,6 +253,8 @@ func (l Limits) validate() error {
 		{"Limits.MaxBinaryItemBytes", l.MaxBinaryItemBytes},
 		{"Limits.MaxBinaryItems", l.MaxBinaryItems},
 		{"Limits.MaxLogMessageBytes", l.MaxLogMessageBytes},
+		{"Limits.MaxElicitMessageBytes", l.MaxElicitMessageBytes},
+		{"Limits.MaxElicitSchemaBytes", l.MaxElicitSchemaBytes},
 		{"Limits.MaxPromptCount", l.MaxPromptCount},
 		{"Limits.MaxResourceCount", l.MaxResourceCount},
 		{"Limits.MaxSamplingDepth", l.MaxSamplingDepth},
@@ -271,6 +292,8 @@ func (l Limits) withDefaults() Limits {
 		MaxBinaryItemBytes:     pick(l.MaxBinaryItemBytes, d.MaxBinaryItemBytes),
 		MaxBinaryItems:         pick(l.MaxBinaryItems, d.MaxBinaryItems),
 		MaxLogMessageBytes:     pick(l.MaxLogMessageBytes, d.MaxLogMessageBytes),
+		MaxElicitMessageBytes:  pick(l.MaxElicitMessageBytes, d.MaxElicitMessageBytes),
+		MaxElicitSchemaBytes:   pick(l.MaxElicitSchemaBytes, d.MaxElicitSchemaBytes),
 		MaxPromptCount:         pick(l.MaxPromptCount, d.MaxPromptCount),
 		MaxResourceCount:       pick(l.MaxResourceCount, d.MaxResourceCount),
 		MaxSamplingDepth:       pick(l.MaxSamplingDepth, d.MaxSamplingDepth),

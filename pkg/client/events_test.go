@@ -28,6 +28,8 @@ func eventUnion() []Event {
 		ConnectionRestored{},
 		ServerLog{},
 		RequestProgress{},
+		ElicitationRequested{},
+		ElicitationResolved{},
 	}
 }
 
@@ -97,16 +99,19 @@ func TestEventFieldsAreSafeByConstruction(t *testing.T) {
 	// The types an event field may have. Everything here is either bounded text
 	// this module produced, a closed enum, an ordinal, or a timestamp.
 	allowed := map[reflect.Type]string{
-		reflect.TypeOf(Name("")):        "a binding name: configured by the host, validated, bounded",
-		reflect.TypeOf(""):              "bounded text: see TestEventTextIsBounded",
-		reflect.TypeOf(uint64(0)):       "a generation ordinal",
-		reflect.TypeOf(0):               "a count",
-		reflect.TypeOf(float64(0)):      "a progress figure",
-		reflect.TypeOf(false):           "a flag",
-		reflect.TypeOf(time.Time{}):     "a timestamp",
-		reflect.TypeOf(State(0)):        "a lifecycle state: a closed enum",
-		reflect.TypeOf(FailureClass(0)): "a failure class: a closed enum",
-		reflect.TypeOf(LogLevel("")):    "a log level: a closed enum of MCP's own levels",
+		reflect.TypeOf(Name("")):         "a binding name: configured by the host, validated, bounded",
+		reflect.TypeOf(""):               "bounded text: see TestEventTextIsBounded",
+		reflect.TypeOf(uint64(0)):        "a generation ordinal",
+		reflect.TypeOf(0):                "a count",
+		reflect.TypeOf(float64(0)):       "a progress figure",
+		reflect.TypeOf(false):            "a flag",
+		reflect.TypeOf(time.Time{}):      "a timestamp",
+		reflect.TypeOf(State(0)):         "a lifecycle state: a closed enum",
+		reflect.TypeOf(FailureClass(0)):  "a failure class: a closed enum",
+		reflect.TypeOf(LogLevel("")):     "a log level: a closed enum of MCP's own levels",
+		reflect.TypeOf(ElicitMode(0)):    "an elicitation mode: a closed enum, and the only thing an elicitation event says about what was asked",
+		reflect.TypeOf(ElicitAction(0)):  "an elicitation action: a closed enum of MCP's own result actions",
+		reflect.TypeOf(time.Duration(0)): "an elapsed time: a measurement this module made, not a value a peer supplied",
 		reflect.TypeOf(ServerIdentity{}): "the server's claimed identity: three bounded strings, cosmetic, " +
 			"and already in Status",
 	}
@@ -187,6 +192,15 @@ func populatedEvents(taint string) []Event {
 		ConnectionRestored{Binding: "srv", Server: ServerIdentity{Name: "srv"}, Adopted: 1, Generation: 2, At: now},
 		ServerLog{Binding: "srv", Level: LogInfo, Logger: "srv", Text: "hello", At: now},
 		RequestProgress{Binding: "srv", Progress: 1, Total: 2, Message: "working", At: now},
+		// The taint is offered as the thing an elicitation event must never
+		// carry: design §Elicitation excludes the action URL and its query
+		// parameters, which is where a server would put a token. There is no
+		// field on either event that would take it — which is the assertion.
+		ElicitationRequested{Binding: "srv", Mode: ElicitModeURL, At: now},
+		ElicitationResolved{
+			Binding: "srv", Mode: ElicitModeURL, Action: ElicitAccept,
+			Duration: time.Second, At: now,
+		},
 	}
 }
 

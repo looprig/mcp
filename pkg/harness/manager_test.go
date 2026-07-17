@@ -24,7 +24,11 @@ type recordingEvents struct{}
 
 func (recordingEvents) PublishEvent(context.Context, event.Event) error { return nil }
 
-func testDeps() Deps { return Deps{Gates: stubGates{}, Events: recordingEvents{}} }
+// testDeps is the Deps every test Manager is built with. sessionID (tools_test.go)
+// is the Session they all belong to.
+func testDeps() Deps {
+	return Deps{SessionID: sessionID, Gates: stubGates{}, Events: recordingEvents{}}
+}
 
 // okTransport returns a transport whose handshake succeeds, serving one tool
 // per name.
@@ -53,14 +57,23 @@ func TestNewManagerValidates(t *testing.T) {
 		{
 			name:     "nil gates",
 			bindings: nil,
-			deps:     Deps{Events: recordingEvents{}},
+			deps:     Deps{SessionID: sessionID, Events: recordingEvents{}},
 			wantErr:  "Deps.Gates is nil",
 		},
 		{
 			name:     "nil events",
 			bindings: nil,
-			deps:     Deps{Gates: stubGates{}},
+			deps:     Deps{SessionID: sessionID, Gates: stubGates{}},
 			wantErr:  "Deps.Events is nil",
+		},
+		// An event stamped with the zero Session is one the hub delivers to the
+		// wrong subscribers, or ValidateEvent refuses outright. The Manager
+		// cannot derive it, so it must be given it.
+		{
+			name:     "zero session id",
+			bindings: nil,
+			deps:     Deps{Gates: stubGates{}, Events: recordingEvents{}},
+			wantErr:  "Deps.SessionID is zero",
 		},
 		{
 			name:     "invalid binding",

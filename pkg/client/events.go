@@ -205,20 +205,69 @@ type RequestProgress struct {
 	At time.Time
 }
 
-func (ConnectionLost) event()     {}
-func (ConnectionRestored) event() {}
-func (ServerLog) event()          {}
-func (RequestProgress) event()    {}
+// ElicitationRequested reports that a server asked for human input, and that the
+// request passed the boundary's checks and reached the host's handler.
+//
+// It deliberately carries none of what was asked. The message, the schema and —
+// above all — the URL stay out of the event stream: design §Elicitation is
+// explicit that the full action URL and its query parameters are not written to
+// journals or ordinary events, and a URL's query string is where a server would
+// put a token. Mode is what an observer needs and all it gets: enough to know a
+// person is being asked something and what kind of thing it is.
+//
+// It is not a promise that a human saw anything. What happened next is the
+// handler's business, and ElicitationResolved is where it is reported.
+type ElicitationRequested struct {
+	// Binding names the server that asked.
+	Binding Name
+	// Mode is the kind of elicitation.
+	Mode ElicitMode
+	// At is when the request reached the handler.
+	At time.Time
+}
 
-// # Auth state and elicitation: deferred, and why
+// ElicitationResolved reports how an elicitation ended. Exactly one follows
+// every ElicitationRequested.
 //
-// The design's event set also lists auth state and the elicitation lifecycle.
-// Neither is here, and the reasons are different from each other.
+// Action is the answer that went to the server, and it is the zero ElicitAction
+// ("unknown") when none did: a handler that failed, timed out, or answered with
+// something the client refused to put on the wire. That is a real outcome and
+// not a gap — the server was told the request failed — so it is reported rather
+// than silently dropped, and it is distinguishable from a decline, which is a
+// person's answer rather than a host's failure.
+type ElicitationResolved struct {
+	// Binding names the server that asked.
+	Binding Name
+	// Mode is the kind of elicitation, repeated from the request so an observer
+	// need not correlate to know what was answered.
+	Mode ElicitMode
+	// Action is what the server was told, or the zero action when the
+	// elicitation failed instead of being answered.
+	Action ElicitAction
+	// Duration is how long the handler took: the time a person was being waited
+	// on, which is the figure an operator wants and the only one this event can
+	// honestly report.
+	Duration time.Duration
+	// At is when the outcome was observed.
+	At time.Time
+}
+
+func (ConnectionLost) event()       {}
+func (ConnectionRestored) event()   {}
+func (ServerLog) event()            {}
+func (RequestProgress) event()      {}
+func (ElicitationRequested) event() {}
+func (ElicitationResolved) event()  {}
+
+// # Auth state: deferred, and why
 //
-// Elicitation has no producer. Handlers.Elicitation is declared, but nothing
-// calls it: internal/protocol's session registers the SDK's progress and logging
-// handlers and no elicitation handler, so no server request ever reaches this
-// module. An event for it would be unemittable.
+// The design's event set also lists auth state. It is not here.
+//
+// (Elicitation was listed alongside it and is no longer deferred:
+// internal/protocol's session now registers an SDK elicitation handler — guarded
+// so the capability is never advertised on a client's behalf — and the client
+// wires Handlers.Elicitation to it, so the two events above have a real
+// producer. See Client.elicitAdapter.)
 //
 // Auth state has a producer and no seam. This is worth stating precisely,
 // because the obvious reading — "nothing authenticates yet" — is false and would

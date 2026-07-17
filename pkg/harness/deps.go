@@ -161,6 +161,16 @@ const (
 	// at all — a foreign loop, whose toolset belongs to its foreign agent. It
 	// is a permanent property of the Loop, not a failure to retry.
 	NoticeAdoptionUnsupported
+	// NoticeEventRejected reports an integration status that could not be
+	// published: this adapter built one the event contract refuses, or the host
+	// declined it. It is the sink of last resort — the fact that the sink for
+	// facts is broken has nowhere else to go.
+	NoticeEventRejected
+	// NoticeElicitationDeclined reports a server's request for human input that
+	// was refused without ever being shown to anyone: an unsupported schema, a
+	// field soliciting a credential, an unusable URL. The server is told
+	// "decline"; this says why, which the server is deliberately not told.
+	NoticeElicitationDeclined
 )
 
 // String returns a stable lowercase identifier, or "unknown".
@@ -174,6 +184,10 @@ func (k NoticeKind) String() string {
 		return "adoption_failed"
 	case NoticeAdoptionUnsupported:
 		return "adoption_unsupported"
+	case NoticeEventRejected:
+		return "event_rejected"
+	case NoticeElicitationDeclined:
+		return "elicitation_declined"
 	default:
 		return "unknown"
 	}
@@ -222,9 +236,16 @@ func (m *Manager) report(n Notice) {
 	m.deps.Reporter.Report(n)
 }
 
-// Deps are the host capabilities the Manager needs. Gates and Events are
-// required; the rest select documented defaults when nil.
+// Deps are the host capabilities the Manager needs. SessionID, Gates and Events
+// are required; the rest select documented defaults when nil.
 type Deps struct {
+	// SessionID identifies the Session these bindings belong to. Required: it is
+	// the coordinate every event.IntegrationStatus is stamped with, and an event
+	// carrying the wrong Session's ID — or none — is one that either reaches the
+	// wrong subscribers or is refused as invalid. The Manager cannot derive it:
+	// it is deliberately given a GateOpener and an EventPublisher rather than a
+	// Session (see this file's header), so nothing it holds knows the answer.
+	SessionID uuid.UUID
 	// Gates routes elicitation to a human. Required: a binding that advertises
 	// the elicitation capability with nowhere to ask would be a lie told to a
 	// server.
@@ -259,6 +280,9 @@ func (d Deps) normalized() Deps {
 // a server request that hangs, and a nil Events discovered during a failure is a
 // failure nobody sees.
 func (d Deps) validate() error {
+	if d.SessionID.IsZero() {
+		return fmt.Errorf("Deps.SessionID is zero; supply the Session's ID")
+	}
 	if d.Gates == nil {
 		return fmt.Errorf("Deps.Gates is nil; supply a GateOpener")
 	}

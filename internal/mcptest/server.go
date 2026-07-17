@@ -70,6 +70,7 @@ package mcptest
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -100,6 +101,7 @@ const (
 	ToolMutated  = "echo2"
 	ToolProgress = "progress"
 	ToolLog      = "log"
+	ToolElicit   = "elicit"
 )
 
 // Prompt and resource identifiers the fixture exposes when enabled.
@@ -201,6 +203,17 @@ type Config struct {
 	// what "as soon as" can and cannot mean here.
 	ElicitOnInitialize bool
 
+	// Elicit adds the "elicit" tool, which asks the client a question while
+	// answering a tool call and reports what it was told.
+	//
+	// It is a tool rather than another unprompted send because that is what
+	// makes an elicitation *observable to the caller*: the client drives it,
+	// and the answer the human gave comes back in the tool's own result. A
+	// test asserts on a reply instead of waiting for a notification that may
+	// or may not have happened yet. ElicitOnInitialize keeps its own,
+	// different job: the first moment a server is allowed to speak unprompted.
+	Elicit bool
+
 	// PageSize caps how many items the server returns per list page. Zero uses
 	// the SDK's default (1000), which no fixture catalog comes close to — so a
 	// test that needs to exercise a client's pagination sets this to 1 or 2 and
@@ -272,6 +285,9 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	addExtraTools(s, cfg.ExtraTools)
 	if cfg.Mutate {
 		addMutateTool(s)
+	}
+	if cfg.Elicit {
+		addElicitTool(s)
 	}
 	if cfg.Crash {
 		addCrashTool(s, cfg.CrashExitCode)
@@ -637,6 +653,57 @@ func addResources(s *mcp.Server) {
 			MIMEType: "text/plain",
 			Text:     word,
 		}}}, nil
+	})
+}
+
+// ElicitInput is the "elicit" tool's argument.
+type ElicitInput struct {
+	// Mode is the elicitation mode to send, verbatim. It is a free string, not
+	// an enum, precisely so a test can send a mode MCP does not define and see
+	// what a client does with it — which is the interesting case.
+	Mode string `json:"mode,omitempty" jsonschema:"the elicitation mode to send (form, url, or anything else)"`
+	// Message overrides the prompt. Empty uses ElicitMessage.
+	Message string `json:"message,omitempty" jsonschema:"the prompt to send; defaults to the fixture's own"`
+	// Schema, when true, requests a one-string-field form, so a test can
+	// exercise a client that has to carry a schema to a human and an answer
+	// back through it.
+	Schema bool `json:"schema,omitempty" jsonschema:"request a {name: string} form schema"`
+	// URL is the action URL to send, for url mode.
+	URL string `json:"url,omitempty" jsonschema:"the action URL, for url mode"`
+}
+
+// ElicitAnswerPrefix prefixes the "elicit" tool's result. What follows is the
+// action the client reported, so a test can assert that the human's answer made
+// it all the way back to the server that asked.
+const ElicitAnswerPrefix = "elicited: "
+
+// addElicitTool registers the tool that asks the client a question mid-call.
+//
+// A failed elicitation is returned as a tool error, not a Go error: the client
+// refusing (or being unable) to answer is a thing the fixture is *for*, and a
+// test asserting on the refusal needs it to arrive as a result rather than as a
+// dead session.
+func addElicitTool(s *mcp.Server) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        ToolElicit,
+		Description: "Asks the client for human input, and reports the action it answered with.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ElicitInput) (*mcp.CallToolResult, any, error) {
+		message := in.Message
+		if message == "" {
+			message = ElicitMessage
+		}
+		params := &mcp.ElicitParams{Mode: in.Mode, Message: message, URL: in.URL}
+		if in.Schema {
+			params.RequestedSchema = json.RawMessage(
+				`{"type":"object","properties":{"name":{"type":"string"}}}`)
+		}
+
+		res, err := req.Session.Elicit(ctx, params)
+		if err != nil {
+			return errorResult(fmt.Sprintf("elicit failed: %v", err)), nil, nil
+		}
+		return textResult(ElicitAnswerPrefix + res.Action), nil, nil
 	})
 }
 
