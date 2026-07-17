@@ -142,6 +142,86 @@ type fixedScopePolicy struct{ scopes []tool.ApprovalScope }
 
 func (p fixedScopePolicy) Scopes(string) []tool.ApprovalScope { return p.scopes }
 
+// NoticeKind classifies an adapter notice. The zero value is not a kind.
+type NoticeKind uint8
+
+const (
+	// NoticeToolNameCollision reports a binding refused from a Loop's
+	// namespace because one of its model-facing names is already held by
+	// another binding. The offending binding contributes nothing to that Loop;
+	// the incumbent keeps serving.
+	NoticeToolNameCollision NoticeKind = iota + 1
+	// NoticeAdopted reports that a Loop's toolset was replaced with a newer
+	// catalog generation at its idle boundary.
+	NoticeAdopted
+	// NoticeAdoptionFailed reports that a replacement was refused. The Loop
+	// keeps the generation it had; nothing partial was installed.
+	NoticeAdoptionFailed
+	// NoticeAdoptionUnsupported reports a Loop that cannot host external tools
+	// at all — a foreign loop, whose toolset belongs to its foreign agent. It
+	// is a permanent property of the Loop, not a failure to retry.
+	NoticeAdoptionUnsupported
+)
+
+// String returns a stable lowercase identifier, or "unknown".
+func (k NoticeKind) String() string {
+	switch k {
+	case NoticeToolNameCollision:
+		return "tool_name_collision"
+	case NoticeAdopted:
+		return "adopted"
+	case NoticeAdoptionFailed:
+		return "adoption_failed"
+	case NoticeAdoptionUnsupported:
+		return "adoption_unsupported"
+	default:
+		return "unknown"
+	}
+}
+
+// Notice is one thing the adapter needs an operator to be able to see.
+//
+// It exists because the design's "reports" cannot be an event.Event: the
+// Harness event set is sealed (Event.isEvent is unexported), so no external
+// module can add a member, and none of the existing members can express "this
+// binding's tools were refused for this Loop". Deps.Events therefore carries
+// the events Harness itself defines, and this carries the facts only MCP knows.
+// The alternative — inventing a Harness event type for a protocol Harness must
+// not know about — is exactly what this module's boundary exists to prevent.
+//
+// Every field is safe to log as-is: names are validated identifiers and
+// Message is this module's own bounded text.
+type Notice struct {
+	// Kind classifies the notice.
+	Kind NoticeKind
+	// Binding names the binding concerned.
+	Binding string
+	// LoopID is the Loop concerned, or zero when the notice is not about one.
+	LoopID uuid.UUID
+	// Generation is the catalog generation concerned, or 0.
+	Generation uint64
+	// Message is bounded, redacted explanatory text.
+	Message string
+}
+
+// Reporter receives the adapter's notices. It is optional; a nil Deps.Reporter
+// drops them.
+//
+// Report must not block: it is called on the goroutine that discovered the
+// fact, which may be a Loop's adoption path or a live toolset assembly. Hand
+// off anything expensive.
+type Reporter interface {
+	Report(Notice)
+}
+
+// report delivers a notice when a Reporter is installed.
+func (m *Manager) report(n Notice) {
+	if m.deps.Reporter == nil {
+		return
+	}
+	m.deps.Reporter.Report(n)
+}
+
 // Deps are the host capabilities the Manager needs. Gates and Events are
 // required; the rest select documented defaults when nil.
 type Deps struct {
@@ -155,6 +235,9 @@ type Deps struct {
 	// ScopePolicy decides approval persistence breadth. Nil selects
 	// defaultScopes.
 	ScopePolicy ScopePolicy
+	// Reporter receives the adapter's own notices — the facts the sealed
+	// Harness event set cannot express. Optional; nil drops them.
+	Reporter Reporter
 	// Clock is the time source. Nil selects the system clock.
 	Clock Clock
 }

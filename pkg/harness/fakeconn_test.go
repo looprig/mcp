@@ -33,13 +33,28 @@ type scriptedTransport struct {
 
 	enteredOnce sync.Once
 	dials       atomic.Int32
+
+	mu  sync.Mutex
+	cfg protocol.ConnectConfig
+}
+
+// lastConfig returns the ConnectConfig of the most recent Connect. It is how a
+// test reaches the callbacks the client installed — a notification must arrive
+// the way a real one does, through the connection, not by poking the client.
+func (t *scriptedTransport) lastConfig() protocol.ConnectConfig {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.cfg
 }
 
 func (t *scriptedTransport) Kind() string           { return "scripted" }
 func (t *scriptedTransport) RedactedOrigin() string { return "scripted://fixture" }
 
-func (t *scriptedTransport) Connect(ctx context.Context, _ protocol.ConnectConfig) (protocol.Conn, error) {
+func (t *scriptedTransport) Connect(ctx context.Context, cfg protocol.ConnectConfig) (protocol.Conn, error) {
 	t.dials.Add(1)
+	t.mu.Lock()
+	t.cfg = cfg
+	t.mu.Unlock()
 	if t.entered != nil {
 		t.enteredOnce.Do(func() { close(t.entered) })
 	}
@@ -71,6 +86,11 @@ type scriptedConn struct {
 	callResult protocol.ToolResult
 	callErr    error
 
+	// calledName and calledArgs record the last CallTool, so a routing test can
+	// assert what actually went on the wire rather than what a name suggests.
+	calledName string
+	calledArgs json.RawMessage
+
 	closes atomic.Int32
 	calls  atomic.Int32
 }
@@ -91,6 +111,28 @@ func fakeTool(rawName string) protocol.ToolSpec {
 		Description: "a fixture tool",
 		InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
 	}
+}
+
+// setTools replaces the served catalog. A refresh triggered afterwards sees the
+// new one, which is how a test makes a server remove or change a tool.
+func (c *scriptedConn) setTools(tools ...protocol.ToolSpec) {
+	c.mu.Lock()
+	c.tools = tools
+	c.mu.Unlock()
+}
+
+// setCall scripts the next CallTool outcome.
+func (c *scriptedConn) setCall(res protocol.ToolResult, err error) {
+	c.mu.Lock()
+	c.callResult, c.callErr = res, err
+	c.mu.Unlock()
+}
+
+// lastCall reports the raw name and arguments of the most recent CallTool.
+func (c *scriptedConn) lastCall() (string, string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.calledName, string(c.calledArgs)
 }
 
 func (c *scriptedConn) Initialize(context.Context) (protocol.InitializeResult, error) {
@@ -124,9 +166,10 @@ func (c *scriptedConn) ListResourceTemplates(context.Context, string) (protocol.
 	return protocol.ResourceTemplatePage{}, nil
 }
 
-func (c *scriptedConn) CallTool(ctx context.Context, _ string, _ json.RawMessage, _ protocol.CallOptions) (protocol.ToolResult, error) {
+func (c *scriptedConn) CallTool(ctx context.Context, rawName string, args json.RawMessage, _ protocol.CallOptions) (protocol.ToolResult, error) {
 	c.calls.Add(1)
 	c.mu.Lock()
+	c.calledName, c.calledArgs = rawName, args
 	res, err := c.callResult, c.callErr
 	c.mu.Unlock()
 	if err != nil {
