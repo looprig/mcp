@@ -65,6 +65,14 @@ type Client struct {
 	// construction and read-only afterwards. Nil means this binding serves no
 	// elicitation and advertises no such capability. See Client.elicitAdapter.
 	elicitHandler ElicitationHandler
+	// samplingHandler is the application's sampling handler, captured at
+	// construction and read-only afterwards. Nil means this binding serves no
+	// sampling and advertises no such capability. See Client.sampleAdapter.
+	samplingHandler SamplingHandler
+	// samples bounds the sampling this binding will serve: how much at once, and
+	// how deep. It is created with the Client and immutable afterwards (it does
+	// its own locking).
+	samples *sampleGate
 	// sched admits this binding's requests: it serializes what must be
 	// serialized and bounds everything. It is created with the Client and is
 	// immutable afterwards (it does its own locking).
@@ -204,6 +212,9 @@ func newClient(def Definition, h Handlers) *Client {
 		refreshCh:     make(chan struct{}, 1),
 		reconnectCh:   make(chan struct{}, 1),
 		stale:         make(map[catalog.Family]struct{}),
+
+		samplingHandler: h.Sampling,
+		samples:         newSampleGate(def.Limits.MaxSamplingDepth, def.Limits.MaxSamplingConcurrency),
 		sched: sched.New(sched.Config{
 			MaxConcurrent: def.Limits.MaxConcurrentRequests,
 			// The application's decision, and only ever the application's. A
@@ -248,6 +259,7 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 		OnLog:         c.logAdapter(),
 		OnListChanged: c.onListChanged,
 		OnElicit:      c.elicitAdapter(),
+		OnSample:      c.sampleAdapter(),
 	})
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)

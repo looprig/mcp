@@ -316,6 +316,7 @@ func (c *Client) reconnectOnce(ctx context.Context) error {
 		// elicitation before a reconnect and not after would advertise a
 		// capability (c.caps is re-advertised verbatim) with nothing behind it.
 		OnElicit: c.elicitAdapter(),
+		OnSample: c.sampleAdapter(),
 	})
 	if err != nil {
 		return c.classify(dialCtx, opReconnect, err, FailureTransportClosed)

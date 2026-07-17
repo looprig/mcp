@@ -349,6 +349,16 @@ func (c *Client) serving(op string) (protocol.Conn, uint64, error) {
 func (c *Client) admit(ctx, callCtx context.Context, op string, class sched.Class) (context.Context, func(), error) {
 	reqCtx, release, err := c.sched.Begin(callCtx, class)
 	if err == nil {
+		// A request issued from inside a sampling handler is the one causal link
+		// in a sampling chain this module can see: it is why the server has work
+		// in flight, so it is why the server might ask for sampling again. It is
+		// registered for exactly as long as it is outstanding, so that a sampling
+		// request arriving meanwhile is attributed to it rather than treated as a
+		// fresh one. See sampleGate.
+		if d := sampleDepthOf(ctx); d > 0 {
+			leave := c.samples.enterChain(d)
+			return reqCtx, func() { leave(); release() }, nil
+		}
 		return reqCtx, release, nil
 	}
 	if errors.Is(err, sched.ErrShutdown) {

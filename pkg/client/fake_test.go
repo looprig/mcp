@@ -84,6 +84,12 @@ type fakeConn struct {
 	// is the correct path.
 	callProbeN      int32
 	callProbeWindow time.Duration
+	// callEntered, when non-nil, receives once per CallTool call, before the
+	// call blocks. Like listEntered it is how a test observes that a call is
+	// actually in flight rather than sleeping and hoping — which is what the
+	// sampling depth tests need, since the thing they assert on is what happens
+	// *while* a call issued from a sampling handler is outstanding.
+	callEntered chan struct{}
 	// callReleased, when non-nil, blocks CallTool until it is closed: every
 	// call, or just one of them when holdCall names it.
 	callReleased chan struct{}
@@ -234,6 +240,13 @@ func (c *fakeConn) CallTool(ctx context.Context, rawName string, _ json.RawMessa
 		max := c.maxLive.Load()
 		if live <= max || c.maxLive.CompareAndSwap(max, live) {
 			break
+		}
+	}
+	if c.callEntered != nil {
+		select {
+		case c.callEntered <- struct{}{}:
+		case <-ctx.Done():
+			return protocol.ToolResult{}, ctx.Err()
 		}
 	}
 	if c.callProbeN > 1 {

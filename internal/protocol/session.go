@@ -81,6 +81,8 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 	caps := s.cfg.Capabilities
 	servesElicit := caps.Elicitation && s.cfg.OnElicit != nil
 	caps.Elicitation = servesElicit
+	servesSample := caps.Sampling && s.cfg.OnSample != nil
+	caps.Sampling = servesSample
 
 	opts := &mcp.ClientOptions{
 		// Explicit, always: a nil Capabilities makes the SDK advertise roots
@@ -132,6 +134,26 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 	if servesElicit {
 		opts.ElicitationHandler = func(ctx context.Context, req *mcp.ElicitRequest) (*mcp.ElicitResult, error) {
 			return s.onElicit(ctx, req.Params)
+		}
+	}
+
+	// Sampling is registered conditionally for exactly the reason elicitation
+	// is, and the SDK's fail-open here is the same one: setting
+	// CreateMessageHandler makes it advertise the sampling capability whenever
+	// the explicit Capabilities left it nil (see its Client.clientCapabilities).
+	// A client that never asked for sampling must not be made to offer it —
+	// least of all this capability, which is the one that spends money.
+	//
+	// CreateMessageHandler, never CreateMessageWithToolsHandler: the basic
+	// handler is the one that cannot carry tools. Registering it is what makes
+	// "sampling never receives an unrestricted tool registry" structural rather
+	// than remembered — the SDK will not deliver a tool-bearing request to it,
+	// and sdkClientCapabilities never advertises the Tools sub-capability that
+	// would invite one. (Setting both handlers is a documented SDK panic; only
+	// this one is ever set.)
+	if servesSample {
+		opts.CreateMessageHandler = func(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
+			return s.onSample(ctx, req.Params)
 		}
 	}
 
@@ -226,6 +248,15 @@ func sdkClientCapabilities(c ClientCapabilities) *mcp.ClientCapabilities {
 		caps.RootsV2 = &mcp.RootCapabilities{ListChanged: true}
 	}
 	if c.Sampling {
+		// Bare, and deliberately: the two sub-capabilities stay nil because this
+		// module serves neither, and each is a thing a server checks for before
+		// asking. Tools nil means no server sends a tool-bearing sampling
+		// request; Context nil means none asks the host to harvest other
+		// servers' context into a prompt. Setting Sampling non-nil here also
+		// suppresses the SDK's own inference (client.go guards it with
+		// `if caps.Sampling == nil`), so this is the whole advertisement — which
+		// is the point: the SDK would otherwise add Tools on its own the moment
+		// a tool-bearing handler were registered.
 		caps.Sampling = &mcp.SamplingCapabilities{}
 	}
 	if c.Elicitation {

@@ -132,6 +132,19 @@ type ConnectConfig struct {
 	// others: it belongs to no request this module made, so there is nothing to
 	// return it from.
 	OnElicit func(context.Context, ElicitRequest) (ElicitResult, error)
+
+	// OnSample serves the server's requests for an LLM completion, already
+	// bounded and validated. Nil means no sampling is served — and, because a
+	// capability with nothing behind it must never reach the wire, nil also
+	// means the sampling capability is not advertised however Capabilities is
+	// set (see Session.Initialize).
+	//
+	// Like OnElicit it answers, and its return value goes to the server. It is
+	// invoked on the connection's request-dispatch goroutine with the caller's
+	// deadline already on ctx; returning an error refuses the request, which a
+	// host is always entitled to do — sampling spends the host's money, and
+	// "no" is a complete answer.
+	OnSample func(context.Context, SampleRequest) (SampleResult, error)
 }
 
 // ListFamily names the catalog family a list-change notification refers to. It
