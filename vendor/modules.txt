@@ -140,11 +140,31 @@ github.com/gorilla/websocket
 github.com/invopop/jsonschema
 # github.com/looprig/core v0.2.0 => ../core
 ## explicit; go 1.25.0
+github.com/looprig/core/content
 github.com/looprig/core/uuid
 # github.com/looprig/harness v0.0.0 => ../harness
 ## explicit; go 1.26.4
+github.com/looprig/harness/pkg/event
+github.com/looprig/harness/pkg/gate
+github.com/looprig/harness/pkg/hustle
+github.com/looprig/harness/pkg/identity
+github.com/looprig/harness/pkg/security
+github.com/looprig/harness/pkg/tool
 # github.com/looprig/inference v0.3.0 => ../inference
 ## explicit; go 1.26.4
+github.com/looprig/inference
+github.com/looprig/inference/codec
+github.com/looprig/inference/codec/anthropicapi
+github.com/looprig/inference/codec/geminiapi
+github.com/looprig/inference/codec/openaiapi
+github.com/looprig/inference/contextcount
+github.com/looprig/inference/failure
+github.com/looprig/inference/internal/usagenorm
+github.com/looprig/inference/model
+github.com/looprig/inference/stream
+github.com/looprig/inference/usage
+github.com/looprig/inference/wire/jsonbody
+github.com/looprig/inference/wire/sse
 # github.com/modelcontextprotocol/go-sdk v1.6.1
 ## explicit; go 1.25.0
 github.com/modelcontextprotocol/go-sdk/auth
