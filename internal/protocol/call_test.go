@@ -535,3 +535,17 @@ func TestCallToolRejectsEmptyIdentifiers(t *testing.T) {
 		t.Error("ReadResource with an empty URI succeeded")
 	}
 }
+
+// TestFromSDKLogParamsNilIsNotAPanic pins the nil contract.
+//
+// The converter is exported to be driven directly — call_fuzz_test.go does
+// exactly that — so nil must be a value it handles, not a panic it delegates to
+// the caller's discipline. It reports no error, so the zero record is the only
+// answer available; that is the contract, and this is it in writing.
+func TestFromSDKLogParamsNilIsNotAPanic(t *testing.T) {
+	t.Parallel()
+	got := protocol.FromSDKLogParams(nil, testBounds())
+	if got != (protocol.LogRecord{}) {
+		t.Errorf("FromSDKLogParams(nil) = %+v, want the zero record", got)
+	}
+}

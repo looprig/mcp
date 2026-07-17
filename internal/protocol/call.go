@@ -452,7 +452,18 @@ func (s *Session) onListChanged(f ListFamily) {
 // a structured log is readable rather than dropped. Either way the result is
 // truncated to Bounds.MaxLogBytes — a log line is a diagnostic from an
 // untrusted peer, not a data channel.
+//
+// Nil params yield the zero LogRecord. The function reports no error — a log
+// line has no failure a caller could act on — so nil cannot be an error return,
+// and it must not be a panic: this converter is exported precisely so a fuzzer
+// can drive it directly with anything a server could produce, and "the caller
+// must nil-check first" is a contract every sibling converter here declines to
+// rely on. It matches the treatment of a nil Data payload, which is likewise
+// empty rather than fatal.
 func FromSDKLogParams(params *mcp.LoggingMessageParams, b Bounds) LogRecord {
+	if params == nil {
+		return LogRecord{}
+	}
 	rec := LogRecord{Level: string(params.Level), Logger: params.Logger}
 	rec.Logger, _ = limits.TruncateText(rec.Logger, b.MaxLogBytes)
 

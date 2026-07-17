@@ -300,9 +300,20 @@ type Bounds struct {
 }
 
 // MaxWarnings caps the Warnings a single conversion may report, so a hostile
-// server cannot turn tolerated defects into unbounded memory. Warnings beyond
-// the cap are discarded.
+// server cannot turn tolerated defects into unbounded memory.
+//
+// Per-item messages beyond the cap are discarded, but the drops they described
+// are not hidden: convertItems spends the last slot on a summary carrying the
+// true total. The cap bounds how much is said, never whether it is said.
 const MaxWarnings = 8
+
+// MaxPromptArgs caps how many arguments one prompt may declare.
+//
+// A prompt's argument list is server-chosen and retained in a catalog for the
+// life of a connection, so it needs a ceiling for the same reason the catalog
+// itself does. The number is set where a prompt stops being one a person could
+// fill in: past this, the server is not describing a prompt.
+const MaxPromptArgs = 64
 
 // ToolSpec is a tool as advertised by a server, bounded and detached from SDK
 // memory. RawName is exactly what the server sent — unvalidated, unnamespaced,

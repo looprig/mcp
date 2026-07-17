@@ -77,9 +77,14 @@ func checkCursor(cursor string) error {
 	return nil
 }
 
-// pageWarn appends a bounded warning to a page's warning list.
+// pageWarn appends a warning to a page's warning list, keeping the last slot
+// free for convertItems' overflow summary.
+//
+// The reserved slot is what keeps MaxWarnings a bound on memory without also
+// making it a bound on the truth. Filling every slot with a per-item message
+// would mean the (MaxWarnings+1)-th drop is reported nowhere at all.
 func pageWarn(warnings []string, msg string) []string {
-	if len(warnings) >= MaxWarnings {
+	if len(warnings) >= MaxWarnings-1 {
 		return warnings
 	}
 	return append(warnings, msg)
@@ -95,8 +100,14 @@ func pageWarn(warnings []string, msg string) []string {
 // an otherwise-working server, and would protect nothing that dropping does not
 // already protect: the unusable item is not exposed either way.
 //
-// A drop is never silent. Each one leaves a warning that reaches the
-// generation, and a caller that finds a tool missing can see why.
+// No drop is silent, and the COUNT is never wrong. Warnings are capped at
+// MaxWarnings so a hostile server cannot turn tolerated defects into unbounded
+// memory, but a cap that simply discarded the rest would make a page of 100
+// dropped tools indistinguishable from a page of 8 — the caller would read the
+// eight warnings as the whole story. So the individual messages are capped and
+// the last slot carries a summary of what the cap hid. A caller that finds a
+// tool missing can always see that it was dropped, and how many others were,
+// even when it cannot see why for every one.
 func convertItems[In, Out any](
 	items []In,
 	convert func(In) (Out, error),
@@ -107,13 +118,20 @@ func convertItems[In, Out any](
 	}
 	out := make([]Out, 0, len(items))
 	var warnings []string
+	dropped := 0
 	for i, item := range items {
 		conv, err := convert(item)
 		if err != nil {
+			dropped++
 			warnings = pageWarn(warnings, fmt.Sprintf("%s %d dropped: %v", what, i, err))
 			continue
 		}
 		out = append(out, conv)
+	}
+	if unreported := dropped - len(warnings); unreported > 0 {
+		warnings = append(warnings, fmt.Sprintf(
+			"%d further %s(s) were dropped without a message (%d dropped in all, over this client's %d warning cap)",
+			unreported, what, dropped, MaxWarnings))
 	}
 	return out, warnings
 }

@@ -3,6 +3,7 @@ package protocol_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -298,4 +299,41 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// TestDroppedItemsPastTheWarningCapAreStillCounted pins the honesty of the cap.
+//
+// MaxWarnings bounds memory, so a server that sends 100 malformed tools cannot
+// buy 100 warning strings. But the bound must not turn into a lie: before this
+// was fixed, drops 9+ vanished entirely and a caller reading eight warnings had
+// no way to know it was looking at eight of a hundred. The per-item messages are
+// capped; the COUNT is not.
+func TestDroppedItemsPastTheWarningCapAreStillCounted(t *testing.T) {
+	t.Parallel()
+
+	const bad = 100
+	res := &mcp.ListToolsResult{}
+	for i := 0; i < bad; i++ {
+		// A missing input schema is a drop: FromSDKTool refuses it rather than
+		// expose a tool that would accept unconstrained arguments.
+		res.Tools = append(res.Tools, &mcp.Tool{Name: fmt.Sprintf("bad%d", i)})
+	}
+	res.Tools = append(res.Tools, &mcp.Tool{Name: "good", InputSchema: objectSchema()})
+
+	page, err := protocol.FromSDKToolPage(res, testBounds())
+	if err != nil {
+		t.Fatalf("FromSDKToolPage() error = %v", err)
+	}
+	if len(page.Tools) != 1 || page.Tools[0].RawName != "good" {
+		t.Fatalf("Tools = %v, want only the one convertible tool", page.Tools)
+	}
+	// The bound still holds.
+	if len(page.Warnings) > protocol.MaxWarnings {
+		t.Errorf("Warnings = %d entries, want at most %d", len(page.Warnings), protocol.MaxWarnings)
+	}
+	// And the count is recoverable from them.
+	joined := strings.Join(page.Warnings, "\n")
+	if !strings.Contains(joined, fmt.Sprintf("%d dropped in all", bad)) {
+		t.Errorf("no warning reports the true drop count of %d; got:\n%s", bad, joined)
+	}
 }

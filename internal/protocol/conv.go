@@ -178,17 +178,38 @@ func fromSDKToolAnnotations(a *mcp.ToolAnnotations) *ToolAnnotations {
 }
 
 // FromSDKPrompt converts an SDK prompt, copying the argument list.
-func FromSDKPrompt(p *mcp.Prompt, _ Bounds) (PromptSpec, error) {
+//
+// Identifiers are bounded by REJECTION and prose by TRUNCATION, and the split is
+// deliberate. A prompt's name and its arguments' names are used to address the
+// thing later; a truncated identifier is a different identifier that still looks
+// like one, so an over-long name drops the prompt (with a warning, via
+// convertItems) rather than silently becoming a name the server never chose.
+// Title and Description are cosmetic — they reach logs and UIs and nothing
+// addresses them — so they truncate, for the same reason FromSDKServerIdentity's
+// do: padding is not a reason to refuse an otherwise-working prompt.
+//
+// The argument COUNT is bounded too. Bounding each string while accepting a
+// million of them would be a bound in name only.
+func FromSDKPrompt(p *mcp.Prompt, b Bounds) (PromptSpec, error) {
 	if p == nil {
 		return PromptSpec{}, fmt.Errorf("%w: prompt", errNilInput)
 	}
 	if p.Name == "" {
 		return PromptSpec{}, errors.New("protocol: prompt has no name")
 	}
+	if len(p.Name) > b.MaxTextBytes {
+		return PromptSpec{}, fmt.Errorf("protocol: prompt name is %d bytes, max %d", len(p.Name), b.MaxTextBytes)
+	}
+	if len(p.Arguments) > MaxPromptArgs {
+		return PromptSpec{}, fmt.Errorf("protocol: prompt %q declares %d arguments, max %d",
+			p.Name, len(p.Arguments), MaxPromptArgs)
+	}
+	title, _ := limits.TruncateText(p.Title, b.MaxTextBytes)
+	description, _ := limits.TruncateText(p.Description, b.MaxTextBytes)
 	spec := PromptSpec{
 		RawName:     p.Name,
-		Title:       p.Title,
-		Description: p.Description,
+		Title:       title,
+		Description: description,
 	}
 	if len(p.Arguments) > 0 {
 		spec.Arguments = make([]PromptArgSpec, 0, len(p.Arguments))
@@ -199,10 +220,16 @@ func FromSDKPrompt(p *mcp.Prompt, _ Bounds) (PromptSpec, error) {
 			if a.Name == "" {
 				return PromptSpec{}, fmt.Errorf("protocol: prompt %q argument %d has no name", p.Name, i)
 			}
+			if len(a.Name) > b.MaxTextBytes {
+				return PromptSpec{}, fmt.Errorf("protocol: prompt %q argument %d name is %d bytes, max %d",
+					p.Name, i, len(a.Name), b.MaxTextBytes)
+			}
+			argTitle, _ := limits.TruncateText(a.Title, b.MaxTextBytes)
+			argDescription, _ := limits.TruncateText(a.Description, b.MaxTextBytes)
 			spec.Arguments = append(spec.Arguments, PromptArgSpec{
 				Name:        a.Name,
-				Title:       a.Title,
-				Description: a.Description,
+				Title:       argTitle,
+				Description: argDescription,
 				Required:    a.Required,
 			})
 		}
@@ -212,36 +239,76 @@ func FromSDKPrompt(p *mcp.Prompt, _ Bounds) (PromptSpec, error) {
 
 // FromSDKResource converts an SDK resource. A resource without a URI cannot be
 // read and is rejected.
-func FromSDKResource(r *mcp.Resource, _ Bounds) (ResourceSpec, error) {
+//
+// Bounds are applied the same way as FromSDKPrompt's: the URI is the address a
+// later read is issued to, so an over-long one is rejected rather than truncated
+// into a URI naming something else. Name and MIMEType are rejected on the same
+// grounds — both are matched against, not merely shown. Title and Description
+// are prose and truncate.
+func FromSDKResource(r *mcp.Resource, b Bounds) (ResourceSpec, error) {
 	if r == nil {
 		return ResourceSpec{}, fmt.Errorf("%w: resource", errNilInput)
 	}
 	if r.URI == "" {
 		return ResourceSpec{}, errors.New("protocol: resource has no URI")
 	}
+	if err := checkIdentifiers(b, "resource", identifier{"URI", r.URI}, identifier{"name", r.Name}, identifier{"MIME type", r.MIMEType}); err != nil {
+		return ResourceSpec{}, err
+	}
+	title, _ := limits.TruncateText(r.Title, b.MaxTextBytes)
+	description, _ := limits.TruncateText(r.Description, b.MaxTextBytes)
 	return ResourceSpec{
 		URI:         r.URI,
 		Name:        r.Name,
-		Title:       r.Title,
-		Description: r.Description,
+		Title:       title,
+		Description: description,
 		MIMEType:    r.MIMEType,
 	}, nil
 }
 
+// identifier is one addressable server-chosen string and the word for it in an
+// error.
+type identifier struct {
+	what  string
+	value string
+}
+
+// checkIdentifiers rejects any identifier over b.MaxTextBytes.
+//
+// It exists so the resource converters state the rule once. An identifier is
+// bounded by refusal, never truncation: see FromSDKPrompt for why.
+func checkIdentifiers(b Bounds, kind string, ids ...identifier) error {
+	for _, id := range ids {
+		if len(id.value) > b.MaxTextBytes {
+			return fmt.Errorf("protocol: %s %s is %d bytes, max %d", kind, id.what, len(id.value), b.MaxTextBytes)
+		}
+	}
+	return nil
+}
+
 // FromSDKResourceTemplate converts an SDK resource template. The URI template
 // is carried verbatim; expanding it safely is the caller's problem.
-func FromSDKResourceTemplate(rt *mcp.ResourceTemplate, _ Bounds) (ResourceTemplateSpec, error) {
+//
+// Bounded exactly as FromSDKResource is, and the template is an identifier for
+// the same reason a URI is — it is expanded into one.
+func FromSDKResourceTemplate(rt *mcp.ResourceTemplate, b Bounds) (ResourceTemplateSpec, error) {
 	if rt == nil {
 		return ResourceTemplateSpec{}, fmt.Errorf("%w: resource template", errNilInput)
 	}
 	if rt.URITemplate == "" {
 		return ResourceTemplateSpec{}, errors.New("protocol: resource template has no URI template")
 	}
+	if err := checkIdentifiers(b, "resource template",
+		identifier{"URI template", rt.URITemplate}, identifier{"name", rt.Name}, identifier{"MIME type", rt.MIMEType}); err != nil {
+		return ResourceTemplateSpec{}, err
+	}
+	title, _ := limits.TruncateText(rt.Title, b.MaxTextBytes)
+	description, _ := limits.TruncateText(rt.Description, b.MaxTextBytes)
 	return ResourceTemplateSpec{
 		URITemplate: rt.URITemplate,
 		Name:        rt.Name,
-		Title:       rt.Title,
-		Description: rt.Description,
+		Title:       title,
+		Description: description,
 		MIMEType:    rt.MIMEType,
 	}, nil
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -833,4 +834,84 @@ func TestFromSDKServerIdentityIsBounded(t *testing.T) {
 			t.Errorf("%s = %d bytes, want <= %d", f.name, len(f.value), max)
 		}
 	}
+}
+
+// TestPromptAndResourceMetadataIsBounded pins the Bounds these converters take.
+//
+// They accepted a Bounds and enforced nothing: a `_ Bounds` parameter that read
+// as protection and was not. Prompt and resource metadata is server-chosen and
+// retained in a catalog for the life of a connection, so it is bounded on the
+// same grounds as FromSDKServerIdentity's — with identifiers rejected rather
+// than truncated, because a truncated identifier is a different one.
+func TestPromptAndResourceMetadataIsBounded(t *testing.T) {
+	t.Parallel()
+	b := testBounds()
+	over := strings.Repeat("a", b.MaxTextBytes+1)
+
+	t.Run("prose truncates", func(t *testing.T) {
+		t.Parallel()
+		got, err := protocol.FromSDKPrompt(&mcp.Prompt{
+			Name: "p", Title: over, Description: over,
+			Arguments: []*mcp.PromptArgument{{Name: "a", Title: over, Description: over}},
+		}, b)
+		if err != nil {
+			t.Fatalf("FromSDKPrompt() error = %v", err)
+		}
+		for _, f := range []struct {
+			what string
+			val  string
+		}{
+			{"Title", got.Title}, {"Description", got.Description},
+			{"argument Title", got.Arguments[0].Title}, {"argument Description", got.Arguments[0].Description},
+		} {
+			if len(f.val) > b.MaxTextBytes {
+				t.Errorf("%s retained %d bytes, over the %d bound", f.what, len(f.val), b.MaxTextBytes)
+			}
+		}
+	})
+
+	t.Run("identifiers are rejected, never truncated", func(t *testing.T) {
+		t.Parallel()
+		if _, err := protocol.FromSDKPrompt(&mcp.Prompt{Name: over}, b); err == nil {
+			t.Error("FromSDKPrompt() accepted an over-long prompt name")
+		}
+		if _, err := protocol.FromSDKPrompt(&mcp.Prompt{
+			Name: "p", Arguments: []*mcp.PromptArgument{{Name: over}},
+		}, b); err == nil {
+			t.Error("FromSDKPrompt() accepted an over-long argument name")
+		}
+		if _, err := protocol.FromSDKResource(&mcp.Resource{URI: "file:///" + over}, b); err == nil {
+			t.Error("FromSDKResource() accepted an over-long URI")
+		}
+		if _, err := protocol.FromSDKResourceTemplate(&mcp.ResourceTemplate{URITemplate: "file:///" + over}, b); err == nil {
+			t.Error("FromSDKResourceTemplate() accepted an over-long URI template")
+		}
+	})
+
+	t.Run("the argument count is bounded", func(t *testing.T) {
+		t.Parallel()
+		args := make([]*mcp.PromptArgument, protocol.MaxPromptArgs+1)
+		for i := range args {
+			args[i] = &mcp.PromptArgument{Name: fmt.Sprintf("a%d", i)}
+		}
+		if _, err := protocol.FromSDKPrompt(&mcp.Prompt{Name: "p", Arguments: args}, b); err == nil {
+			t.Errorf("FromSDKPrompt() accepted %d arguments, over the %d bound", len(args), protocol.MaxPromptArgs)
+		}
+		// The boundary itself is still accepted.
+		if _, err := protocol.FromSDKPrompt(&mcp.Prompt{Name: "p", Arguments: args[:protocol.MaxPromptArgs]}, b); err != nil {
+			t.Errorf("FromSDKPrompt() refused exactly %d arguments: %v", protocol.MaxPromptArgs, err)
+		}
+	})
+
+	t.Run("resource prose truncates", func(t *testing.T) {
+		t.Parallel()
+		got, err := protocol.FromSDKResource(&mcp.Resource{URI: "file:///x", Title: over, Description: over}, b)
+		if err != nil {
+			t.Fatalf("FromSDKResource() error = %v", err)
+		}
+		if len(got.Title) > b.MaxTextBytes || len(got.Description) > b.MaxTextBytes {
+			t.Errorf("resource prose retained %d/%d bytes, over the %d bound",
+				len(got.Title), len(got.Description), b.MaxTextBytes)
+		}
+	})
 }
