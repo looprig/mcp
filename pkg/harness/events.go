@@ -55,17 +55,25 @@ const IntegrationSource = "mcp"
 // reconfiguration, and a server that elicits at that moment must still be
 // answerable.
 //
-// Both handlers are installed unconditionally. That is not the same as
-// advertising a capability: client.Handlers' contract is that installing a
-// handler the Definition did not ask for is legal and the handler is simply
-// never called, while asking for a capability with no handler is a configuration
-// error Connect rejects. So the binding's own Definition decides whether this
-// host offers elicitation; this method only makes sure that a binding which does
-// ask has somewhere to route.
+// The event and elicitation handlers are installed unconditionally. That is not
+// the same as advertising a capability: client.Handlers' contract is that
+// installing a handler the Definition did not ask for is legal and the handler is
+// simply never called, while asking for a capability with no handler is a
+// configuration error Connect rejects. So the binding's own Definition decides
+// whether this host offers elicitation; this method only makes sure that a
+// binding which does ask has somewhere to route.
+//
+// Sampling is conditional, and the asymmetry is Deps': Gates is a required
+// dependency, so an elicitor always has a host to ask, while Sampling is optional
+// and a nil one means the application supplied no policy. Passing that nil
+// through — rather than installing a sampler that could only ever refuse — is what
+// lets Connect's rule fire on a binding that requests the capability without one.
+// See Manager.samplingHandler.
 func (m *Manager) handlersFor(bs *bindingState) client.Handlers {
 	return client.Handlers{
 		Event:       func(ev client.Event) { m.onClientEvent(bs, ev) },
 		Elicitation: &elicitor{m: m, bs: bs},
+		Sampling:    m.samplingHandler(bs),
 	}
 }
 
@@ -79,6 +87,11 @@ func (m *Manager) handlersFor(bs *bindingState) client.Handlers {
 // binding's life arrives while the Manager still has no *client.Client for it.
 // Nothing here reads one.
 func (m *Manager) onClientEvent(bs *bindingState, ev client.Event) {
+	// Audited first, and separately: a sampling event is never a status — a
+	// server being told no about spending money says nothing about whether it is
+	// up — so it has its own sink rather than a branch in statusFor. See
+	// sampleAudit.
+	m.sampleAudit(bs, ev)
 	status, ok := m.statusFor(bs.binding.Name, ev)
 	if !ok {
 		return

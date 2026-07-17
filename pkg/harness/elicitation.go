@@ -239,20 +239,6 @@ func (e *elicitor) translate(req client.ElicitRequest) (*translation, error) {
 	}
 }
 
-// loopID is the Loop an elicitation is on behalf of.
-//
-// It is zero for a Session-scoped binding, and that is not a gap: a Session's
-// server is shared, and an elicitation it raises — during initialization, or
-// during a call from any of several Loops — belongs to the Session, not to
-// whichever Loop happened to be first. GateRequest.LoopID documents the zero as
-// exactly this case.
-func (e *elicitor) loopID() (id [16]byte) {
-	if e.bs.binding.Scope == ScopeLoop {
-		return e.bs.binding.Loop
-	}
-	return id
-}
-
 // elicitControls are the three answers a gate may come back with. They are the
 // gate.FormAction* values, and they are reused verbatim for an open-url gate:
 // the vocabulary is accept/decline/cancel on both sides of this file — MCP's
@@ -482,7 +468,7 @@ func (e *elicitor) translateForm(req client.ElicitRequest) (*translation, error)
 			// question no server is still listening for.
 			Restorable: false,
 			Binding:    e.bs.binding.Name,
-			LoopID:     e.loopID(),
+			LoopID:     e.bs.loopID(),
 		},
 	}, nil
 }
@@ -602,7 +588,7 @@ func (e *elicitor) translateURL(req client.ElicitRequest) (*translation, error) 
 			// one could only present an origin with no URL behind it.
 			Restorable: false,
 			Binding:    e.bs.binding.Name,
-			LoopID:     e.loopID(),
+			LoopID:     e.bs.loopID(),
 		},
 	}, nil
 }

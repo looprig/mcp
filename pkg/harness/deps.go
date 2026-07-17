@@ -31,6 +31,7 @@ package mcpharness
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -91,6 +92,137 @@ type GateResponse struct {
 // would strand a server request nobody can answer.
 type GateOpener interface {
 	OpenGate(ctx context.Context, req GateRequest) (GateResponse, error)
+}
+
+// SampleRole is who authored a sampling message. The zero value is not a role.
+type SampleRole uint8
+
+// The sampling message roles.
+const (
+	// SampleRoleUser marks a message the server attributes to the user.
+	SampleRoleUser SampleRole = iota + 1
+	// SampleRoleAssistant marks a message the server attributes to the model.
+	SampleRoleAssistant
+)
+
+// String returns a stable lowercase identifier, or "unknown".
+func (r SampleRole) String() string {
+	switch r {
+	case SampleRoleUser:
+		return "user"
+	case SampleRoleAssistant:
+		return "assistant"
+	default:
+		return "unknown"
+	}
+}
+
+// SampleMessage is one turn of a sampling conversation. Both fields are the
+// server's: it chose the text and it chose whom to attribute it to. Neither is
+// an instruction to the host.
+type SampleMessage struct {
+	// Role is who the server says authored this message. It is always a
+	// declared role.
+	Role SampleRole
+	// Text is the message body, bounded by the binding's Limits.
+	Text string
+}
+
+// SampleRequest is a server asking the host to spend model budget on its
+// behalf.
+//
+// Every field but Binding and LoopID is server-supplied and untrusted. The
+// server's own steering — its model preferences, its temperature, its request to
+// have the host harvest conversation context — is dropped by pkg/client before
+// this exists, so what arrives here is the request reduced to what a host can
+// safely act on: some text, and a ceiling.
+//
+// # Why this type has nowhere to put a reference
+//
+// Every field is a string, an int, or an array of bytes. That is the design's
+// "sampling never receives a Harness Session controller or unrestricted tool
+// registry", enforced structurally: a SamplingPolicy cannot be handed authority
+// through this type because there is no field shaped like authority, and a field
+// added later must argue with TestSamplingSeamCarriesNoAuthority, which sweeps
+// this struct by field KIND. pkg/client holds up the same end for its own
+// SampleRequest, and internal/protocol registers only the SDK's tool-free
+// handler — so a tool cannot enter from the server's side either.
+type SampleRequest struct {
+	// Binding names the server that asked. It is the whole of "which authority
+	// is this": a policy that trusts one server to spend and not another
+	// switches on this.
+	Binding string
+	// LoopID is the Loop the request is on behalf of, or zero for a
+	// Session-scoped binding.
+	//
+	// The zero is not a gap, for the reason GateRequest.LoopID gives: a
+	// Session's server is shared, and a sampling request it raises belongs to the
+	// Session rather than to whichever Loop happened to be calling. A policy that
+	// budgets per Loop must therefore treat the zero as "the Session's own
+	// budget" rather than as an unattributed request to be waved through.
+	LoopID uuid.UUID
+	// SystemPrompt is the system prompt the server asked for, bounded. It is a
+	// request, not a fact: a policy is free to replace or ignore it.
+	SystemPrompt string
+	// Messages is the conversation the server wants completed. Never empty:
+	// pkg/client refuses a sampling request with no messages before it reaches
+	// here.
+	Messages []SampleMessage
+	// MaxTokens is the completion budget, already capped against the binding's
+	// Limits.MaxSamplingTokens. A server may lower this ceiling and never raise
+	// it, so it is an upper bound the policy may spend within — not a number to
+	// honor.
+	MaxTokens int
+}
+
+// SampleResult is the completion the host's policy produced.
+type SampleResult struct {
+	// Model names the model the policy actually ran, which need not be one the
+	// server asked for. It is required: pkg/client refuses a result without one,
+	// because a completion nobody can attribute to a model is not auditable.
+	Model string
+	// Text is the completion.
+	Text string
+	// StopReason is why generation stopped.
+	StopReason string
+}
+
+// ErrSamplingDenied is how a SamplingPolicy refuses to spend. Return it, or
+// anything wrapping it, and the server is told the host declined; the request is
+// audited as denied rather than failed.
+//
+// The distinction is worth the sentinel. A denial is policy working — a host is
+// always entitled to decline to spend, and an operator reading a stream of them
+// is reading a budget being enforced. A failure is the host trying and breaking,
+// which is a defect. A policy that returned an ordinary error for both would make
+// its own budget enforcement indistinguishable from its own bugs.
+var ErrSamplingDenied = errors.New("mcp: the sampling policy declined")
+
+// SamplingPolicy services a server's request for an LLM completion, under the
+// application's policy and nobody else's.
+//
+// # What the adapter does and does not decide
+//
+// Server-requested sampling gives a server authority to initiate model work and
+// spend (design §Optional sampling). The application supplies model selection,
+// budget, permission, recursion, tool-use, and content policy; this adapter
+// invents none of it. It routes the request, attributes it to a binding and a
+// Loop, translates the answer, and audits both — and that is the whole of its
+// job. There is deliberately no default: a nil Deps.Sampling is not a permissive
+// policy or a restrictive one, it is no policy, and a binding that asked to
+// advertise the capability without one fails to start (see Deps.Sampling).
+//
+// Sample is called on the connection's goroutine while the server waits. It must
+// honor ctx, which already carries the binding's request timeout and dies with
+// the connection: a policy that ignored it would pin a dispatch goroutine and a
+// sampling slot on a completion nobody is waiting for any more.
+//
+// The caps that bound how MUCH a server may ask for — tokens, concurrency, chain
+// depth — are pkg/client's and are enforced before this is called, so a policy
+// never has to implement them to be safe. What a policy adds is whether this
+// spend is one the application wants to make at all.
+type SamplingPolicy interface {
+	Sample(ctx context.Context, req SampleRequest) (SampleResult, error)
 }
 
 // EventPublisher receives the adapter's protocol-neutral integration events.
@@ -171,6 +303,23 @@ const (
 	// field soliciting a credential, an unusable URL. The server is told
 	// "decline"; this says why, which the server is deliberately not told.
 	NoticeElicitationDeclined
+	// NoticeSamplingRequested reports that a server asked the host to spend
+	// model budget. It is raised when the request ARRIVES, not when it is
+	// admitted: a request the client's depth or concurrency cap refused is
+	// exactly the one an operator wants to see.
+	//
+	// It carries the request's shape — how many messages, what budget, what
+	// chain depth — and none of its content. See sampleAudit.
+	NoticeSamplingRequested
+	// NoticeSamplingResolved reports how a sampling request ended. Exactly one
+	// follows every NoticeSamplingRequested, including for the requests refused
+	// before any model ran.
+	NoticeSamplingResolved
+	// NoticeSamplingDenied reports WHY the host refused, which the server is
+	// deliberately not told — the same rule NoticeElicitationDeclined follows,
+	// for the same reason: a server that can enumerate a host's policy can
+	// search for a request that gets past it.
+	NoticeSamplingDenied
 )
 
 // String returns a stable lowercase identifier, or "unknown".
@@ -188,6 +337,12 @@ func (k NoticeKind) String() string {
 		return "event_rejected"
 	case NoticeElicitationDeclined:
 		return "elicitation_declined"
+	case NoticeSamplingRequested:
+		return "sampling_requested"
+	case NoticeSamplingResolved:
+		return "sampling_resolved"
+	case NoticeSamplingDenied:
+		return "sampling_denied"
 	default:
 		return "unknown"
 	}
@@ -265,6 +420,43 @@ type Deps struct {
 	// Events receives integration events. Required: a binding whose failures
 	// nobody can observe is one an operator cannot fix.
 	Events EventPublisher
+	// Sampling services servers' requests for LLM completions, under the
+	// application's own policy. Optional, and its absence is the default: this
+	// module never spends a host's model budget because it was composed, only
+	// because it was asked to.
+	//
+	// # Nil means the capability is not advertised, and that is not a downgrade
+	//
+	// A nil here yields a nil client.Handlers.Sampling for every binding (see
+	// Manager.samplingHandler). That is the whole of the fail-closed rule, and it
+	// is deliberately NOT a rule this file enforces a second time:
+	// client.Handlers.advertised already owns it, and owns it for elicitation and
+	// roots identically — a capability the Definition requests with no handler to
+	// serve it is a FailureInvalidConfig, never a silent downgrade. So a Binding
+	// whose Server.Capabilities.Sampling is true with no policy installed fails to
+	// connect, before its transport is ever dialed, with the same classified error
+	// an application would get from pkg/client directly. A required binding takes
+	// its owner's startup down with it; an optional one fails as a whole, serving
+	// nothing — never a binding that quietly comes up with its tools and without
+	// the capability it advertised.
+	//
+	// Re-deriving that check here would be a second opinion on a decision one
+	// package already makes: two places to keep in step, and the wrong one wins
+	// whenever they disagree.
+	//
+	// # Why this is not a field on Binding
+	//
+	// Sampling authority IS per-binding, and it already lands there: a binding
+	// advertises the capability only if its own Server.Capabilities.Sampling says
+	// so, and SampleRequest.Binding names the asker, so one policy decides per
+	// server. What a Binding must not hold is the policy VALUE. A Binding is
+	// immutable configuration that gets digested into the Session's configuration
+	// identity (see identity.go), and an interface has no stable encoding to
+	// digest — it would either be excluded, making the digest lie about what a
+	// binding may spend, or included, making a restore report drift because the
+	// host allocated a new policy. Deps is where host capabilities live, for
+	// exactly this reason: Gates is not a Binding field either.
+	Sampling SamplingPolicy
 	// ScopePolicy decides approval persistence breadth. Nil selects
 	// defaultScopes.
 	ScopePolicy ScopePolicy

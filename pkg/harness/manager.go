@@ -135,6 +135,24 @@ func (bs *bindingState) markRetiring() <-chan struct{} {
 	return bs.idle
 }
 
+// loopID is the Loop a server-initiated request on this binding is on behalf of.
+//
+// It is zero for a Session-scoped binding, and that is not a gap: a Session's
+// server is shared, and a request it raises — during initialization, or during a
+// call from any of several Loops — belongs to the Session, not to whichever Loop
+// happened to be first. GateRequest.LoopID and SampleRequest.LoopID both
+// document the zero as exactly this case.
+//
+// It reads bs.binding without the lock, as its callers do: a binding is immutable
+// while installed, and reconfiguration replaces the whole bindingState rather
+// than mutating this one.
+func (bs *bindingState) loopID() uuid.UUID {
+	if bs.binding.Scope == ScopeLoop {
+		return bs.binding.Loop
+	}
+	return uuid.UUID{}
+}
+
 func (bs *bindingState) client() *client.Client {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
