@@ -120,7 +120,7 @@ func Discover(ctx context.Context, l Lister, cfg Config) (*Generation, error) {
 		Instructions:    cfg.Handshake.Instructions,
 	}
 
-	var warnings []string
+	var warnings warningBudget
 
 	tools, w, err := fetchFamily(ctx, FamilyTools, caps.Tools, cfg.Limits.MaxPages, cfg.Limits.MaxTools,
 		func(ctx context.Context, cursor string) ([]protocol.ToolSpec, string, []string, error) {
@@ -130,7 +130,8 @@ func Discover(ctx context.Context, l Lister, cfg Config) (*Generation, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.Tools, warnings = tools, append(warnings, w...)
+	b.Tools = tools
+	warnings.merge(w)
 	b.Decisions = append(b.Decisions, decisionFor(FamilyTools, caps.Tools))
 
 	prompts, w, err := fetchFamily(ctx, FamilyPrompts, caps.Prompts, cfg.Limits.MaxPages, cfg.Limits.MaxPrompts,
@@ -141,7 +142,8 @@ func Discover(ctx context.Context, l Lister, cfg Config) (*Generation, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.Prompts, warnings = prompts, append(warnings, w...)
+	b.Prompts = prompts
+	warnings.merge(w)
 	b.Decisions = append(b.Decisions, decisionFor(FamilyPrompts, caps.Prompts))
 
 	resources, w, err := fetchFamily(ctx, FamilyResources, caps.Resources, cfg.Limits.MaxPages, cfg.Limits.MaxResources,
@@ -152,7 +154,8 @@ func Discover(ctx context.Context, l Lister, cfg Config) (*Generation, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.Resources, warnings = resources, append(warnings, w...)
+	b.Resources = resources
+	warnings.merge(w)
 	b.Decisions = append(b.Decisions, decisionFor(FamilyResources, caps.Resources))
 
 	// Templates are gated on the resources capability: MCP has no separate
@@ -165,10 +168,11 @@ func Discover(ctx context.Context, l Lister, cfg Config) (*Generation, error) {
 	if err != nil {
 		return nil, err
 	}
-	b.ResourceTemplates, warnings = templates, append(warnings, w...)
+	b.ResourceTemplates = templates
+	warnings.merge(w)
 	b.Decisions = append(b.Decisions, decisionFor(FamilyResourceTemplates, caps.Resources))
 
-	b.Warnings = warnings
+	b.Warnings, b.DroppedWarnings = warnings.kept, warnings.dropped
 	return b.Build()
 }
 
@@ -197,14 +201,14 @@ func fetchFamily[T any](
 	advertised bool,
 	maxPages, maxItems int,
 	fetch func(ctx context.Context, cursor string) (items []T, next string, warnings []string, err error),
-) ([]T, []string, error) {
+) ([]T, warningBudget, error) {
 	if !advertised {
-		return nil, nil, nil
+		return nil, warningBudget{}, nil
 	}
 
 	var (
 		items    []T
-		warnings []string
+		warnings warningBudget
 		cursor   string
 	)
 	// seen holds every cursor already requested, including the initial empty
@@ -219,24 +223,24 @@ func fetchFamily[T any](
 			// fetch it. A truncated catalog is not a safe catalog — the missing
 			// tools would look identical to tools the server removed — so this
 			// is an error rather than a warning.
-			return nil, nil, &limits.OverLimitError{What: WhatCatalogPages, Limit: maxPages}
+			return nil, warningBudget{}, &limits.OverLimitError{What: WhatCatalogPages, Limit: maxPages}
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, nil, fmt.Errorf("catalog: %s: %w", family, err)
+			return nil, warningBudget{}, fmt.Errorf("catalog: %s: %w", family, err)
 		}
 
 		got, next, w, err := fetch(ctx, cursor)
 		if err != nil {
-			return nil, nil, fmt.Errorf("catalog: %s: %w", family, err)
+			return nil, warningBudget{}, fmt.Errorf("catalog: %s: %w", family, err)
 		}
 
 		// Count before appending: a page that would take the total over the
 		// bound must not be retained even briefly.
 		if len(items)+len(got) > maxItems {
-			return nil, nil, &limits.OverLimitError{What: WhatCatalogItems, Limit: maxItems}
+			return nil, warningBudget{}, &limits.OverLimitError{What: WhatCatalogItems, Limit: maxItems}
 		}
 		items = append(items, got...)
-		warnings = appendBounded(warnings, w)
+		warnings.add(w...)
 
 		if next == "" {
 			return items, warnings, nil
@@ -244,7 +248,7 @@ func fetchFamily[T any](
 		if _, repeat := seen[next]; repeat {
 			// The cursor never reaches a name or a log; it is opaque server
 			// data with no diagnostic value and unbounded length.
-			return nil, nil, &DefectError{
+			return nil, warningBudget{}, &DefectError{
 				Family: family,
 				Reason: fmt.Sprintf("server returned a pagination cursor it already served (page %d): the catalog does not terminate", page),
 			}
@@ -252,17 +256,4 @@ func fetchFamily[T any](
 		seen[next] = struct{}{}
 		cursor = next
 	}
-}
-
-// appendBounded merges page warnings into a family's list, stopping at
-// MaxWarnings so that a server producing one warning per item cannot make
-// diagnostics unbounded.
-func appendBounded(dst, src []string) []string {
-	for _, s := range src {
-		if len(dst) >= MaxWarnings {
-			return dst
-		}
-		dst = append(dst, s)
-	}
-	return dst
 }

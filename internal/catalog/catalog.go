@@ -289,6 +289,11 @@ type Builder struct {
 
 	// Warnings records defects tolerated during discovery.
 	Warnings []string
+	// DroppedWarnings is how many warnings the caller raised but could not keep
+	// before Build was reached — discovery bounds each family as it fetches it.
+	// It is carried so that the summary Build writes counts every warning that
+	// was ever raised, not merely those that survived to here.
+	DroppedWarnings int
 	// Decisions records what discovery did about each family.
 	Decisions []Decision
 	// Tolerances is the compatibility policy Build applies. The zero value
@@ -299,8 +304,58 @@ type Builder struct {
 
 // MaxWarnings caps the warnings one generation retains, so that a server which
 // produces a tolerated defect per item cannot turn diagnostics into unbounded
-// memory. Warnings beyond the cap are dropped.
+// memory.
+//
+// The text of a warning past the cap is dropped; the fact of it is not. The
+// last slot is spent on a summary naming how many were raised in all, because a
+// cap that simply stopped appending would make a server with 64 tolerated
+// defects indistinguishable from one with 6400 — and a reader would take the 64
+// messages for the whole story. The cap bounds how much is said, never whether
+// it is said.
 const MaxWarnings = 64
+
+// warningBudget accumulates warnings under MaxWarnings while remembering how
+// many it could not keep.
+//
+// The count is why this is a type and not an append helper. Warning text is
+// server-influenced and must be bounded, but the number of warnings is one
+// integer, and it survives every layer that folds one budget into another — so
+// the total the summary reports is the true one and not merely what reached the
+// last layer.
+type warningBudget struct {
+	kept    []string
+	dropped int
+}
+
+// add keeps each message until the budget is full, then counts it instead. The
+// final slot is left free for the summary render writes there.
+func (b *warningBudget) add(msgs ...string) {
+	for _, m := range msgs {
+		if len(b.kept) >= MaxWarnings-1 {
+			b.dropped++
+			continue
+		}
+		b.kept = append(b.kept, m)
+	}
+}
+
+// merge folds another budget in: its messages compete for the remaining slots,
+// and whatever it had already dropped stays counted.
+func (b *warningBudget) merge(o warningBudget) {
+	b.add(o.kept...)
+	b.dropped += o.dropped
+}
+
+// render returns the bounded list, ending in a summary of what the cap hid
+// whenever it hid anything.
+func (b warningBudget) render() []string {
+	if b.dropped == 0 {
+		return slices.Clone(b.kept)
+	}
+	return append(slices.Clone(b.kept), fmt.Sprintf(
+		"%d further warning(s) were discarded without their text (%d raised in all, over this client's %d warning cap)",
+		b.dropped, len(b.kept)+b.dropped, MaxWarnings))
+}
 
 // Build validates the accumulated parts and returns the immutable Generation.
 //
@@ -329,10 +384,8 @@ func (b Builder) Build() (*Generation, error) {
 		decisions:       slices.Clone(b.Decisions),
 	}
 
-	g.warnings = slices.Clone(b.Warnings)
-	if len(g.warnings) > MaxWarnings {
-		g.warnings = g.warnings[:MaxWarnings]
-	}
+	warnings := warningBudget{dropped: b.DroppedWarnings}
+	warnings.add(b.Warnings...)
 
 	tools, applied, err := buildTools(b.Binding, b.Tools, b.Tolerances)
 	if err != nil {
@@ -344,8 +397,9 @@ func (b Builder) Build() (*Generation, error) {
 		// Every applied tolerance is reported in diagnostics as well as being
 		// enumerable: a warning is what an operator reads, and
 		// AppliedTolerances is what a program branches on.
-		g.warnings = appendBounded(g.warnings, []string{"compatibility: applied tolerance " + t.String()})
+		warnings.add("compatibility: applied tolerance " + t.String())
 	}
+	g.warnings = warnings.render()
 
 	if g.prompts, err = buildPrompts(b.Prompts); err != nil {
 		return nil, err
@@ -636,6 +690,10 @@ func (g *Generation) ResourceTemplates() []protocol.ResourceTemplateSpec {
 }
 
 // Warnings returns a copy of the defects tolerated during discovery.
+//
+// It holds at most MaxWarnings entries. When more were raised than that, the
+// last entry is a summary naming how many there were in all, so a list that
+// stops short is never mistaken for the whole story.
 func (g *Generation) Warnings() []string { return slices.Clone(g.warnings) }
 
 // AppliedTolerances returns a copy of the compatibility tolerances this

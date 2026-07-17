@@ -584,8 +584,21 @@ func TestDiscoverBoundsWarnings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Discover() error = %v", err)
 	}
-	if got := len(g.Warnings()); got > catalog.MaxWarnings {
-		t.Errorf("len(Warnings()) = %d, want at most %d", got, catalog.MaxWarnings)
+	got := g.Warnings()
+	if len(got) > catalog.MaxWarnings {
+		t.Errorf("len(Warnings()) = %d, want at most %d", len(got), catalog.MaxWarnings)
+	}
+
+	// The cap bounds the text, not the truth. A reader of a capped list must be
+	// able to tell that it is capped and by how much — otherwise 192 tolerated
+	// defects read as 64, and the difference between a slightly odd server and
+	// a wholly broken one disappears.
+	last := got[len(got)-1]
+	if !strings.Contains(last, fmt.Sprintf("%d raised in all", len(many))) {
+		t.Errorf("last warning = %q, want it to report all %d warnings raised", last, len(many))
+	}
+	if !strings.Contains(last, fmt.Sprintf("%d further", len(many)-(catalog.MaxWarnings-1))) {
+		t.Errorf("last warning = %q, want it to report the number discarded", last)
 	}
 }
 

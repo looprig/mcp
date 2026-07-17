@@ -204,6 +204,7 @@ func TestDigestIsSensitiveToEveryContentField(t *testing.T) {
 	excluded := map[string]string{
 		"Number":                   "an ordinal, not content",
 		"Warnings":                 "derived from content already covered",
+		"DroppedWarnings":          "a count of the diagnostics in Warnings, which is itself derived from content already covered",
 		"Decisions":                "derived from capabilities already covered",
 		"Tools.Warnings":           "derived: a tolerated defect is a function of what the server sent, and what survived it is already covered",
 		"Tolerances":               "host policy, not server truth: see TestDigestIgnoresNonContent",

@@ -3,6 +3,7 @@ package catalog_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -148,8 +149,27 @@ func TestBuildBoundedAtLimits(t *testing.T) {
 			many[i] = "w"
 		}
 		g := mustBuild(t, catalog.Builder{Binding: "b", Warnings: many})
-		if got := len(g.Warnings()); got != catalog.MaxWarnings {
-			t.Errorf("len(Warnings()) = %d, want %d", got, catalog.MaxWarnings)
+		got := g.Warnings()
+		if len(got) != catalog.MaxWarnings {
+			t.Errorf("len(Warnings()) = %d, want %d", len(got), catalog.MaxWarnings)
+		}
+		if last := got[len(got)-1]; !strings.Contains(last, fmt.Sprintf("%d raised in all", len(many))) {
+			t.Errorf("last warning = %q, want it to report all %d warnings raised", last, len(many))
+		}
+	})
+
+	t.Run("warnings dropped before Build are counted in the summary", func(t *testing.T) {
+		t.Parallel()
+		// Discovery bounds each family as it fetches, so by the time Build sees
+		// a list the list may already be short. The count it carries is what
+		// keeps the summary's total the true one rather than a per-layer one.
+		g := mustBuild(t, catalog.Builder{Binding: "b", Warnings: []string{"w"}, DroppedWarnings: 500})
+		got := g.Warnings()
+		if len(got) != 2 {
+			t.Fatalf("Warnings() = %v, want the warning plus a summary", got)
+		}
+		if last := got[1]; !strings.Contains(last, "501 raised in all") || !strings.Contains(last, "500 further") {
+			t.Errorf("summary = %q, want it to count the 500 dropped before Build", last)
 		}
 	})
 }
