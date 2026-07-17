@@ -310,11 +310,44 @@ func (p *OAuthProvider) setStatus(status Status) {
 	p.status = status
 }
 
+// foreignFailure is the Status text for an error this package did not author.
+//
+// It names no detail on purpose. A Status is published — it reaches logs, UIs
+// and telemetry — and the text of a foreign error is not this package's to
+// vouch for. The error itself is still returned to the caller, who owns it and
+// can render it wherever they judge safe; what is refused is republishing it.
+const foreignFailure = "the operation failed with an error this package did not author; see the returned error"
+
 // setFailure publishes a failure posture derived from err's class.
+//
+// Only an *Error's OWN rendering is ever published, and that is the whole point
+// of this function's shape.
+//
+// The obvious version — classify with ClassOf, then publish err.Error() — is
+// wrong twice, and both are the same mistake: taking a guarantee that holds for
+// SOME of err's possible values and stating it for all of them.
+//
+//  1. A caller's TokenStore is application code and may return any error at
+//     all. ClassOf's `ok` result is the admission: when it is false, err is
+//     foreign, and err.Error() is arbitrary text of unknown provenance — a
+//     store that puts a connection string or a key id in its message would land
+//     it in a published Status.
+//  2. Even when ClassOf succeeds, err.Error() is still not safe. ClassOf finds
+//     an *Error ANYWHERE in the chain, including wrapped inside a foreign
+//     error — and err.Error() renders the WHOLE chain, foreign text included.
+//     "ok" says an auth Error is in there, never that err is one.
+//
+// So the *Error is extracted and asked to render ITSELF (class, op, and its own
+// bounded, normalized, secret-free Msg — never its cause). An error with no
+// *Error in it publishes a constant. The status is derived from what this
+// package wrote, or from nothing.
 func (p *OAuthProvider) setFailure(err error) {
 	state := StateFailed
-	if class, ok := ClassOf(err); ok {
-		switch class {
+	message := foreignFailure
+
+	var e *Error
+	if errors.As(err, &e) {
+		switch e.Class {
 		case ClassDenied:
 			state = StateDenied
 		case ClassExpired:
@@ -324,11 +357,9 @@ func (p *OAuthProvider) setFailure(err error) {
 		case ClassInvalidConfig, ClassFailed:
 			state = StateFailed
 		}
+		message = e.Error()
 	}
-	// err.Error() is safe to publish: an auth Error renders only class, op and
-	// its own bounded Msg, never the wrapped cause. That guarantee is what
-	// makes this line legal, and it is tested (TestErrorDoesNotRenderWrappedSecret).
-	p.setStatus(NewStatus(state, time.Time{}, nil, err.Error()))
+	p.setStatus(NewStatus(state, time.Time{}, nil, message))
 }
 
 // Headers implements HeaderProvider, returning the bearer Authorization header

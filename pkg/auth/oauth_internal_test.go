@@ -10,6 +10,7 @@ package auth
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"math"
 	"net/http"
@@ -961,5 +962,65 @@ func TestDefaultHTTPClientRefusesADowngradingRedirect(t *testing.T) {
 	if err == nil {
 		_ = resp.Body.Close()
 		t.Fatal("Do() followed a redirect to a non-loopback http URL; want it refused")
+	}
+}
+
+// TestSetFailurePublishesOnlyThisPackagesText pins Status.Failure's contract
+// against the input the old code never considered: an error this package did
+// not author.
+//
+// Status.Failure is documented "bounded, normalized, secret-free". That was
+// established for an *Error and asserted for every error — but a TokenStore is
+// supplied by the APPLICATION and may return anything, and the old code called
+// err.Error() on it unconditionally. The wrapping case is the sharper one:
+// ClassOf reports ok for an auth Error nested inside a foreign error, while
+// err.Error() renders the foreign text along with it.
+func TestSetFailurePublishesOnlyThisPackagesText(t *testing.T) {
+	t.Parallel()
+	const secret = "postgres://user:HUNTER2@db.internal/tokens"
+
+	tests := []struct {
+		name      string
+		err       error
+		wantState State
+		// wantText, when set, must be the published Failure exactly.
+		wantText string
+	}{
+		{
+			name:      "a foreign error from a caller's TokenStore",
+			err:       errors.New("store unavailable: " + secret),
+			wantState: StateFailed,
+			wantText:  foreignFailure,
+		},
+		{
+			name:      "a foreign error WRAPPING an auth Error",
+			err:       fmt.Errorf("store unavailable: %s: %w", secret, NewError(ClassDenied, "load", "denied", nil)),
+			wantState: StateDenied, // classification still works...
+			wantText:  "auth: load: denied: denied",
+		},
+		{
+			name:      "this package's own error is published in full",
+			err:       NewError(ClassExpired, "refresh", "the token has lapsed", errors.New(secret)),
+			wantState: StateExpired,
+			wantText:  "auth: refresh: expired: the token has lapsed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			p := &OAuthProvider{}
+			p.setFailure(tt.err)
+			got := p.Status()
+			if got.State != tt.wantState {
+				t.Errorf("State = %v, want %v", got.State, tt.wantState)
+			}
+			if got.Failure != tt.wantText {
+				t.Errorf("Failure = %q, want %q", got.Failure, tt.wantText)
+			}
+			if strings.Contains(got.Failure, "HUNTER2") {
+				t.Errorf("Failure republished a secret from an error this package did not author: %q", got.Failure)
+			}
+		})
 	}
 }
