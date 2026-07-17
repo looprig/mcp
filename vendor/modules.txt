@@ -138,6 +138,17 @@ github.com/gorilla/websocket
 # github.com/invopop/jsonschema v0.14.0
 ## explicit; go 1.24
 github.com/invopop/jsonschema
+# github.com/looprig/core v0.2.0 => ../core
+## explicit; go 1.25.0
+github.com/looprig/core/content
+github.com/looprig/core/uuid
+# github.com/looprig/harness v0.0.0 => ../harness
+## explicit; go 1.26.4
+github.com/looprig/harness/pkg/identity
+github.com/looprig/harness/pkg/security
+github.com/looprig/harness/pkg/tool
+# github.com/looprig/inference v0.3.0 => ../inference
+## explicit; go 1.26.4
 # github.com/modelcontextprotocol/go-sdk v1.6.1
 ## explicit; go 1.25.0
 github.com/modelcontextprotocol/go-sdk/auth
@@ -708,3 +719,7 @@ honnef.co/go/tools/stylecheck/st1021
 honnef.co/go/tools/stylecheck/st1022
 honnef.co/go/tools/stylecheck/st1023
 honnef.co/go/tools/unused
+# github.com/looprig/harness => ../harness
+# github.com/looprig/core => ../core
+# github.com/looprig/inference => ../inference
+# github.com/looprig/storage => ../storage
