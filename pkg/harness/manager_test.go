@@ -66,14 +66,15 @@ func TestNewManagerValidates(t *testing.T) {
 			deps:     Deps{SessionID: sessionID, Gates: stubGates{}},
 			wantErr:  "Deps.Events is nil",
 		},
-		// An event stamped with the zero Session is one the hub delivers to the
-		// wrong subscribers, or ValidateEvent refuses outright. The Manager
-		// cannot derive it, so it must be given it.
+		// A zero Session is ACCEPTED: it is how an application that fingerprints
+		// its MCP configuration builds a Manager it must start before its Session
+		// exists (attach.go). BindSession supplies the ID, and StartAdoption is
+		// what refuses a Manager that never got one.
 		{
-			name:     "zero session id",
+			name:     "zero session id is accepted for the discover-then-create flow",
 			bindings: nil,
 			deps:     Deps{Gates: stubGates{}, Events: recordingEvents{}},
-			wantErr:  "Deps.SessionID is zero",
+			wantErr:  "",
 		},
 		{
 			name:     "invalid binding",

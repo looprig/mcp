@@ -36,7 +36,6 @@ import (
 
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
-	"github.com/looprig/harness/pkg/identity"
 	"github.com/looprig/mcp/pkg/client"
 )
 
@@ -87,7 +86,16 @@ func (m *Manager) onClientEvent(bs *bindingState, ev client.Event) {
 	m.publish(status)
 }
 
-// publish validates a status and sends it to the host.
+// publish addresses a status to the Manager's Session, validates it, and sends it
+// to the host.
+//
+// Addressing happens here rather than in status because it is the part that can
+// fail: a Manager that has not been bound to a Session yet has no coordinate to
+// stamp, and a session-scoped event without one is refused by ValidateEvent and
+// could only misroute if it were not. Such a status is dropped, and the drop is
+// bounded and repaired rather than silent — BindSession republishes every
+// binding's current status the moment there is a Session to publish to. See
+// attach.go, which owns that window and explains why nothing durable is in it.
 //
 // The validation is not ceremony. hub.PublishEvent does NOT validate a public
 // event's body — it checks nil, visibility, and type, then (for an Ephemeral
@@ -102,6 +110,11 @@ func (m *Manager) onClientEvent(bs *bindingState, ev client.Event) {
 // client's event goroutine. It goes to the Reporter, which is exactly the sink
 // for "something MCP knows that Harness cannot say".
 func (m *Manager) publish(status event.IntegrationStatus) {
+	sessionID, bound := m.boundSession()
+	if !bound {
+		return
+	}
+	status.Coordinates.SessionID = sessionID
 	if err := event.ValidateEvent(status); err != nil {
 		m.report(Notice{
 			Kind:    NoticeEventRejected,
@@ -176,7 +189,9 @@ func (m *Manager) statusFor(binding string, ev client.Event) (event.IntegrationS
 	}
 }
 
-// status builds one status for this Manager's Session.
+// status builds one status's body. It is deliberately not addressed to a Session:
+// publish does that, because the Session is the one part of a status that a
+// Manager may not know yet (see attach.go).
 //
 // The EventID is minted here because the hub does not mint one for a public
 // event — it stamps only the session events it derives itself — and
@@ -192,7 +207,6 @@ func (m *Manager) status(binding string, state event.IntegrationState, detail st
 		Header: event.Header{
 			EventID:         id,
 			EventVisibility: event.Public,
-			Coordinates:     identity.Coordinates{SessionID: m.deps.SessionID},
 		},
 		Source: IntegrationSource,
 		Name:   binding,

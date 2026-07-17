@@ -117,12 +117,23 @@ type Adopter struct {
 // Close stops it. The Manager's own Close does not: an Adopter is an optional
 // capability layered over a Manager, and a Manager that closed its host's
 // subscription would be reaching outside what it was given.
+//
+// It refuses a Manager that is not bound to a Session (ErrNotBound). That is
+// where the check for a forgotten BindSession belongs: adoption is the point at
+// which a Manager stops being a set of connections and starts serving a Session's
+// Loops, so an unbound Manager here is one whose every integration status would be
+// dropped for the life of that Session — see attach.go. Deps.SessionID cannot
+// fail closed at construction instead, because "not yet" is a legitimate answer
+// there and is the whole reason this seam exists.
 func (m *Manager) StartAdoption(source EventSource, loops LoopControllers) (*Adopter, error) {
 	if source == nil {
 		return nil, fmt.Errorf("mcp: StartAdoption: source is nil; supply an EventSource")
 	}
 	if loops == nil {
 		return nil, fmt.Errorf("mcp: StartAdoption: loops is nil; supply a LoopControllers")
+	}
+	if _, bound := m.boundSession(); !bound {
+		return nil, fmt.Errorf("mcp: StartAdoption: %w", ErrNotBound)
 	}
 	// Enduring, every Loop: LoopIdle is an enduring loop-scoped event, and the
 	// set of Loops is not known in advance — a delegate spawned in an hour must

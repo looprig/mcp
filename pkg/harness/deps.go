@@ -236,15 +236,27 @@ func (m *Manager) report(n Notice) {
 	m.deps.Reporter.Report(n)
 }
 
-// Deps are the host capabilities the Manager needs. SessionID, Gates and Events
-// are required; the rest select documented defaults when nil.
+// Deps are the host capabilities the Manager needs. Gates and Events are
+// required; the rest select documented defaults when nil.
 type Deps struct {
-	// SessionID identifies the Session these bindings belong to. Required: it is
-	// the coordinate every event.IntegrationStatus is stamped with, and an event
+	// SessionID identifies the Session these bindings belong to. It is the
+	// coordinate every event.IntegrationStatus is stamped with, and an event
 	// carrying the wrong Session's ID — or none — is one that either reaches the
 	// wrong subscribers or is refused as invalid. The Manager cannot derive it:
 	// it is deliberately given a GateOpener and an EventPublisher rather than a
 	// Session (see this file's header), so nothing it holds knows the answer.
+	//
+	// It is OPTIONAL, and the zero value is a supported way to build a Manager
+	// rather than a mistake: an application that contributes its MCP identity to
+	// the Session's config fingerprint must discover its servers BEFORE the
+	// Session exists, so there is no ID to give yet. Such an application leaves
+	// this zero and calls BindSession once rig.NewSession has minted one. See
+	// attach.go, which owns that ordering and is the only reason this field is
+	// optional.
+	//
+	// Supplying it here is still the right thing for an application that does not
+	// contribute a fingerprint: the Manager is attached from birth and never has
+	// a window in which a status has nowhere to go.
 	SessionID uuid.UUID
 	// Gates routes elicitation to a human. Required: a binding that advertises
 	// the elicitation capability with nowhere to ask would be a lie told to a
@@ -279,10 +291,13 @@ func (d Deps) normalized() Deps {
 // construction: a nil Gates discovered at the moment a server asks for input is
 // a server request that hangs, and a nil Events discovered during a failure is a
 // failure nobody sees.
+//
+// SessionID is deliberately not checked. It is optional (see the field), and the
+// thing that keeps a Manager from running unattached by accident is
+// StartAdoption, which refuses one — a check at the moment the omission would
+// start costing an operator events, rather than one at a moment an application
+// may honestly not have the answer.
 func (d Deps) validate() error {
-	if d.SessionID.IsZero() {
-		return fmt.Errorf("Deps.SessionID is zero; supply the Session's ID")
-	}
 	if d.Gates == nil {
 		return fmt.Errorf("Deps.Gates is nil; supply a GateOpener")
 	}

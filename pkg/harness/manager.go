@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/looprig/core/uuid"
@@ -150,6 +151,13 @@ type Manager struct {
 	deps  Deps
 	clock Clock
 
+	// sessionID is the Session these bindings serve, or nil while the Manager is
+	// unbound. It is late-bound and atomic because of the ordering attach.go
+	// exists for: an application that fingerprints its MCP configuration starts
+	// this Manager before its Session exists, so a status published on a client's
+	// event goroutine may race the BindSession that gives it somewhere to go.
+	sessionID atomic.Pointer[uuid.UUID]
+
 	// ctx is the Manager's lifetime context: Close cancels it, which cancels
 	// startup, in-flight requests, background readers, and reconnect work
 	// (design §Shutdown). It is deliberately NOT derived from Start's ctx —
@@ -195,7 +203,7 @@ func NewManager(bindings []Binding, deps Deps) (*Manager, error) {
 	}
 	deps = deps.normalized()
 	ctx, cancel := context.WithCancel(context.Background())
-	return &Manager{
+	m := &Manager{
 		deps:     deps,
 		clock:    deps.Clock,
 		ctx:      ctx,
@@ -203,7 +211,15 @@ func NewManager(bindings []Binding, deps Deps) (*Manager, error) {
 		states:   states,
 		retireIn: DefaultRetirementTimeout,
 		elicitIn: DefaultElicitationTimeout,
-	}, nil
+	}
+	// A Deps that named a Session binds the Manager at birth, so the one-phase
+	// composition is attached before anything can publish. A Deps that did not is
+	// the discover-then-create flow, and BindSession closes it (see attach.go).
+	if !deps.SessionID.IsZero() {
+		id := deps.SessionID
+		m.sessionID.Store(&id)
+	}
+	return m, nil
 }
 
 // BindingFailure is one binding's classified startup failure.
