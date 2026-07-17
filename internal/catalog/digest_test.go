@@ -400,3 +400,266 @@ func TestDigestString(t *testing.T) {
 		t.Error("a real digest reports IsZero")
 	}
 }
+
+// TestDigestHasNoCollisions is the unambiguity half of the digest's contract:
+// no two *different* catalogs may encode to the same bytes.
+//
+// It is a table of PAIRS because that property cannot be tested one field at a
+// time. TestDigestIsSensitiveToEveryContentField mutates a single field and
+// demands the digest move, which it does under any framing at all — change a
+// byte and some byte changes. The bug class this test exists for is the
+// opposite shape: the framing itself. Drop the length prefix from str and
+// {Title:"ab", Description:""} and {Title:"a", Description:"b"} become the same
+// bytes; collapse a presence flag and "the server said nothing" becomes "the
+// server said no". Every pair below is content two catalogs genuinely differ
+// on, chosen so that the *only* thing keeping their encodings apart is a
+// delimiter or a presence marker.
+//
+// The pairs are deliberately adjacent-field slides. A slide across a fixed-width
+// field (a bool, a count) cannot collide however the strings are framed, so
+// those are not the interesting cases and are not here.
+func TestDigestHasNoCollisions(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// why records the framing property the pair pins, so a failure says
+		// which guarantee was dropped rather than only that two digests met.
+		why  string
+		a, b func(*catalog.Builder)
+	}{
+		{
+			name: "tool title and description slide",
+			why:  "str is length-delimited, so a tool's title cannot borrow its description's first byte",
+			a:    func(b *catalog.Builder) { b.Tools[0].Title, b.Tools[0].Description = "ab", "c" },
+			b:    func(b *catalog.Builder) { b.Tools[0].Title, b.Tools[0].Description = "a", "bc" },
+		},
+		{
+			name: "tool title empty versus description empty",
+			why:  "an empty string is a distinct encoding, not an absence that lets the next field slide up",
+			a:    func(b *catalog.Builder) { b.Tools[0].Title, b.Tools[0].Description = "", "x" },
+			b:    func(b *catalog.Builder) { b.Tools[0].Title, b.Tools[0].Description = "x", "" },
+		},
+		{
+			name: "server name and version slide",
+			why:  "the server identity's three fields are separately delimited",
+			a: func(b *catalog.Builder) {
+				b.Server = protocol.ServerIdentity{Name: "srv", Version: "1.2.3", Title: "T"}
+			},
+			b: func(b *catalog.Builder) {
+				b.Server = protocol.ServerIdentity{Name: "srv1", Version: ".2.3", Title: "T"}
+			},
+		},
+		{
+			name: "server version and title slide",
+			why:  "the version/title boundary is a delimiter, not a convention",
+			a: func(b *catalog.Builder) {
+				b.Server = protocol.ServerIdentity{Name: "srv", Version: "1.0", Title: "X"}
+			},
+			b: func(b *catalog.Builder) {
+				b.Server = protocol.ServerIdentity{Name: "srv", Version: "1.0X", Title: ""}
+			},
+		},
+		{
+			name: "prompt name and title slide",
+			why:  "a prompt's raw name cannot be extended into its title",
+			a:    func(b *catalog.Builder) { b.Prompts[0].RawName, b.Prompts[0].Title = "ab", "c" },
+			b:    func(b *catalog.Builder) { b.Prompts[0].RawName, b.Prompts[0].Title = "a", "bc" },
+		},
+		{
+			name: "prompt title and description slide",
+			why:  "the prompt title/description boundary is a delimiter",
+			a:    func(b *catalog.Builder) { b.Prompts[0].Title, b.Prompts[0].Description = "ab", "c" },
+			b:    func(b *catalog.Builder) { b.Prompts[0].Title, b.Prompts[0].Description = "a", "bc" },
+		},
+		{
+			name: "prompt argument name and title slide",
+			why:  "an argument's name cannot borrow bytes from its title",
+			a:    func(b *catalog.Builder) { b.Prompts[0].Arguments[0].Name, b.Prompts[0].Arguments[0].Title = "ab", "c" },
+			b:    func(b *catalog.Builder) { b.Prompts[0].Arguments[0].Name, b.Prompts[0].Arguments[0].Title = "a", "bc" },
+		},
+		{
+			name: "prompt argument title and description slide",
+			why:  "the argument list's strings are delimited within each argument",
+			a: func(b *catalog.Builder) {
+				b.Prompts[0].Arguments[1].Title, b.Prompts[0].Arguments[1].Description = "ab", "c"
+			},
+			b: func(b *catalog.Builder) {
+				b.Prompts[0].Arguments[1].Title, b.Prompts[0].Arguments[1].Description = "a", "bc"
+			},
+		},
+		{
+			name: "resource uri and name slide",
+			why:  "a resource's URI cannot run into its name",
+			a:    func(b *catalog.Builder) { b.Resources[0].URI, b.Resources[0].Name = "fixture://ab", "c" },
+			b:    func(b *catalog.Builder) { b.Resources[0].URI, b.Resources[0].Name = "fixture://a", "bc" },
+		},
+		{
+			name: "resource description and mime type slide",
+			why:  "the last two strings of a resource are separately delimited",
+			a:    func(b *catalog.Builder) { b.Resources[0].Description, b.Resources[0].MIMEType = "ab", "c" },
+			b:    func(b *catalog.Builder) { b.Resources[0].Description, b.Resources[0].MIMEType = "a", "bc" },
+		},
+		{
+			name: "resource template uri template and name slide",
+			why:  "a template's URI template cannot run into its name",
+			a: func(b *catalog.Builder) {
+				b.ResourceTemplates[0].URITemplate, b.ResourceTemplates[0].Name = "fixture://ab/{x}", "c"
+			},
+			b: func(b *catalog.Builder) {
+				b.ResourceTemplates[0].URITemplate, b.ResourceTemplates[0].Name = "fixture://a", "b/{x}c"
+			},
+		},
+		{
+			name: "annotations absent versus all false",
+			why:  "the presence flag keeps \"the server said nothing\" apart from \"the server said no to everything\"",
+			a:    func(b *catalog.Builder) { b.Tools[0].Annotations = nil },
+			b:    func(b *catalog.Builder) { b.Tools[0].Annotations = &protocol.ToolAnnotations{} },
+		},
+		{
+			name: "annotation title and tool description slide",
+			why:  "an annotation's title is delimited like any other string",
+			a: func(b *catalog.Builder) {
+				b.Tools[0].Annotations = &protocol.ToolAnnotations{Title: "ab"}
+			},
+			b: func(b *catalog.Builder) {
+				b.Tools[0].Annotations = &protocol.ToolAnnotations{Title: "a"}
+			},
+		},
+		{
+			name: "destructive hint absent versus false",
+			why:  "a tri-state hint is three values, not two: nil is why the SDK models it as a pointer",
+			a:    func(b *catalog.Builder) { b.Tools[0].Annotations.DestructiveHint = nil },
+			b:    func(b *catalog.Builder) { b.Tools[0].Annotations.DestructiveHint = ptr(false) },
+		},
+		{
+			name: "destructive hint false versus true",
+			why:  "the other two thirds of the tri-state stay apart",
+			a:    func(b *catalog.Builder) { b.Tools[0].Annotations.DestructiveHint = ptr(false) },
+			b:    func(b *catalog.Builder) { b.Tools[0].Annotations.DestructiveHint = ptr(true) },
+		},
+		{
+			name: "open world hint absent versus false",
+			why:  "every tri-state is encoded tri-state, not just the first one",
+			a:    func(b *catalog.Builder) { b.Tools[0].Annotations.OpenWorldHint = nil },
+			b:    func(b *catalog.Builder) { b.Tools[0].Annotations.OpenWorldHint = ptr(false) },
+		},
+		{
+			name: "output schema absent versus present",
+			why:  "presence is encoded explicitly, so \"no output schema\" is not any digest's encoding",
+			a:    func(b *catalog.Builder) { b.Tools[0].OutputSchema = nil },
+			b:    func(b *catalog.Builder) { b.Tools[0].OutputSchema = json.RawMessage(`{"type":"object"}`) },
+		},
+		{
+			name: "capabilities absent versus one flag set",
+			why:  "capability flags are fixed-width and positional; a server that advertises nothing is not one that advertises tools. A nil ServerCapabilities is not representable here — protocol reduces nil to the zero value on the way in — so all-false IS absent, and it must stay apart from every advertised flag",
+			a:    func(b *catalog.Builder) { b.Capabilities = protocol.ServerCapabilities{} },
+			b:    func(b *catalog.Builder) { b.Capabilities = protocol.ServerCapabilities{Tools: true} },
+		},
+		{
+			name: "value equal to a field tag",
+			why:  "a field tag is a length-delimited string like any other, so a value that spells one cannot impersonate it",
+			a:    func(b *catalog.Builder) { b.Instructions = "tools" },
+			b:    func(b *catalog.Builder) { b.Instructions = "" },
+		},
+		{
+			name: "collection shrinks versus a member changing",
+			why:  "the count is encoded, so dropping the last prompt is not the same catalog as blanking it",
+			a:    func(b *catalog.Builder) { b.Prompts = nil },
+			b:    func(b *catalog.Builder) { b.Prompts[0].Arguments = nil },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			ba := richBuilder()
+			tt.a(&ba)
+			bb := richBuilder()
+			tt.b(&bb)
+
+			da := mustBuild(t, ba).Digest()
+			db := mustBuild(t, bb).Digest()
+			if da == db {
+				t.Errorf("two different catalogs share digest %s: %s", da, tt.why)
+			}
+		})
+	}
+}
+
+// goldenBuilder is a frozen catalog: the input half of the known-answer test
+// below. It is deliberately separate from richBuilder, which the sweeps are
+// free to grow — this one must never change, because changing it changes the
+// answer and the whole point is that the answer cannot change by accident.
+//
+// It exercises every branch of the encoder: a tag, a string, an empty string, a
+// count, an empty collection, a bool, a schema digest present and absent,
+// annotations present and absent, and all three states of a tri-state.
+func goldenBuilder() catalog.Builder {
+	return catalog.Builder{
+		Binding:         "golden",
+		Number:          1,
+		ProtocolVersion: "2025-06-18",
+		Capabilities: protocol.ServerCapabilities{
+			Tools: true, Prompts: true, Resources: true, Logging: true,
+		},
+		Server:       protocol.ServerIdentity{Name: "gold", Version: "0.1.0", Title: ""},
+		Instructions: "hold still",
+		Tools: []protocol.ToolSpec{
+			{
+				RawName:      "with_everything",
+				Title:        "With everything",
+				Description:  "has an output schema and annotations",
+				InputSchema:  json.RawMessage(`{"type":"object"}`),
+				OutputSchema: json.RawMessage(`{"type":"object"}`),
+				Annotations: &protocol.ToolAnnotations{
+					Title:           "Everything",
+					ReadOnlyHint:    true,
+					IdempotentHint:  false,
+					DestructiveHint: ptr(false),
+					OpenWorldHint:   ptr(true),
+				},
+			},
+			{
+				RawName:     "with_nothing",
+				InputSchema: json.RawMessage(`{"type":"object"}`),
+			},
+		},
+		Prompts: []protocol.PromptSpec{{
+			RawName: "p",
+			Arguments: []protocol.PromptArgSpec{
+				{Name: "a", Title: "A", Description: "first", Required: true},
+			},
+		}},
+		Resources:         []protocol.ResourceSpec{{URI: "golden://r", Name: "r"}},
+		ResourceTemplates: nil,
+	}
+}
+
+// TestDigestIsGolden pins the canonical encoding to a known answer.
+//
+// This is the guard the pairwise test structurally cannot be: with every value
+// length-delimited, the encoding is already unambiguous, so dropping the field
+// tags — or reordering fields, or changing a domain string — makes no two
+// catalogs collide and no sensitivity or collision test can see it. What it
+// does do is silently give existing content a new digest, or worse, let two
+// builds disagree about the same content while digestSchemaVersion says they
+// agree.
+//
+// So this test enforces the contract digestSchemaVersion states: if this fails,
+// the encoding changed. That is allowed — but it costs a version bump and this
+// constant, together, deliberately. It is not a test to "just update".
+func TestDigestIsGolden(t *testing.T) {
+	t.Parallel()
+
+	const want = "28a3791f06547176ac6d39a18628782043c3061a2e6c55c15dc21736cd6a763f"
+	got := mustBuild(t, goldenBuilder()).Digest().String()
+	if got != want {
+		t.Errorf("catalog digest = %s, want %s\n"+
+			"The canonical encoding changed. If that was deliberate, bump "+
+			"digestSchemaVersion and update this constant in the same change; "+
+			"if it was not, the encoding has drifted and every digest an older "+
+			"build computed is now wrong.", got, want)
+	}
+}

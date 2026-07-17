@@ -156,7 +156,12 @@ func (c *Client) CallTool(ctx context.Context, rawName string, args json.RawMess
 	if err != nil {
 		return ToolResult{}, err
 	}
-	if caps, ok := c.serverCapabilities(); !ok || !caps.Tools {
+	// One read of the adopted generation, and every question below is asked of
+	// that one. Reading it twice would let a refresh adopt a new generation in
+	// between and admit a call on evidence that never coexisted: capabilities
+	// from the generation before the refresh, a tool from the one after.
+	gen := c.adopted()
+	if caps, ok := capabilitiesOf(gen); !ok || !caps.Tools {
 		return ToolResult{}, c.unsupported(opCallTool, "tools")
 	}
 	// Policy before lookup: a denied tool is refused whether or not it exists,
@@ -164,11 +169,6 @@ func (c *Client) CallTool(ctx context.Context, rawName string, args json.RawMess
 	if !c.def.ToolFilter.Permits(rawName) {
 		return ToolResult{}, NewError(FailureToolUnavailable, c.def.Name, opCallTool,
 			fmt.Sprintf("tool %q is not permitted by this binding's ToolFilter", rawName), nil)
-	}
-	gen := c.adopted()
-	if gen == nil {
-		return ToolResult{}, NewError(FailureCatalogStale, c.def.Name, opCallTool,
-			"the binding has no adopted catalog", nil)
 	}
 	if _, ok := gen.ToolByRawName(rawName); !ok {
 		return ToolResult{}, NewError(FailureToolUnavailable, c.def.Name, opCallTool,
@@ -369,9 +369,21 @@ func (c *Client) unsupported(op, what string) *Error {
 }
 
 // serverCapabilities returns what the adopted generation recorded the server
-// advertising, and whether there is an adopted generation at all.
+// advertising, and whether there is an adopted generation at all. It is for the
+// callers whose only question is the capability; one that also consults the
+// catalog reads the generation itself and asks capabilitiesOf, so that both
+// answers come from the same generation.
 func (c *Client) serverCapabilities() (ServerCapabilities, bool) {
-	gen := c.adopted()
+	return capabilitiesOf(c.adopted())
+}
+
+// capabilitiesOf returns what gen recorded the server advertising, and whether
+// there is a generation at all. A nil generation reports no capabilities rather
+// than an error of its own: "no adopted catalog" and "the server never
+// advertised this" are the same refusal to the caller — the method is not
+// available on this binding — and the caller has nothing different to do about
+// either.
+func capabilitiesOf(gen *catalog.Generation) (ServerCapabilities, bool) {
 	if gen == nil {
 		return ServerCapabilities{}, false
 	}

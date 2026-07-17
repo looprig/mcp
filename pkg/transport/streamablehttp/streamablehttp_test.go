@@ -1162,3 +1162,54 @@ func (f providerFunc) Headers(ctx context.Context) ([]auth.Header, error) { retu
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestDeadlineClass pins the op-aware classification of a blown deadline.
+//
+// It is a direct unit test because deadlineClass is a pure function of the op
+// and because the paths that reach it cannot cover the op set cheaply: the
+// classification a caller acts on is decided here, so this is where every op is
+// stated. The regression it exists to catch is the one this code started with —
+// reporting every deadline as a startup timeout, which tells a caller that its
+// healthy binding failed to start — and that mistake is invisible to a test
+// that only ever blows one deadline.
+func TestDeadlineClass(t *testing.T) {
+	t.Parallel()
+
+	// Every op this package defines, so that a new op has to be classified here
+	// rather than defaulting in silence.
+	tests := []struct {
+		name string
+		op   string
+		want client.FailureClass
+	}{
+		// Startup: the binding never came up, and the caller may retry or drop it.
+		{name: "connect", op: opConnect, want: client.FailureStartupTimeout},
+		{name: "initialize", op: opInitialize, want: client.FailureStartupTimeout},
+
+		// Everything else: the binding is fine and this operation ran out of time.
+		{name: "new", op: opNew, want: client.FailureDeadline},
+		{name: "close", op: opClose, want: client.FailureDeadline},
+		{name: "list tools", op: opListTools, want: client.FailureDeadline},
+		{name: "list prompts", op: opListPrompts, want: client.FailureDeadline},
+		{name: "list resources", op: opListResources, want: client.FailureDeadline},
+		{name: "list resource templates", op: opListResourceTemplates, want: client.FailureDeadline},
+		{name: "call tool", op: opCallTool, want: client.FailureDeadline},
+		{name: "get prompt", op: opGetPrompt, want: client.FailureDeadline},
+		{name: "read resource", op: opReadResource, want: client.FailureDeadline},
+		{name: "subscribe", op: opSubscribe, want: client.FailureDeadline},
+		{name: "set log level", op: opSetLogLevel, want: client.FailureDeadline},
+
+		// An op this package does not define is not a startup: defaulting the
+		// unknown case to a startup timeout would misreport a caller's binding.
+		{name: "unknown op", op: "no_such_op", want: client.FailureDeadline},
+		{name: "empty op", op: "", want: client.FailureDeadline},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := deadlineClass(tt.op); got != tt.want {
+				t.Errorf("deadlineClass(%q) = %v, want %v", tt.op, got, tt.want)
+			}
+		})
+	}
+}
