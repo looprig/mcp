@@ -93,6 +93,19 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 		LoggingMessageHandler: func(_ context.Context, req *mcp.LoggingMessageRequest) {
 			s.onLog(req.Params)
 		},
+		// The list-change notifications. Registered unconditionally for the same
+		// reason as the two above: a notification with no OnListChanged installed
+		// is dropped here, where declining to register it would leave the SDK
+		// logging an unhandled notification instead.
+		ToolListChangedHandler: func(_ context.Context, _ *mcp.ToolListChangedRequest) {
+			s.onListChanged(ListFamilyTools)
+		},
+		PromptListChangedHandler: func(_ context.Context, _ *mcp.PromptListChangedRequest) {
+			s.onListChanged(ListFamilyPrompts)
+		},
+		ResourceListChangedHandler: func(_ context.Context, _ *mcp.ResourceListChangedRequest) {
+			s.onListChanged(ListFamilyResources)
+		},
 	})
 
 	cs, err := client.Connect(ctx, s.transport, nil)

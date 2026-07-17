@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	"errors"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -280,7 +281,9 @@ func TestConnectHappyPath(t *testing.T) {
 	if got.Failure != nil {
 		t.Errorf("Failure = %+v, want nil on a healthy binding", got.Failure)
 	}
-	if got != want {
+	// DeepEqual, not ==: Status carries a slice (StaleFamilies) and so is not
+	// comparable. A ready binding's is nil, which this covers.
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("Status() = %+v, want %+v", got, want)
 	}
 	if got.LastChange.IsZero() {

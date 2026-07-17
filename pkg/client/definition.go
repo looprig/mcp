@@ -146,6 +146,14 @@ type Definition struct {
 	ToolFilter ToolFilter
 	// AllowParallelCalls opts in to bounded parallel tool calls.
 	AllowParallelCalls bool
+	// Refresh bounds the retries of a catalog refresh that failed. Zero fields
+	// select their defaults.
+	//
+	// A refresh is triggered by the server announcing a change to one of its
+	// lists (see Client.Candidate). Failing one costs the binding its view of
+	// that change, never its adopted catalog, so the policy here decides how
+	// hard a binding tries to catch up — not whether it stays usable.
+	Refresh RetryPolicy
 	// LogLevel is the minimum severity of server log message to request. Zero
 	// means DefaultLogLevel.
 	//
@@ -179,6 +187,7 @@ func (d Definition) Validate() error {
 		d.Limits.validate(),
 		d.ToolFilter.validate(),
 		d.LogLevel.validate(),
+		d.Refresh.validate("Refresh"),
 	} {
 		if err != nil {
 			return NewError(FailureInvalidConfig, d.Name, "validate", err.Error(), nil)
@@ -195,6 +204,7 @@ func (d Definition) normalized() Definition {
 	d.Timeouts = d.Timeouts.withDefaults()
 	d.Limits = d.Limits.withDefaults()
 	d.ToolFilter = d.ToolFilter.clone()
+	d.Refresh = d.Refresh.withDefaults()
 	if d.LogLevel == "" {
 		d.LogLevel = DefaultLogLevel
 	}

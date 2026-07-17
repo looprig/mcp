@@ -39,11 +39,19 @@ type fakeConn struct {
 	templates []protocol.ResourceTemplateSpec
 	toolPages []protocol.ToolPage
 
-	// listErr, when set, fails tools/list — the discovery failure a Client has
-	// to unwind from.
-	listErr error
 	// lists counts every list call.
 	lists atomic.Int32
+	// toolLists counts calls to ListTools alone, which is one per catalog
+	// fetch: the number a refresh test counts passes with.
+	toolLists atomic.Int32
+	// listEntered, when non-nil, receives once per ListTools call, before the
+	// gate. It is how a test observes that a fetch has actually started rather
+	// than sleeping and hoping.
+	listEntered chan struct{}
+	// listGate, when non-nil, blocks ListTools until it is closed or ctx ends.
+	// It turns a fetch into something a test can hold open, which is what makes
+	// coalescing observable.
+	listGate chan struct{}
 
 	// The call surface. callResult is returned by CallTool unless callErr is
 	// set; callBlock makes it wait for ctx instead, which is how a deadline or
@@ -69,6 +77,33 @@ type fakeConn struct {
 	calls     []string
 	logLevel  string
 	logLevels int
+	// listErr, when set, fails tools/list — the discovery failure a Client has
+	// to unwind from, and the refresh failure it has to degrade on. It is
+	// guarded because a refresh test flips it on a live client.
+	listErr error
+}
+
+// setTools replaces the tool list the conn serves. It is what makes a server's
+// catalog change mid-connection, which is the thing every candidate-generation
+// test is about.
+func (c *fakeConn) setTools(tools ...protocol.ToolSpec) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.tools = tools
+}
+
+// setListErr makes (or stops making) tools/list fail.
+func (c *fakeConn) setListErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listErr = err
+}
+
+// listState reads the fields ListTools serves from, under the lock.
+func (c *fakeConn) listState() ([]protocol.ToolSpec, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tools, c.listErr
 }
 
 func (c *fakeConn) Initialize(ctx context.Context) (protocol.InitializeResult, error) {
@@ -91,10 +126,27 @@ func (c *fakeConn) Close(_ context.Context) error {
 	return c.closeErr
 }
 
-func (c *fakeConn) ListTools(_ context.Context, cursor string) (protocol.ToolPage, error) {
+func (c *fakeConn) ListTools(ctx context.Context, cursor string) (protocol.ToolPage, error) {
 	c.lists.Add(1)
-	if c.listErr != nil {
-		return protocol.ToolPage{}, c.listErr
+	c.toolLists.Add(1)
+	if c.listEntered != nil {
+		select {
+		case c.listEntered <- struct{}{}:
+		case <-ctx.Done():
+			return protocol.ToolPage{}, ctx.Err()
+		}
+	}
+	if c.listGate != nil {
+		select {
+		case <-c.listGate:
+		case <-ctx.Done():
+			return protocol.ToolPage{}, ctx.Err()
+		}
+	}
+
+	tools, listErr := c.listState()
+	if listErr != nil {
+		return protocol.ToolPage{}, listErr
 	}
 	if c.toolPages != nil {
 		i := 0
@@ -108,7 +160,7 @@ func (c *fakeConn) ListTools(_ context.Context, cursor string) (protocol.ToolPag
 		}
 		return c.toolPages[i], nil
 	}
-	return protocol.ToolPage{Tools: c.tools}, nil
+	return protocol.ToolPage{Tools: tools}, nil
 }
 
 func (c *fakeConn) CallTool(ctx context.Context, rawName string, _ json.RawMessage, opts protocol.CallOptions) (protocol.ToolResult, error) {

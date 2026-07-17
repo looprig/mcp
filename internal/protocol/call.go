@@ -432,6 +432,19 @@ func (s *Session) onLog(params *mcp.LoggingMessageParams) {
 	s.cfg.OnLog(FromSDKLogParams(params, s.cfg.Bounds))
 }
 
+// onListChanged routes a list-change notification to the config's callback.
+//
+// There is nothing to convert and nothing to bound: the notification's params
+// carry no content this module reads (see ListChange), so what crosses the
+// boundary is the family alone — a value from this package's own enum, chosen
+// by the handler that received the notification, never by the server.
+func (s *Session) onListChanged(f ListFamily) {
+	if s.cfg.OnListChanged == nil {
+		return
+	}
+	s.cfg.OnListChanged(ListChange{Family: f})
+}
+
 // FromSDKLogParams converts a logging notification, bounding its text.
 //
 // The MCP log payload is `any`: a server may log a string or an arbitrary JSON

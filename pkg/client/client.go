@@ -41,11 +41,6 @@ const (
 	opClose      = "close"
 )
 
-// firstGeneration is the number given to the catalog discovered at startup.
-// Generations are 1-based so that zero can mean "none adopted" (see
-// Catalog.Valid).
-const firstGeneration = 1
-
 // Client is one connection to one MCP server. It is safe for concurrent use.
 // A Client is always either usable or closed: Connect never returns one that
 // failed to start.
@@ -62,6 +57,19 @@ type Client struct {
 	// logHandler is the application's log callback, captured at construction.
 	// It is read-only after that, so it needs no lock.
 	logHandler LogHandler
+	// eventHandler is the application's event callback, captured at
+	// construction and read-only afterwards. See Client.emit.
+	eventHandler EventHandler
+
+	// refreshCh carries a request for a catalog refresh pass. It is buffered to
+	// one: that buffer is what coalesces duplicate notifications (see
+	// signalRefresh).
+	refreshCh chan struct{}
+	// stopRefresher ends the refresh worker; refresherDone is closed when it
+	// has. Both are nil until the worker starts, which is after the binding is
+	// ready — a client that never reached ready has no worker to stop.
+	stopRefresher context.CancelFunc
+	refresherDone chan struct{}
 
 	// connOnce guards the single Close of conn. Both Connect's unwind path and
 	// Close go through it, so a conn can never be closed twice.
@@ -82,10 +90,24 @@ type Client struct {
 	protocolVersion string
 	failure         *Failure
 	lastChange      time.Time
+	// initResult is what the handshake settled. A refresh needs it — discovery
+	// is gated on the server's advertised capabilities — and re-running the
+	// handshake to recover it is not an option, so it is kept.
+	initResult protocol.InitializeResult
 	// generation is the adopted catalog, or nil before discovery has published
 	// one. The Generation it points at is immutable, so only the pointer needs
 	// guarding.
 	generation *catalog.Generation
+	// candidate is the validated generation waiting for the caller to adopt it,
+	// or nil when there is none. Only the refresh path writes it; only Adopt
+	// promotes it. See refresh.go.
+	candidate *catalog.Generation
+	// lastGeneration is the highest ordinal handed out so far. See
+	// reserveGeneration.
+	lastGeneration uint64
+	// stale holds the catalog families a server has announced a change to and
+	// which have not been refetched since.
+	stale map[catalog.Family]struct{}
 }
 
 // Connect establishes a binding: it validates def, opens a transport, performs
@@ -126,16 +148,20 @@ func Connect(ctx context.Context, def Definition, h Handlers) (*Client, error) {
 // watcher already registered, so no transition can be missed by a caller's
 // event handler.
 func newClient(def Definition, h Handlers) *Client {
-	c := &Client{def: def, machine: lifecycle.NewMachine(), logHandler: h.Log}
+	c := &Client{
+		def:          def,
+		machine:      lifecycle.NewMachine(),
+		logHandler:   h.Log,
+		eventHandler: h.Event,
+		refreshCh:    make(chan struct{}, 1),
+		stale:        make(map[catalog.Family]struct{}),
+	}
 	c.unwatch = c.machine.Watch(func(from, to lifecycle.State) {
 		now := time.Now()
 		c.mu.Lock()
 		c.lastChange = now
 		c.mu.Unlock()
-		if h.Event == nil {
-			return
-		}
-		h.Event(StateChanged{
+		c.emit(StateChanged{
 			Binding: def.Name,
 			From:    fromLifecycle(from),
 			To:      fromLifecycle(to),
@@ -157,11 +183,12 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	}
 
 	conn, err := c.def.Transport.Connect(ctx, protocol.ConnectConfig{
-		Client:       protocol.ClientIdentity{Name: ClientName, Version: ClientVersion, Title: ClientTitle},
-		Capabilities: caps,
-		Bounds:       c.def.Limits.bounds(),
-		Wire:         c.def.Limits.wire(),
-		OnLog:        c.logAdapter(),
+		Client:        protocol.ClientIdentity{Name: ClientName, Version: ClientVersion, Title: ClientTitle},
+		Capabilities:  caps,
+		Bounds:        c.def.Limits.bounds(),
+		Wire:          c.def.Limits.wire(),
+		OnLog:         c.logAdapter(),
+		OnListChanged: c.onListChanged,
 	})
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)
@@ -189,6 +216,7 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	c.mu.Lock()
 	c.server = ServerIdentity{Name: res.Server.Name, Version: res.Server.Version, Title: res.Server.Title}
 	c.protocolVersion = string(res.ProtocolVersion)
+	c.initResult = res
 	c.mu.Unlock()
 
 	// From here on the conn is established, so every failure — including a
@@ -206,7 +234,44 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	if err := c.to(lifecycle.StateReady, opDiscover); err != nil {
 		return c.unwind(ctx, err)
 	}
+	// Last, once the binding is established and no failure path can still
+	// unwind it: a worker started earlier would be one more thing every unwind
+	// had to remember to stop, and the only work it has is on a live connection
+	// anyway. From here the goroutine's lifetime is exactly Close's.
+	c.startRefresher()
 	return nil
+}
+
+// startRefresher launches the refresh worker. It is called once, from the end of
+// a successful startup.
+func (c *Client) startRefresher() {
+	// Deliberately not derived from the startup context: startup's context
+	// bounds startup, and the worker outlives it. Cancellation comes from Close
+	// and from nowhere else.
+	ctx, cancel := context.WithCancel(context.Background())
+	c.stopRefresher = cancel
+	c.refresherDone = make(chan struct{})
+	go c.runRefresher(ctx)
+}
+
+// stopRefreshing ends the refresh worker and waits for it to exit, so that no
+// refresh can still be in flight against a connection Close is about to shut.
+//
+// It is bounded by ctx: a worker wedged in a fetch against a server that has
+// stopped answering must not hold shutdown open forever. Abandoning the wait is
+// safe — the worker's own context is already cancelled, so it ends as soon as
+// its fetch does, and it touches nothing Close releases (closing a conn under an
+// in-flight request is the transport's business, and it reports it as a closed
+// connection).
+func (c *Client) stopRefreshing(ctx context.Context) {
+	if c.stopRefresher == nil {
+		return
+	}
+	c.stopRefresher()
+	select {
+	case <-c.refresherDone:
+	case <-ctx.Done():
+	}
 }
 
 // discover fetches the initial catalog and adopts it, and sets the server's log
@@ -218,8 +283,11 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 // closed and the caller gets a typed error.
 func (c *Client) discover(ctx context.Context, conn protocol.Conn, res protocol.InitializeResult) error {
 	gen, err := catalog.Discover(ctx, conn, catalog.Config{
-		Binding:   string(c.def.Name),
-		Number:    firstGeneration,
+		Binding: string(c.def.Name),
+		// The first ordinal this binding hands out, and the same counter every
+		// later refresh draws from: generations are numbered by one source, so
+		// no two of them can ever share a number.
+		Number:    c.reserveGeneration(),
 		Handshake: res,
 		Limits:    c.def.Limits.catalog(),
 	})
@@ -411,6 +479,7 @@ func (c *Client) Status() Status {
 		State:          fromLifecycle(c.machine.State()),
 		TransportKind:  c.def.Transport.Kind(),
 		RedactedOrigin: c.def.Transport.RedactedOrigin(),
+		StaleFamilies:  c.staleFamilies(),
 	}
 
 	c.mu.Lock()
@@ -421,6 +490,10 @@ func (c *Client) Status() Status {
 	if c.generation != nil {
 		s.CatalogGeneration = c.generation.Number()
 		s.CatalogDigest = c.generation.Digest().String()
+	}
+	if c.candidate != nil {
+		s.CandidateGeneration = c.candidate.Number()
+		s.CandidateDigest = c.candidate.Digest().String()
 	}
 	if c.failure != nil {
 		// Copy: a caller must not be able to rewrite the client's own record.
@@ -448,6 +521,10 @@ func (c *Client) Close(ctx context.Context) error {
 		// terminal). Shutdown is best-effort by design: the transport must be
 		// released regardless of what the machine says.
 		_ = c.machine.To(lifecycle.StateClosing)
+		// Background work first, connection second: a refresh in flight against
+		// a conn that is about to close would fail, degrade the binding, and
+		// report a catalog rejection for a binding the caller is shutting down.
+		c.stopRefreshing(ctx)
 		err = c.closeConn(ctx)
 		_ = c.machine.To(lifecycle.StateClosed)
 		c.unwatch()

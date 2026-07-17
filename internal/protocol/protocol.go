@@ -106,6 +106,64 @@ type ConnectConfig struct {
 	// it from. It is invoked on the connection's notification goroutine and
 	// blocks it, so an implementation must not do work.
 	OnLog func(LogRecord)
+
+	// OnListChanged receives the server's list-change notifications. Nil drops
+	// them.
+	//
+	// Like OnLog it is a callback rather than a method for want of a request to
+	// return it from, and it is invoked on the connection's notification
+	// goroutine and blocks it: an implementation must record the change and
+	// return, never fetch.
+	OnListChanged func(ListChange)
+}
+
+// ListFamily names the catalog family a list-change notification refers to. It
+// is this package's own enum rather than internal/catalog's Family because
+// catalog imports protocol, not the other way round; the client maps between
+// them.
+type ListFamily uint8
+
+// The families a server can announce a change to. MCP defines one notification
+// per family; there is none for resource templates, which travel with
+// resources.
+const (
+	// ListFamilyTools is notifications/tools/list_changed.
+	ListFamilyTools ListFamily = iota + 1
+	// ListFamilyPrompts is notifications/prompts/list_changed.
+	ListFamilyPrompts
+	// ListFamilyResources is notifications/resources/list_changed.
+	ListFamilyResources
+
+	listFamilySentinel // must remain last; tests derive the declared range from it
+)
+
+// listFamilyNames maps each family to its stable lowercase identifier. These
+// reach events and telemetry, so they must not change.
+var listFamilyNames = [listFamilySentinel]string{
+	ListFamilyTools:     "tools",
+	ListFamilyPrompts:   "prompts",
+	ListFamilyResources: "resources",
+}
+
+// String returns the family's stable identifier, or "unknown" for any value
+// outside the declared range.
+func (f ListFamily) String() string {
+	if f < ListFamilyTools || f >= listFamilySentinel {
+		return "unknown"
+	}
+	return listFamilyNames[f]
+}
+
+// ListChange is a server's announcement that a catalog family changed.
+//
+// It carries no content: MCP's list-change notifications say only that a list
+// changed, never how. That is a property worth keeping rather than papering
+// over — a client that acted on a server's account of its own delta would be
+// trusting an untrusted peer's diff. The only safe response is to refetch the
+// family and compare, which is what internal/catalog and the client do.
+type ListChange struct {
+	// Family names the list the server says changed.
+	Family ListFamily
 }
 
 // WireLimits bounds untrusted bytes at the point they arrive, which is a

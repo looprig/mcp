@@ -106,6 +106,20 @@ type Status struct {
 	// host's policy, so two bindings reporting the same digest are looking at
 	// the same catalog.
 	CatalogDigest string
-	// Candidate catalog digests and retry state arrive with the tasks that
-	// introduce change notifications and reconnection.
+
+	// CandidateGeneration is the ordinal of the validated candidate awaiting
+	// adoption, or 0 when there is none. See Client.Candidate.
+	CandidateGeneration uint64
+	// CandidateDigest is the candidate's hex catalog digest, empty when there
+	// is no candidate.
+	CandidateDigest string
+	// StaleFamilies names the catalog families a server has announced a change
+	// to and which have not been refetched since, as stable identifiers
+	// ("tools", "prompts", "resources") in a deterministic order.
+	//
+	// It is normally empty even on a binding whose server changes constantly: a
+	// family is stale only between the notification and the refetch that
+	// answers it. A family that stays here is a binding whose refreshes are
+	// failing — which State (degraded) and Failure describe.
+	StaleFamilies []string
 }
