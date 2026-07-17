@@ -110,7 +110,9 @@ type Error struct {
 	Op string
 	// Msg is a bounded, normalized, secret-free description.
 	Msg string
-	// Err is the wrapped cause, if any. It is never rendered.
+	// Err is the wrapped cause, if any. It is never rendered — not through
+	// Error, not through any fmt verb, and not through a copy of this struct.
+	// See the receivers on Error's methods: they are VALUES, deliberately.
 	Err error
 }
 
@@ -136,7 +138,7 @@ func NewNoTokenError(op string) *Error {
 
 // Error renders "auth: <op>: <class>: <msg>", omitting empty segments. The
 // wrapped cause is never rendered — see the file comment.
-func (e *Error) Error() string {
+func (e Error) Error() string {
 	parts := make([]string, 0, 4)
 	parts = append(parts, "auth")
 	if e.Op != "" {
@@ -150,7 +152,7 @@ func (e *Error) Error() string {
 }
 
 // Unwrap returns the wrapped cause for errors.Is / errors.As traversal.
-func (e *Error) Unwrap() error {
+func (e Error) Unwrap() error {
 	return e.Err
 }
 
@@ -164,7 +166,17 @@ func (e *Error) Unwrap() error {
 // print whatever that failure's text contains, which is exactly the material
 // Error refuses to render through Error(). A verb typo must not be the
 // difference.
-func (e *Error) Format(f fmt.State, verb rune) {
+//
+// The VALUE receiver is the other half, and it is not a style choice — it is
+// the same reasoning TokenSet's receivers follow. A pointer receiver puts
+// Format in *Error's method set only, so a value copy — `fmt.Sprintf("%v",
+// *err)`, an Error stored or ranged by value, a struct embedding one — misses
+// Formatter entirely and falls to reflection, which prints Err in full. This
+// package hands callers a *Error, but "never rendered" is a claim about the
+// TYPE, and a caller who copies one has done nothing wrong. A value receiver
+// covers both method sets, so the claim is true of every value of this type
+// rather than only of the pointers this package happens to return.
+func (e Error) Format(f fmt.State, verb rune) {
 	// fmt.Formatter cannot report a write error and fmt ignores them
 	// anyway; discarding is the contract here, not an oversight.
 	_, _ = io.WriteString(f, e.Error())

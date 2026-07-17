@@ -195,3 +195,38 @@ func TestErrNoTokenDistinguishesAbsentFromFailure(t *testing.T) {
 		t.Error("a store failure matched ErrNoToken; absent and broken must not be conflated")
 	}
 }
+
+// TestErrorNeverRendersTheCauseThroughACopy pins "never rendered" as a property
+// of the TYPE, not of the pointers this package happens to hand out.
+//
+// Error's methods had pointer receivers, so Formatter was in *Error's method set
+// alone and a VALUE copy fell through to fmt's reflection path — which reads the
+// exported Err field and prints the wrapped cause in full. `fmt.Sprintf("%v",
+// *err)` printed the secret the type promises never to render. Copying an error
+// value is not a misuse, so the guarantee has to survive it.
+func TestErrorNeverRendersTheCauseThroughACopy(t *testing.T) {
+	t.Parallel()
+	const secret = "SECRET-CAUSE-TEXT"
+	ptr := auth.NewError(auth.ClassFailed, "refresh", "boom", errors.New(secret))
+	value := *ptr
+
+	// Verbs held in variables: a literal would let vet reject the wrong-type
+	// verbs this test exists to drive, and those are exactly a caller's typo.
+	for _, verb := range []string{"%v", "%s", "%q", "%d", "%x", "%#v", "%+v", "%t", "%c"} {
+		for _, target := range []struct {
+			what string
+			val  any
+		}{
+			{"pointer", ptr},
+			{"value copy", value},
+			{"pointer to the copy", &value},
+			{"slice of values", []auth.Error{value}},
+			{"struct embedding a value", struct{ E auth.Error }{value}},
+		} {
+			got := fmt.Sprintf(verb, target.val)
+			if strings.Contains(got, secret) {
+				t.Errorf("%s rendered with %s leaks the wrapped cause: %s", target.what, verb, got)
+			}
+		}
+	}
+}
