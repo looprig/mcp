@@ -35,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/mcp/internal/httpconn"
 	"github.com/looprig/mcp/internal/mcptest"
 	"github.com/looprig/mcp/pkg/auth"
 	"github.com/looprig/mcp/pkg/client"
@@ -57,7 +58,7 @@ func newFixtureServer(t *testing.T, cfg mcptest.Config) string {
 
 // connectFixture connects the transport to endpoint and initializes it,
 // registering the close. It returns the live connection.
-func connectFixture(t *testing.T, cfg Config) *conn {
+func connectFixture(t *testing.T, cfg Config) *httpconn.Conn {
 	t.Helper()
 
 	f, err := New(cfg)
@@ -81,7 +82,7 @@ func connectFixture(t *testing.T, cfg Config) *conn {
 	if _, err := c.Initialize(ctx); err != nil {
 		t.Fatalf("Initialize() error = %v", err)
 	}
-	return c.(*conn)
+	return c.(*httpconn.Conn)
 }
 
 // callTool drives a real tool call over the established connection, through the
@@ -91,7 +92,7 @@ func connectFixture(t *testing.T, cfg Config) *conn {
 // args is a map here purely for the call sites' convenience: it is marshalled
 // straight to the raw JSON the protocol layer takes, which is what a tool's
 // arguments are on the wire.
-func callTool(ctx context.Context, c *conn, name string, args map[string]any) (protocol.ToolResult, error) {
+func callTool(ctx context.Context, c *httpconn.Conn, name string, args map[string]any) (protocol.ToolResult, error) {
 	raw, err := json.Marshal(args)
 	if err != nil {
 		return protocol.ToolResult{}, err
@@ -528,7 +529,7 @@ func TestSessionLifetime(t *testing.T) {
 	if _, err := c.Initialize(ctx); err != nil {
 		t.Fatalf("Initialize() error = %v", err)
 	}
-	if _, err := callTool(ctx, c.(*conn), mcptest.ToolEcho, map[string]any{"text": "one"}); err != nil {
+	if _, err := callTool(ctx, c.(*httpconn.Conn), mcptest.ToolEcho, map[string]any{"text": "one"}); err != nil {
 		t.Fatalf("CallTool() error = %v", err)
 	}
 	if err := c.Close(ctx); err != nil {

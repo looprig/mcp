@@ -59,23 +59,21 @@
 // strips Authorization across origins, and a transport that attaches
 // credentials in a RoundTripper — as this one does, so that they can be
 // refreshed per request — runs below that logic and would put the header back.
-// See checkRedirect.
+// See httpsec.RedirectGuard.
 package streamablehttp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/looprig/mcp/internal/limits"
+	"github.com/looprig/mcp/internal/httpconn"
+	"github.com/looprig/mcp/internal/httpsec"
 	"github.com/looprig/mcp/internal/protocol"
 	"github.com/looprig/mcp/pkg/auth"
 	"github.com/looprig/mcp/pkg/client"
@@ -87,29 +85,15 @@ import (
 // other being pkg/transport/sse).
 const kind = "streamablehttp"
 
+// displayName is how this transport names itself in an error's message. It is
+// prose where kind is an identifier, and it is this module's own word: nothing a
+// server sends ever reaches it.
+const displayName = "streamable HTTP"
+
 // The contracts this package exists to satisfy.
 var (
 	_ client.TransportFactory = (*factory)(nil)
-	_ protocol.Conn           = (*conn)(nil)
-)
-
-// Operation names carried by the errors this package returns.
-const (
-	opNew        = "new"
-	opConnect    = "connect"
-	opInitialize = "initialize"
-	opClose      = "close"
-	// The catalog list operations, named as they appear in an error.
-	opListTools             = "list_tools"
-	opListPrompts           = "list_prompts"
-	opListResources         = "list_resources"
-	opListResourceTemplates = "list_resource_templates"
-	// The request operations.
-	opCallTool     = "call_tool"
-	opGetPrompt    = "get_prompt"
-	opReadResource = "read_resource"
-	opSubscribe    = "subscribe"
-	opSetLogLevel  = "set_log_level"
+	_ protocol.Conn           = (*httpconn.Conn)(nil)
 )
 
 // streamReconnects is how many times a dropped SSE stream is reconnected before
@@ -276,6 +260,25 @@ func (t Timeouts) withDefaults() Timeouts {
 	}
 }
 
+// httpsec projects the defaulted timeouts onto the narrow view the shared HTTP
+// layer enforces. Call it on a defaulted value: httpsec expects positive fields
+// and this package's defaults are what make them so.
+//
+// The mapping is explicit rather than a shared struct because the two types have
+// different jobs: this one is a caller's configuration surface, with the prose
+// and the defaults that belong to it, and httpsec.Timeouts is what the
+// enforcement reads.
+func (t Timeouts) httpsec() httpsec.Timeouts {
+	return httpsec.Timeouts{
+		Dial:           t.Dial,
+		TLSHandshake:   t.TLSHandshake,
+		ResponseHeader: t.ResponseHeader,
+		Frame:          t.Frame,
+		IdleConn:       t.IdleConn,
+		Request:        t.Request,
+	}
+}
+
 // validate reports the first negative field, naming it. Zero is valid (it means
 // "use the default").
 func (t Timeouts) validate() error {
@@ -326,10 +329,10 @@ type factory struct {
 // never a header's value, a query string, or a token, which may be.
 func New(cfg Config) (client.TransportFactory, error) {
 	fail := func(msg string) error {
-		return client.NewError(client.FailureInvalidConfig, "", opNew, msg, nil)
+		return client.NewError(client.FailureInvalidConfig, "", httpconn.OpNew, msg, nil)
 	}
 
-	endpoint, origin, err := resolveEndpoint(cfg.Endpoint)
+	endpoint, origin, err := httpsec.ResolveEndpoint(cfg.Endpoint)
 	if err != nil {
 		return nil, fail(err.Error())
 	}
@@ -343,7 +346,7 @@ func New(cfg Config) (client.TransportFactory, error) {
 	if err := cfg.Timeouts.validate(); err != nil {
 		return nil, fail(err.Error())
 	}
-	base, err := vetTransport(cfg.HTTPClient, cfg.Timeouts.withDefaults())
+	base, err := httpsec.VetTransport(cfg.HTTPClient, cfg.Timeouts.withDefaults().httpsec())
 	if err != nil {
 		return nil, fail(err.Error())
 	}
@@ -359,51 +362,6 @@ func New(cfg Config) (client.TransportFactory, error) {
 		times:    cfg.Timeouts.withDefaults(),
 		base:     base,
 	}, nil
-}
-
-// resolveEndpoint validates rawURL and splits it into the URL to request and
-// the origin to display.
-//
-// The validation is auth.CanonicalOrigin's, not a second opinion: it is the
-// function that decides what an origin is for the token store, and a transport
-// that accepted a URL the store cannot key — or refused one it can — would put
-// a credential and the server it is for in disagreement about what "the server"
-// means. It brings the loopback rule with it, which is the rule that matters:
-// cleartext is for a server on this machine, and tokens do not cross a network
-// unencrypted.
-//
-// The request URL keeps its path and query; only the origin is derived. The two
-// are separate values because they have separate audiences: one is sent, the
-// other is shown.
-func resolveEndpoint(rawURL string) (endpoint, origin string, err error) {
-	const field = "Endpoint"
-	if rawURL == "" {
-		return "", "", fmt.Errorf("%s is empty", field)
-	}
-	origin, err = auth.CanonicalOrigin(rawURL)
-	if err != nil {
-		// The auth error is already bounded, normalized and secret-free — it is
-		// built to be logged — and it never renders its cause. Its text is the
-		// message; the URL it describes is not repeated, because a query string
-		// is not something to put in an error.
-		return "", "", fmt.Errorf("%s is not usable: %s", field, err.Error())
-	}
-	// Parsed again only to normalize the request URL. CanonicalOrigin has
-	// already accepted it, so this cannot fail; the error is checked rather
-	// than discarded because "cannot fail" is a claim about today's code.
-	u, perr := url.Parse(rawURL)
-	if perr != nil {
-		return "", "", fmt.Errorf("%s is not a valid URL", field)
-	}
-	// Rebuilt from the canonical origin rather than reusing the caller's
-	// scheme/host spelling: "HTTPS://Example.COM:0443/mcp" and
-	// "https://example.com/mcp" must not become two different endpoints when
-	// they are one server, and the origin is the spelling the token store uses.
-	u.Scheme = ""
-	u.Host = ""
-	u.User = nil
-	u.Fragment = ""
-	return origin + u.String(), origin, nil
 }
 
 // Kind implements client.TransportFactory.
@@ -431,24 +389,23 @@ func (f *factory) Connect(ctx context.Context, cfg protocol.ConnectConfig) (prot
 		if errors.Is(err, context.DeadlineExceeded) {
 			class = client.FailureStartupTimeout
 		}
-		return nil, client.NewError(class, "", opConnect,
+		return nil, client.NewError(class, "", httpconn.OpConnect,
 			"the streamable HTTP transport was not connected", err)
 	}
 
 	// Per connection, not per factory: diags is where a failure's cause is
 	// recorded on its way past, and two connections must not read each other's.
-	d := &diagnostics{}
-	c := &conn{diags: d, endpoint: f.endpoint, origin: f.origin}
-	c.session = protocol.NewSession(&mcp.StreamableClientTransport{
+	d := &httpsec.Diagnostics{}
+	session := protocol.NewSession(&mcp.StreamableClientTransport{
 		Endpoint:   f.endpoint,
-		HTTPClient: f.httpClient(d, newWireLimits(cfg.Wire)),
+		HTTPClient: f.httpClient(d, httpsec.NewWireLimits(cfg.Wire)),
 		MaxRetries: streamReconnects,
 		// OAuthHandler is deliberately left nil, and this is load-bearing: it is
 		// the SDK's only path that re-sends a POST, and a re-sent POST is a
 		// re-run tool call. Credentials reach a request through the RoundTripper
 		// instead — see the package comment.
 	}, cfg)
-	return c, nil
+	return httpconn.New(session, d, displayName, f.endpoint, f.origin), nil
 }
 
 // httpClient builds the client for one connection: the shared, vetted transport
@@ -458,373 +415,25 @@ func (f *factory) Connect(ctx context.Context, cfg protocol.ConnectConfig) (prot
 // this binding, and the diagnostics buffer this connection's errors are
 // classified from. The pool underneath is shared, so the wrapping costs a
 // struct and not a socket.
-func (f *factory) httpClient(d *diagnostics, w wireLimits) *http.Client {
+func (f *factory) httpClient(d *httpsec.Diagnostics, w httpsec.WireLimits) *http.Client {
 	return &http.Client{
 		// No Timeout, by design: see Timeouts. The bounds live on the transport
 		// underneath and in the RoundTripper, where a stream can be told apart
 		// from an exchange.
-		CheckRedirect: f.checkRedirect,
-		Transport: &roundTripper{
-			base:     f.base,
-			headers:  f.headers,
-			provider: f.provider,
-			wire:     w,
-			request:  f.times.Request,
-			frame:    f.times.Frame,
-			diags:    d,
+		CheckRedirect: httpsec.RedirectGuard(f.origin),
+		Transport: &httpsec.RoundTripper{
+			Base:     f.base,
+			Headers:  f.headers,
+			Provider: f.provider,
+			Wire:     w,
+			Request:  f.times.Request,
+			Frame:    f.times.Frame,
+			Diags:    d,
+			// The endpoint's origin, pinned. This transport's URLs are all its
+			// own — the SDK derives them from the configured endpoint — so this
+			// is belt to CheckRedirect's braces here, and the load-bearing guard
+			// in pkg/transport/sse, where a server supplies a URL directly.
+			Origin: f.origin,
 		},
-	}
-}
-
-// maxRedirects bounds a redirect chain. Even a same-origin chain is bounded: a
-// server that bounces a request between two of its own paths forever is a hang,
-// and a hang is what every bound in this package exists to prevent.
-const maxRedirects = 5
-
-// checkRedirect refuses any redirect that leaves the configured origin.
-//
-// This is not a hardening nicety; without it this transport is strictly worse
-// than the http.Client it wraps. The stdlib strips Authorization when a redirect
-// crosses origins — and then this package's RoundTripper, which runs *below*
-// that logic and attaches credentials to every request it sees, puts it back. A
-// 302 from a configured endpoint to an attacker's host would hand over the
-// bearer token, in cleartext if the redirect said http. A test proves both
-// halves, because the failure is invisible from the happy path.
-//
-// The policy is origin-pinning, and it is deliberately stricter than the
-// scheme check pkg/auth's defaultHTTPClient applies to its own flows:
-//
-//   - An MCP endpoint is configuration. The caller named one server; a server
-//     that answers "I am actually over there" is not a redirect to follow, it is
-//     a different server, and only the caller can decide to talk to it.
-//   - The credential is keyed by origin. auth.Key binds a token to the origin it
-//     was minted for, so sending it to another origin is incoherent by
-//     construction — whatever the scheme, whatever the trust.
-//   - Allowing cross-origin https "because TLS" would still send a token for
-//     server A to server B. The scheme is not what makes that wrong.
-//
-// So same-origin redirects pass — "/mcp" to "/mcp/" is an ordinary thing for a
-// server to do, and the credential is not going anywhere new — and everything
-// else is refused. Refusing costs a caller nothing but an explicit config
-// change, which is the point: it makes the move deliberate.
-//
-// Canonicalization is auth.CanonicalOrigin, the same function New validated the
-// endpoint with, which is what makes config time and run time agree. A hop to a
-// non-loopback http host does not need its own check: it fails to match the
-// origin, and would fail CanonicalOrigin too.
-func (f *factory) checkRedirect(req *http.Request, via []*http.Request) error {
-	if len(via) >= maxRedirects {
-		return fmt.Errorf("stopped after %d redirects", maxRedirects)
-	}
-	origin, err := auth.CanonicalOrigin(req.URL.String())
-	if err != nil {
-		// The URL is not repeated: a redirect target is server-controlled and a
-		// query string is a place tokens live. The auth error is already
-		// bounded, normalized and secret-free.
-		return fmt.Errorf("refusing a redirect to an unusable URL: %s", err.Error())
-	}
-	if origin != f.origin {
-		// Origins are not secret and naming both is the whole diagnostic.
-		return fmt.Errorf("refusing a redirect from %s to %s: an MCP endpoint's origin is configuration, "+
-			"and a credential minted for one origin is never sent to another", f.origin, origin)
-	}
-	return nil
-}
-
-// conn is one MCP session over Streamable HTTP.
-//
-// It is thin, and it is thin on purpose: the SDK's transport owns the session
-// ID, the streams and the DELETE, so there is nothing here to hold but the
-// session and the record of what went wrong underneath it.
-type conn struct {
-	session *protocol.Session
-	diags   *diagnostics
-	// endpoint and origin are held only so that cause can keep the request URL
-	// out of an error message. They are the factory's, unchanged.
-	endpoint string
-	origin   string
-}
-
-// Initialize performs the MCP handshake.
-func (c *conn) Initialize(ctx context.Context) (protocol.InitializeResult, error) {
-	res, err := c.session.Initialize(ctx)
-	if err != nil {
-		return protocol.InitializeResult{}, c.classify(ctx, opInitialize, err)
-	}
-	return res, nil
-}
-
-// The catalog list methods. Each is a straight delegation to the session, with
-// the transport's own classification applied to a failure: only this layer can
-// tell "the server spoke badly" from "the remote server is gone", and a list that
-// fails during discovery must be classified the same way a handshake would be.
-//
-// The four are generated through listVia rather than written out because they
-// differ only in the method they call — and a hand-written fourth copy is where
-// the classification would eventually go missing.
-
-// ListTools fetches one page of tools.
-func (c *conn) ListTools(ctx context.Context, cursor string) (protocol.ToolPage, error) {
-	return listVia(ctx, c, opListTools, cursor, c.session.ListTools)
-}
-
-// ListPrompts fetches one page of prompts.
-func (c *conn) ListPrompts(ctx context.Context, cursor string) (protocol.PromptPage, error) {
-	return listVia(ctx, c, opListPrompts, cursor, c.session.ListPrompts)
-}
-
-// ListResources fetches one page of resources.
-func (c *conn) ListResources(ctx context.Context, cursor string) (protocol.ResourcePage, error) {
-	return listVia(ctx, c, opListResources, cursor, c.session.ListResources)
-}
-
-// ListResourceTemplates fetches one page of resource templates.
-func (c *conn) ListResourceTemplates(ctx context.Context, cursor string) (protocol.ResourceTemplatePage, error) {
-	return listVia(ctx, c, opListResourceTemplates, cursor, c.session.ListResourceTemplates)
-}
-
-// listVia runs one list method and classifies its failure. The page type is the
-// only thing that varies, so it is the only type parameter.
-func listVia[P any](
-	ctx context.Context,
-	c *conn,
-	op string,
-	cursor string,
-	fetch func(context.Context, string) (P, error),
-) (P, error) {
-	page, err := fetch(ctx, cursor)
-	if err != nil {
-		var zero P
-		return zero, c.classify(ctx, op, err)
-	}
-	return page, nil
-}
-
-// The request methods. Like the list methods they delegate to the session and
-// classify the failure here, where the cause is knowable.
-
-// CallTool invokes a tool by its raw server name.
-func (c *conn) CallTool(ctx context.Context, rawName string, args json.RawMessage, opts protocol.CallOptions) (protocol.ToolResult, error) {
-	res, err := c.session.CallTool(ctx, rawName, args, opts)
-	if err != nil {
-		return protocol.ToolResult{}, c.classify(ctx, opCallTool, err)
-	}
-	return res, nil
-}
-
-// GetPrompt fetches a prompt's messages.
-func (c *conn) GetPrompt(ctx context.Context, name string, args map[string]string) (protocol.PromptResult, error) {
-	res, err := c.session.GetPrompt(ctx, name, args)
-	if err != nil {
-		return protocol.PromptResult{}, c.classify(ctx, opGetPrompt, err)
-	}
-	return res, nil
-}
-
-// ReadResource reads a resource by URI.
-func (c *conn) ReadResource(ctx context.Context, uri string) (protocol.ResourceResult, error) {
-	res, err := c.session.ReadResource(ctx, uri)
-	if err != nil {
-		return protocol.ResourceResult{}, c.classify(ctx, opReadResource, err)
-	}
-	return res, nil
-}
-
-// Subscribe asks the server to report changes to a resource.
-func (c *conn) Subscribe(ctx context.Context, uri string) error {
-	if err := c.session.Subscribe(ctx, uri); err != nil {
-		return c.classify(ctx, opSubscribe, err)
-	}
-	return nil
-}
-
-// SetLogLevel asks the server to send logs at or above level.
-func (c *conn) SetLogLevel(ctx context.Context, level string) error {
-	if err := c.session.SetLogLevel(ctx, level); err != nil {
-		return c.classify(ctx, opSetLogLevel, err)
-	}
-	return nil
-}
-
-// Close ends the session. The SDK's close drains the conversation and then
-// issues the DELETE that releases the server's session state.
-//
-// It is idempotent, via Session. A server that has already forgotten the session
-// is not a close failure: there is nothing left to release, which is what Close
-// is for.
-func (c *conn) Close(ctx context.Context) error {
-	if err := c.session.Close(ctx); err != nil {
-		return client.NewError(client.FailureTransportClosed, "", opClose,
-			"the streamable HTTP session could not be closed", err)
-	}
-	return nil
-}
-
-// classify turns a session failure into a typed error.
-//
-// The order is a hierarchy of causes, most specific first, because the SDK
-// reports very different things identically — "the connection failed" covers a
-// refused credential, a 500, an oversized body and a cancelled caller alike.
-// The specific causes come from diagnostics, which recorded them at the point
-// they happened; the SDK's error text is only the symptom, and much of it is
-// flattened with %v on the way up, so the cause is not reliably in the chain by
-// the time it arrives here.
-//
-// The caller's own context is read first: a cancelled caller is a cancellation,
-// whatever the read that noticed it returned.
-func (c *conn) classify(ctx context.Context, op string, err error) error {
-	switch {
-	case errors.Is(err, context.Canceled), errors.Is(ctx.Err(), context.Canceled):
-		return client.NewError(client.FailureCancelled, "", op,
-			"the streamable HTTP transport was cancelled", err)
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return client.NewError(deadlineClass(op), "", op,
-			"the streamable HTTP server did not answer in time", err)
-	}
-
-	// An auth failure, from the provider or from the chain. The message is
-	// always this package's own text plus the auth error's class: an auth
-	// error's cause routinely quotes a URL or a header, and client.Error renders
-	// a wrapped cause verbatim when no explicit message is given.
-	if aerr := c.diags.authError(); aerr != nil {
-		return client.NewError(authClass(aerr), "", op, authMessage(aerr), aerr)
-	}
-	var aerr *auth.Error
-	if errors.As(err, &aerr) {
-		return client.NewError(authClass(aerr), "", op, authMessage(aerr), err)
-	}
-
-	// A bound this transport enforced. It is reported ahead of the HTTP status
-	// because a 200 that overruns the limit is the limit's verdict, not the
-	// status's.
-	if lerr := c.diags.limitError(); lerr != nil {
-		return client.NewError(client.FailureLimitExceeded, "", op,
-			"the streamable HTTP server's response exceeded a limit: "+lerr.Error(), lerr)
-	}
-
-	// A server that started a message and stopped. It is reported ahead of the
-	// status for the reason the limit is: whatever the response line said, the
-	// stream is what ended the session.
-	if serr := c.diags.stallError(); serr != nil {
-		return client.NewError(client.FailureServerProtocol, "", op,
-			"the streamable HTTP server stalled mid-frame: "+serr.Error(), serr)
-	}
-
-	if status, ok := c.diags.status(); ok {
-		return client.NewError(statusClass(status), "", op,
-			fmt.Sprintf("the streamable HTTP server answered %d %s",
-				status, http.StatusText(status)), err)
-	}
-
-	// Nothing was recorded: the request never got far enough to have a status,
-	// or the session broke on something the server said rather than on the
-	// transport underneath it. Either way this is not a class this package can
-	// name more precisely without guessing.
-	return client.NewError(client.FailureServerProtocol, "", op, c.cause(err), err)
-}
-
-// cause renders err for a client.Error's message, with the request URL kept out
-// of it.
-//
-// Its existence is not tidiness. client.Error renders its wrapped cause verbatim
-// when no explicit message is given, and every network failure this transport
-// can suffer arrives wrapped in a *url.Error — whose text quotes the request
-// URL, whose query is a place people put access tokens. Leaving the message
-// empty therefore prints the credential, which a test here proves.
-//
-// So the message is never the chain's text. It is built from the one part of it
-// that is URL-free by construction: url.Error's inner Err, which holds the
-// actual fault ("connection refused") without the URL its parent formats in.
-// The endpoint is then scrubbed anyway, because "by construction" is a claim
-// about the stdlib's formatting that this package would rather not bet a
-// credential on. An unrecognized error contributes no text at all — the class
-// and the operation still say what happened, and the cause stays reachable
-// through errors.Is and errors.As for a caller that wants to inspect it.
-func (c *conn) cause(err error) string {
-	var uerr *url.Error
-	if !errors.As(err, &uerr) || uerr.Err == nil {
-		return "the streamable HTTP request failed"
-	}
-	text := uerr.Err.Error()
-	if text == "" {
-		return "the streamable HTTP request failed"
-	}
-	// Belt and braces: if the URL appears anyway, it becomes the origin, which
-	// is what RedactedOrigin would have said.
-	text = strings.ReplaceAll(text, c.endpoint, c.origin)
-	return "the streamable HTTP request failed: " + text
-}
-
-// authClass maps an auth failure onto the client taxonomy. The mapping is the
-// fixed 1:1 one documented in pkg/auth/errors.go — that package is a leaf and
-// must not import pkg/client, so a transport is where the translation lives.
-//
-// An unknown class maps to FailureAuthFailed rather than to something more
-// specific: a class this code does not recognize is an auth failure whose nature
-// it cannot state, and inventing a nature for it would be a fail-open.
-func authClass(err *auth.Error) client.FailureClass {
-	switch err.Class {
-	case auth.ClassInvalidConfig:
-		return client.FailureInvalidConfig
-	case auth.ClassNoToken, auth.ClassRequired:
-		return client.FailureAuthRequired
-	case auth.ClassDenied:
-		return client.FailureAuthDenied
-	case auth.ClassExpired:
-		return client.FailureAuthExpired
-	default:
-		return client.FailureAuthFailed
-	}
-}
-
-// authMessage renders an auth failure for a client.Error's message.
-//
-// It uses the auth error's own text, which is safe by construction: pkg/auth
-// bounds and normalizes it, refuses to render its cause, and documents that its
-// Msg is secret-free. What must not happen is leaving the message empty and
-// letting client.Error substitute the wrapped chain, which is not any of those
-// things.
-func authMessage(err *auth.Error) string {
-	text, _ := limits.TruncateText(err.Error(), auth.MaxMessageBytes)
-	return text
-}
-
-// statusClass maps an HTTP status onto the client taxonomy.
-//
-// 401 and 403 become auth classes because that is what they mean, and because a
-// caller deciding whether to start a login should not have to parse a number out
-// of a string. 401 is Required rather than Expired: the distinction is whether a
-// credential was sent and has aged out, which is the provider's knowledge and
-// not the status line's — an OAuthProvider that refreshed and still got 401
-// reports Expired itself, through the path above.
-//
-// Everything else is the remote's HTTP behavior, which is one class: a 404, a
-// 429 and a 500 differ in what to do about them, not in what they are, and the
-// status is in the message for the caller that cares.
-func statusClass(status int) client.FailureClass {
-	switch status {
-	case http.StatusUnauthorized:
-		return client.FailureAuthRequired
-	case http.StatusForbidden:
-		return client.FailureAuthDenied
-	default:
-		return client.FailureRemoteHTTP
-	}
-}
-
-// deadlineClass reports which failure a blown deadline is, for op.
-//
-// The distinction is the caller's to act on, not cosmetic: a startup timeout
-// means the binding never came up and may be retried or dropped, while a
-// deadline on a request means this call ran out of time on a binding that is
-// otherwise fine. Reporting every timeout as a startup timeout — which is what
-// this did when startup was the only thing that could time out — would tell a
-// caller its healthy binding had failed to start.
-func deadlineClass(op string) client.FailureClass {
-	switch op {
-	case opConnect, opInitialize:
-		return client.FailureStartupTimeout
-	default:
-		return client.FailureDeadline
 	}
 }

@@ -7,7 +7,7 @@
 // limit). A reader that only did one of those would look correct in production
 // right up until it wasn't.
 
-package streamablehttp
+package httpsec
 
 import (
 	"errors"
@@ -122,8 +122,8 @@ func TestFrameReader(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			d := &diagnostics{}
-			got, err := readAll(newFrameReader(strings.NewReader(tt.input), tt.limit, d, 0, nil))
+			d := &Diagnostics{}
+			got, err := readAll(NewFrameReader(strings.NewReader(tt.input), tt.limit, d, 0, nil))
 
 			if (err != nil) != tt.wantErr {
 				t.Fatalf("read error = %v, wantErr %v (read %d bytes)", err, tt.wantErr, len(got))
@@ -132,8 +132,8 @@ func TestFrameReader(t *testing.T) {
 				if got != tt.input {
 					t.Errorf("the reader altered the stream: got %q, want %q", got, tt.input)
 				}
-				if d.limitError() != nil {
-					t.Errorf("a stream within its bound recorded a limit error: %v", d.limitError())
+				if d.LimitError() != nil {
+					t.Errorf("a stream within its bound recorded a limit error: %v", d.LimitError())
 				}
 				return
 			}
@@ -146,9 +146,9 @@ func TestFrameReader(t *testing.T) {
 				t.Errorf("OverLimitError.Limit = %d, want %d", over.Limit, tt.limit)
 			}
 			// Recorded as well as returned: the SDK flattens this error's chain
-			// on the way up, so diagnostics is what classify actually reads.
-			if d.limitError() == nil {
-				t.Error("the over-limit read was not recorded in diagnostics")
+			// on the way up, so Diagnostics is what classify actually reads.
+			if d.LimitError() == nil {
+				t.Error("the over-limit read was not recorded in Diagnostics")
 			}
 			// Nothing beyond what the per-frame bound allows was ever surfaced.
 			if len(got) != tt.wantSurfaced {
@@ -164,7 +164,7 @@ func TestFrameReader(t *testing.T) {
 func TestFrameReaderErrorIsSticky(t *testing.T) {
 	t.Parallel()
 
-	r := newFrameReader(strings.NewReader(strings.Repeat("x", 512)+"\n\ndata: ok\n\n"), 16, &diagnostics{}, 0, nil)
+	r := NewFrameReader(strings.NewReader(strings.Repeat("x", 512)+"\n\ndata: ok\n\n"), 16, &Diagnostics{}, 0, nil)
 	if _, err := readAll(r); err == nil {
 		t.Fatal("read succeeded past the bound")
 	}
@@ -185,7 +185,7 @@ func TestFrameReaderSplitCRLF(t *testing.T) {
 
 	// One frame, well over the bound, whose every CRLF is split across a read.
 	body := "data: " + strings.Repeat("x", 256) + "\r\n" + "data: " + strings.Repeat("y", 256) + "\r\n\r\n"
-	r := newFrameReader(&crSplitter{s: body}, 64, &diagnostics{}, 0, nil)
+	r := NewFrameReader(&crSplitter{s: body}, 64, &Diagnostics{}, 0, nil)
 	if got, err := readAll(r); err == nil {
 		t.Errorf("read %d bytes without error; a split CRLF must not reset the frame budget", len(got))
 	}
@@ -210,7 +210,7 @@ func TestFrameReaderCountsEveryByte(t *testing.T) {
 		t.Fatalf("the fixture is %d bytes, which does not exceed the %d byte bound", len(body), limit)
 	}
 
-	got, err := readAll(newFrameReader(strings.NewReader(body), limit, &diagnostics{}, 0, nil))
+	got, err := readAll(NewFrameReader(strings.NewReader(body), limit, &Diagnostics{}, 0, nil))
 	if err == nil {
 		t.Fatalf("read all %d bytes of a %d byte frame without error; the bound was %d — "+
 			"line terminators must be counted", len(got), len(body), limit)
@@ -247,10 +247,10 @@ func TestNewFrameReaderRejectsANonPositiveBound(t *testing.T) {
 		func() {
 			defer func() {
 				if recover() == nil {
-					t.Errorf("newFrameReader(_, %d, _) did not panic; a bound that cannot bound is a bug at the call site", limit)
+					t.Errorf("NewFrameReader(_, %d, _) did not panic; a bound that cannot bound is a bug at the call site", limit)
 				}
 			}()
-			newFrameReader(strings.NewReader(""), limit, &diagnostics{}, 0, nil)
+			NewFrameReader(strings.NewReader(""), limit, &Diagnostics{}, 0, nil)
 		}()
 	}
 }

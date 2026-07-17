@@ -31,7 +31,7 @@
 // frame's first byte and stops at its last, and a frame that does not arrive in
 // time ends the stream.
 
-package streamablehttp
+package httpsec
 
 import (
 	"errors"
@@ -46,7 +46,7 @@ import (
 // errFrameStalled reports a frame that was started and never finished.
 var errFrameStalled = errors.New("streamablehttp: the server stopped mid-frame")
 
-// frameReader bounds each SSE frame in a stream, independently.
+// FrameReader bounds each SSE frame in a stream, independently.
 //
 // It is a byte filter, not a parser. It does not decode events — the SDK does
 // that, downstream — and it deliberately understands only one thing about the
@@ -57,10 +57,10 @@ var errFrameStalled = errors.New("streamablehttp: the server stopped mid-frame")
 // names and its line endings, which slightly over-counts the payload. That is
 // the safe direction, and the difference is tens of bytes against a bound of
 // megabytes.
-type frameReader struct {
+type FrameReader struct {
 	r     io.Reader
 	limit int
-	diags *diagnostics
+	diags *Diagnostics
 
 	// timeout is how long a frame has to arrive once it has started.
 	timeout time.Duration
@@ -97,7 +97,7 @@ type frameReader struct {
 	err error
 }
 
-// newFrameReader returns a reader over r that fails once any single SSE frame
+// NewFrameReader returns a reader over r that fails once any single SSE frame
 // exceeds limit bytes, or takes longer than timeout to arrive once it has
 // started.
 //
@@ -105,10 +105,10 @@ type frameReader struct {
 // Read when the timeout fires. It may be nil, which disables the time bound and
 // is for callers with no body to close — the byte bound still applies.
 //
-// limit and timeout must be positive; Timeouts and wireLimits guarantee both. A
+// limit and timeout must be positive; Timeouts and WireLimits guarantee both. A
 // non-positive bound is not "unbounded" anywhere in this module, and here it has
 // no sensible meaning at all — it would reject the empty frame.
-func newFrameReader(r io.Reader, limit int, d *diagnostics, timeout time.Duration, interrupt func()) *frameReader {
+func NewFrameReader(r io.Reader, limit int, d *Diagnostics, timeout time.Duration, interrupt func()) *FrameReader {
 	if limit <= 0 {
 		// Mirrors limits.BoundedReader: a bound that cannot bound is a
 		// programmer error at the call site, and failing loudly here beats
@@ -118,12 +118,12 @@ func newFrameReader(r io.Reader, limit int, d *diagnostics, timeout time.Duratio
 	if timeout <= 0 && interrupt != nil {
 		panic("streamablehttp: frame timeout must be positive")
 	}
-	return &frameReader{r: r, limit: limit, diags: d, timeout: timeout, interrupt: interrupt}
+	return &FrameReader{r: r, limit: limit, diags: d, timeout: timeout, interrupt: interrupt}
 }
 
 // arm starts the frame clock, if it is not already running. It is called on the
 // first byte of a frame.
-func (f *frameReader) arm() {
+func (f *FrameReader) arm() {
 	if f.interrupt == nil {
 		return
 	}
@@ -147,7 +147,7 @@ func (f *frameReader) arm() {
 }
 
 // disarm stops the frame clock. It is called at a frame boundary and at close.
-func (f *frameReader) disarm() {
+func (f *FrameReader) disarm() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.timer != nil {
@@ -157,7 +157,7 @@ func (f *frameReader) disarm() {
 }
 
 // isStalled reports whether the frame clock fired.
-func (f *frameReader) isStalled() bool {
+func (f *FrameReader) isStalled() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.stalled
@@ -165,7 +165,7 @@ func (f *frameReader) isStalled() bool {
 
 // close releases the frame clock. A timer left armed on a finished stream is a
 // goroutine and a body close waiting to happen to somebody else's connection.
-func (f *frameReader) close() { f.disarm() }
+func (f *FrameReader) close() { f.disarm() }
 
 // Read passes bytes through, counting them against the current frame's budget
 // and resetting that budget at each frame boundary.
@@ -175,7 +175,7 @@ func (f *frameReader) close() { f.disarm() }
 // That matters for a streaming transport — a reader that buffered a frame to
 // measure it would add the very latency SSE exists to avoid, and would have to
 // hold the frame it is trying not to hold.
-func (f *frameReader) Read(p []byte) (int, error) {
+func (f *FrameReader) Read(p []byte) (int, error) {
 	if f.err != nil {
 		return 0, f.err
 	}
@@ -185,7 +185,7 @@ func (f *frameReader) Read(p []byte) (int, error) {
 		// Report the cause, not the symptom: "use of closed network connection"
 		// describes what this package did, not what the server did.
 		f.err = fmt.Errorf("%w: no frame completed within %v", errFrameStalled, f.timeout)
-		f.diags.recordStallError(f.err)
+		f.diags.RecordStallError(f.err)
 		return 0, f.err
 	}
 	if n > 0 {
@@ -200,7 +200,7 @@ func (f *frameReader) Read(p []byte) (int, error) {
 		if scanErr != nil {
 			f.disarm()
 			f.err = scanErr
-			f.diags.recordLimitError(scanErr)
+			f.diags.RecordLimitError(scanErr)
 			// Only the bytes still within the frame's budget are surfaced; the
 			// rest of this read is dropped on the floor with the stream. The
 			// error lands on the next Read, which is limits.BoundedReader's
@@ -230,7 +230,7 @@ func (f *frameReader) Read(p []byte) (int, error) {
 // the SDK's scanner), so this counts terminators rather than matching a literal:
 // a CR followed by an LF is one terminator, and two in a row with nothing
 // between them is the blank line that ends a frame.
-func (f *frameReader) scan(chunk []byte) (int, error) {
+func (f *FrameReader) scan(chunk []byte) (int, error) {
 	for i := 0; i < len(chunk); i++ {
 		terminator := false
 		switch chunk[i] {
