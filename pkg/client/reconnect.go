@@ -454,7 +454,14 @@ func (c *Client) swapConn(conn protocol.Conn, res protocol.InitializeResult) (pr
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	// Re-check under the lock, against the same lock Close's teardown takes: the
-	// state read above is a moment that has passed.
+	// pre-lock check is a moment that has passed, and Close moves the machine to
+	// Closing before closeConn takes this lock. If the binding closed in that
+	// window, installing conn would hand a live connection to a Client whose
+	// teardown has already run and will never run again — the caller closes what
+	// it could not install.
+	if !c.ownerLive() {
+		return nil, NewError(FailureShutdown, c.def.Name, opReconnect, "the binding is shutting down", nil)
+	}
 	old := c.conn
 	c.conn = conn
 	// A new connection is a new epoch: every request still holding the old one

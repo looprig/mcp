@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/looprig/mcp/internal/lifecycle"
 	"github.com/looprig/mcp/internal/protocol"
 )
 
@@ -611,6 +612,73 @@ func TestReconnectConcurrentLossReportsOnce(t *testing.T) {
 // instructions wide and needs a specific three-goroutine interleaving, so left
 // to chance it reproduced in roughly one full-suite run in ten — which is not a
 // regression test, it is a rumour.
+// TestSwapConnRechecksOwnerUnderLock is Fix #3: swapConn promises an under-lock
+// re-check of the owner's liveness, and this proves that promise is kept rather
+// than only commented.
+//
+// The window it guards is real but a few instructions wide: Close moves the
+// machine to Closing and only later takes c.mu, so a reconnect that passed the
+// pre-lock liveness check can still find the binding closed by the time it holds
+// the lock. Forcing that nanosecond in the wild is not practical, so the window
+// is opened deliberately: the test holds c.mu while a swapConn is parked on it,
+// closes the machine, then releases — so swapConn's pre-lock check provably
+// passed (the machine was live then) and only the under-lock check can catch the
+// close. With the re-check removed, the new connection is installed into a closed
+// binding and this fails.
+func TestSwapConnRechecksOwnerUnderLock(t *testing.T) {
+	t.Parallel()
+
+	c := connectTo(t, okConn(), nil) // reaches StateReady: pre-lock check will pass
+
+	// Hold the lock so a swapConn that clears the pre-lock check parks here.
+	c.mu.Lock()
+
+	newConn := okConn()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.swapConn(newConn, protocol.InitializeResult{})
+		done <- err
+	}()
+
+	// Let swapConn run its pre-lock liveness check — the machine is still Ready,
+	// so it passes — and park on c.mu. This ordering is what makes the test a real
+	// guard on the *under-lock* re-check: the close below happens strictly after
+	// the pre-lock check, so only the under-lock check can catch it. Without this
+	// wait the close could win the pre-lock check and the test would pass even
+	// with the under-lock re-check deleted.
+	time.Sleep(50 * time.Millisecond)
+
+	// Close the machine from another goroutine while swapConn is parked on c.mu.
+	// It must be another goroutine: the machine's watcher takes c.mu, so a
+	// transition on this goroutine (which holds it) would self-deadlock. drain
+	// releases the machine lock before the watcher runs, so State observes the new
+	// state at once even though the watcher itself is blocked on c.mu.
+	go func() { _ = c.machine.To(lifecycle.StateClosing) }()
+
+	// Wait until the close is committed before releasing c.mu, so only swapConn's
+	// under-lock re-check can catch it.
+	waitFor(t, "the machine to reach Closing", func() bool {
+		return c.machine.State() == lifecycle.StateClosing
+	})
+	c.mu.Unlock()
+
+	err := <-done
+	if err == nil {
+		t.Fatal("swapConn installed a connection into a binding that closed under the lock: the re-check is missing")
+	}
+	if class, _ := ClassOf(err); class != FailureShutdown {
+		t.Errorf("swapConn error class = %v, want %v", class, FailureShutdown)
+	}
+
+	// The new connection must not have been installed.
+	c.mu.Lock()
+	installed := c.conn == protocol.Conn(newConn)
+	c.mu.Unlock()
+	if installed {
+		t.Error("the new connection was installed despite the binding closing under the lock")
+	}
+}
+
 func TestLossClaimIsAtomicWithTheSwap(t *testing.T) {
 	t.Parallel()
 
