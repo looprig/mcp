@@ -740,4 +740,3 @@ honnef.co/go/tools/unused
 # github.com/looprig/harness => ../harness
 # github.com/looprig/core => ../core
 # github.com/looprig/inference => ../inference
-# github.com/looprig/storage => ../storage

@@ -79,5 +79,3 @@ replace github.com/looprig/harness => ../harness
 replace github.com/looprig/core => ../core
 
 replace github.com/looprig/inference => ../inference
-
-replace github.com/looprig/storage => ../storage
