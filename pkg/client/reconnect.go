@@ -93,53 +93,50 @@ func (c *Client) noteFailure(epoch uint64, err error) error {
 // connectionLost records a lost connection and asks the reconnect worker for a
 // pass.
 //
-// It is idempotent in effect rather than in fact: several in-flight requests
-// will each report the same disconnection, and they collapse onto one signal
-// (the channel is buffered to one, like the refresher's) and one degraded
-// transition. Reporting the event per observer would tell an application that
-// its connection dropped eight times.
+// One disconnection produces one report, however many requests observe it: a
+// binding with eight calls in flight has lost one connection, not eight, and an
+// application told otherwise would be told something false. The collapsing is
+// done by claimLoss, which admits exactly one caller per connection — so of the
+// eight, one degrades the binding, emits, and signals, and the other seven
+// return here having done nothing at all.
 func (c *Client) connectionLost(epoch uint64, class FailureClass, cause error) {
-	if !c.isCurrentConn(epoch) {
-		// A request that was issued on a connection this binding has already
-		// replaced. Its death is old news — it is the very death that produced
-		// the replacement — and acting on it now would degrade a healthy binding
-		// and dial away a connection nothing is wrong with.
-		return
-	}
-
-	// The ready -> degraded transition is the client's claim on the report. It
-	// is a compare-and-swap in effect: exactly one of the requests that observed
-	// this disconnection wins it (To checks the current state under the
-	// machine's own lock), and that one is the one that tells the application.
+	// One atomic step decides everything: is this report about the connection
+	// the binding is using now, and is it the first report about it?
 	//
-	// Every observer signals, though. The signal is idempotent — the channel is
-	// buffered to one — and a binding that only signalled from the winner would
-	// depend on the winner's goroutine getting there, which is not something to
-	// leave to a scheduler.
-	reporter := false
-	switch c.machine.State() {
-	case lifecycle.StateReady:
-		reporter = c.machine.To(lifecycle.StateDegraded) == nil
-	case lifecycle.StateDegraded:
-		// Already reported by whoever moved the machine; this observer saw the
-		// same disconnection, not a second one.
-	default:
-		// Reconnecting already, or starting, failed, or closing. None of those
-		// wants another signal: the first two are already handling it, and the
-		// rest have no connection to lose.
+	// It has to be one step. Checking the epoch and then transitioning the
+	// machine is two, and the gap between them is long enough to lose a race
+	// that matters: a request descheduled after the check resumes to find that
+	// the reconnect it triggered has already installed a new connection and put
+	// the binding back in service, and then degrades it — which dials away a
+	// working connection, and, if the retries run out, fails a binding whose
+	// connection was never broken. That is not a hypothetical; it is what this
+	// code did, and it surfaced as an intermittent hang under load rather than
+	// as anything that pointed at itself.
+	if !c.claimLoss(epoch) {
 		return
 	}
 
-	if reporter {
-		c.emit(ConnectionLost{
-			Binding:  c.def.Name,
-			Class:    class,
-			Message:  failureMessage(asError(c.def.Name, opReconnect, class, cause)),
-			Adopted:  c.adoptedNumber(),
-			Retrying: !c.def.Reconnect.Disabled,
-			At:       time.Now(),
-		})
+	// The claimer, and only the claimer, moves the machine. This is safe against
+	// the swap without holding a lock across it, because a swap cannot happen
+	// before this point: a reconnect starts only on the signal below, the signal
+	// comes only from a claimer, and there is exactly one claimer per
+	// connection. Every other observer of the same disconnection has already
+	// returned above.
+	//
+	// Best-effort: the binding may be closing, in which case shutdown wins and
+	// there is nothing to reconnect.
+	if err := c.machine.To(lifecycle.StateDegraded); err != nil {
+		return
 	}
+
+	c.emit(ConnectionLost{
+		Binding:  c.def.Name,
+		Class:    class,
+		Message:  failureMessage(asError(c.def.Name, opReconnect, class, cause)),
+		Adopted:  c.adoptedNumber(),
+		Retrying: !c.def.Reconnect.Disabled,
+		At:       time.Now(),
+	})
 
 	if c.def.Reconnect.Disabled {
 		// Policy refuses. The binding stays degraded and keeps serving nothing
@@ -155,12 +152,37 @@ func (c *Client) connectionLost(epoch uint64, class FailureClass, cause error) {
 	}
 }
 
-// isCurrentConn reports whether epoch names the connection the binding is using
-// now.
-func (c *Client) isCurrentConn(epoch uint64) bool {
+// claimLoss reports whether this caller is the one that gets to act on the loss
+// of connection epoch: it must name the binding's current connection, and no
+// other caller must have claimed it already.
+//
+// It is the whole of the concurrency control on the reporting path, and it works
+// because both halves of the question are answered under the one lock that the
+// swap also takes (see swapConn). A request holding a retired epoch cannot claim
+// anything, and of the several requests that observe one disconnection, exactly
+// one leaves here with a claim.
+//
+// The claim is released by the swap, not by the claimer: it is a fact about a
+// connection ("this one's death has been reported"), so it lives exactly as long
+// as the connection does. A binding that never reconnects therefore never
+// reports the same disconnection twice, however many requests fail on it.
+//
+// The lossHook seam fires on arrival, before the claim, and is nil outside tests
+// (see the field). That position is deliberate: a caller suspended there has not
+// claimed anything yet, so a test can hold one reporter without stalling the
+// reconnect that another is driving.
+func (c *Client) claimLoss(epoch uint64) bool {
+	if c.lossHook != nil {
+		c.lossHook()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return epoch == c.connEpoch
+	if epoch != c.connEpoch || c.lossReported {
+		return false
+	}
+	c.lossReported = true
+	return true
 }
 
 // asError renders an arbitrary cause as an *Error of the given class.
@@ -426,8 +448,11 @@ func (c *Client) swapConn(conn protocol.Conn, res protocol.InitializeResult) (pr
 	c.conn = conn
 	// A new connection is a new epoch: every request still holding the old one
 	// is now talking about a connection that has been retired, and its report
-	// of that connection's death must not touch this one.
+	// of that connection's death must not touch this one. The new connection
+	// starts with its own death unreported — the claim belongs to a connection,
+	// not to the binding.
 	c.connEpoch++
+	c.lossReported = false
 	c.server = ServerIdentity{Name: res.Server.Name, Version: res.Server.Version, Title: res.Server.Title}
 	c.protocolVersion = string(res.ProtocolVersion)
 	c.initResult = res

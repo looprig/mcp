@@ -24,6 +24,7 @@
 package catalog
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -382,6 +383,9 @@ func buildTools(binding string, specs []protocol.ToolSpec, tol Tolerances) ([]To
 		if err := validateRawName(FamilyTools, s.RawName); err != nil {
 			return nil, nil, err
 		}
+		if err := checkInputSchema(s); err != nil {
+			return nil, nil, err
+		}
 		if s.OutputSchemaDefect != "" {
 			if !tol.InvalidOutputSchema {
 				return nil, nil, &DefectError{
@@ -436,6 +440,46 @@ func buildTools(binding string, specs []protocol.ToolSpec, tol Tolerances) ([]To
 		applied = append(applied, ToleranceNormalizedDisplayName)
 	}
 	return tools, applied, nil
+}
+
+// checkInputSchema refuses a tool that would reach a model with nothing
+// constraining its arguments.
+//
+// This is defence in depth, and it is deliberate duplication: internal/protocol
+// already rejects a tool whose input schema is missing or not a JSON object, and
+// today Discover is the only thing that fills a Builder, so nothing here is
+// reachable. The reason to keep it is what rests on it. "Never replace an
+// invalid input schema with unconstrained arguments" is the design's first named
+// *unsafe* tolerance, and it is the one invariant in this package whose failure
+// is silent: a tool with no schema is not a broken tool, it is a tool a model may
+// call with anything, and it looks perfectly healthy in a catalog. An invariant
+// that severe should not rest on one layer and a comment about who calls whom —
+// Builder is exported within the module, and the next caller (a test fixture, a
+// replay, a future non-Discover path) inherits the guarantee rather than having
+// to know about it.
+//
+// It checks shape, not content: presence, valid JSON, and a JSON object, which
+// is exactly what "there is a schema constraining these arguments" means here.
+// Validating the schema *document* is a job for whoever validates arguments
+// against it, and duplicating that would be the bad kind of duplication —
+// two validators to disagree with each other.
+func checkInputSchema(s protocol.ToolSpec) error {
+	defect := func(reason string) error {
+		return &DefectError{
+			Family: FamilyTools,
+			Reason: fmt.Sprintf("tool %q %s: a tool without one would reach a model with unconstrained arguments", s.RawName, reason),
+		}
+	}
+	trimmed := bytes.TrimSpace(s.InputSchema)
+	switch {
+	case len(trimmed) == 0:
+		return defect("has no input schema")
+	case trimmed[0] != '{':
+		return defect("has an input schema that is not a JSON object")
+	case !json.Valid(trimmed):
+		return defect("has an input schema that is not valid JSON")
+	}
+	return nil
 }
 
 func buildPrompts(specs []protocol.PromptSpec) ([]protocol.PromptSpec, error) {
@@ -598,13 +642,22 @@ func (g *Generation) Warnings() []string { return slices.Clone(g.warnings) }
 // generation needed, in a deterministic order. It is empty for a server that
 // implements the specification faithfully.
 //
-// It is deliberately not part of the catalog digest. The digest answers "is this
-// the same server offering?", and two hosts with different compatibility
-// profiles looking at one server must agree on the answer — the same reason a
-// ToolFilter is not in it (see the package doc). What a tolerance changed *is*
-// in the digest, through the value it changed: a normalized model name and an
-// absent output schema are both covered. The profile itself belongs to the
-// binding's configuration identity, not to the server's.
+// It is deliberately not part of the catalog digest, for three reasons that
+// point the same way:
+//
+//   - The digest answers "is this the same server offering?", and two hosts with
+//     different compatibility profiles looking at one server must agree on the
+//     answer — the same reason a ToolFilter is not in it (see the package doc).
+//   - The design's configuration manifest lists "capability, filter, limits, and
+//     compatibility policy digests" separately from "adopted catalog digest and
+//     tool schema digests". They are two identity components, not one: the
+//     policy's identity is the profile's own digest (client.Profile.Digest), and
+//     the catalog's is this one.
+//   - Including it could not distinguish anything anyway. What a tolerance
+//     changed is already digested through the value it changed — a normalized
+//     ModelName and an absent OutputSchema are both covered — so "same digest,
+//     different applied tolerances" describes two catalogs that are, tool for
+//     tool and schema for schema, the same catalog.
 func (g *Generation) AppliedTolerances() []Tolerance { return slices.Clone(g.tolerances) }
 
 // Decisions returns a copy of the compatibility decisions discovery made.

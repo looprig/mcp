@@ -252,6 +252,15 @@ const (
 // manifest records so that "this session ran under this compatibility policy" is
 // checkable rather than a claim.
 //
+// Nothing in this module consumes it yet. It is the compatibility half of the
+// design's manifest identity — which lists "compatibility policy digests"
+// separately from the "adopted catalog digest" — and the manifest work is a
+// later stage, so this is the seam waiting for it rather than something already
+// wired. What a binding reports about its profile today is Status.CompatProfile
+// ("name/vN"), which is a label for a human; this is the checkable form. See
+// catalog.Generation.AppliedTolerances for why the two identities are separate
+// and why neither belongs inside the other.
+//
 // It is canonical. The tolerances are sorted and deduplicated first, so two
 // profiles that permit the same things digest the same however they were
 // written; and every value is length-delimited, so no two different profiles can

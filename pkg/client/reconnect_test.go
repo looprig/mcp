@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -588,5 +589,108 @@ func TestReconnectConcurrentLossReportsOnce(t *testing.T) {
 	}
 	if got := tr.dialCount(); got != 2 {
 		t.Errorf("dials = %d, want 2 (startup plus one reconnect)", got)
+	}
+}
+
+// TestLossClaimIsAtomicWithTheSwap drives the interleaving that made this test
+// file's concurrent-loss case hang intermittently under load.
+//
+// The shape is three-way. Two requests fail on one dying connection. The first
+// claims the loss and triggers the reconnect, which installs a new connection
+// and puts the binding back in service. The second is descheduled in between:
+// it observed the death of a connection that, by the time it gets to say so, has
+// already been replaced.
+//
+// The failure it guards against is not "an extra event". It is that the late
+// reporter degrades a binding whose connection is fine, which triggers a
+// reconnect against a server that never disconnected — and when those retries
+// run out, fails a healthy binding outright. It surfaced as a hang: the binding
+// sat in StateFailed and every wait for readiness burned its whole deadline.
+//
+// The lossHook seam is what makes it deterministic. The window is a few
+// instructions wide and needs a specific three-goroutine interleaving, so left
+// to chance it reproduced in roughly one full-suite run in ten — which is not a
+// regression test, it is a rumour.
+func TestLossClaimIsAtomicWithTheSwap(t *testing.T) {
+	t.Parallel()
+
+	first, second := okConn(), okConn()
+	first.callErr = lostConn()
+	tr := newRedialTransport(first, second)
+
+	rec := &eventRecorder{}
+	def := fastReconnect(Definition{Name: "srv", Transport: tr}, 3)
+	def.AllowParallelCalls = true
+	def.Limits.MaxConcurrentRequests = 4
+
+	c, err := Connect(context.Background(), def, Handlers{Event: rec.handle})
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer func() { _ = c.Close(context.Background()) }()
+
+	// A rendezvous, not a race. Both reporters must be inside the window — each
+	// having formed its verdict about the dying connection — before the
+	// reconnect is allowed to start. Otherwise the second call can simply be
+	// issued on the new connection and succeed, and the test proves nothing
+	// while looking like it passed.
+	//
+	// Which goroutine takes which role does not matter: the two calls are
+	// identical, and the first to arrive drives while the second straggles.
+	var hookCount atomic.Int32
+	arrived := make(chan struct{}, 2)
+	bothArrived := make(chan struct{})
+	reconnected := make(chan struct{})
+	c.lossHook = func() {
+		n := hookCount.Add(1)
+		arrived <- struct{}{}
+		if n == 1 {
+			// The driver: held until the straggler has also formed its verdict,
+			// so the straggler's view of the connection is provably the old one.
+			<-bothArrived
+			return
+		}
+		// The straggler: held until the reconnect it knows nothing about has
+		// completely finished.
+		<-reconnected
+	}
+
+	// Two concurrent calls on the dying connection.
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = c.CallTool(context.Background(), "echo", nil, CallOpts{})
+		}()
+	}
+
+	// Both reporters are now inside the window, holding a verdict about the
+	// connection that is about to be replaced.
+	<-arrived
+	<-arrived
+	close(bothArrived)
+
+	// The driver's claim rebuilds the binding: new connection, back in service.
+	waitFor(t, "the reconnect", func() bool {
+		return c.Status().State == StateReady && tr.dialCount() == 2
+	})
+	// Only now does the straggler get to act on what it saw.
+	close(reconnected)
+	wg.Wait()
+	time.Sleep(50 * time.Millisecond)
+
+	// The late report must have changed nothing at all.
+	if got := c.Status().State; got != StateReady {
+		t.Errorf("State = %v, want %v: a report about a replaced connection degraded a healthy binding", got, StateReady)
+	}
+	if got := tr.dialCount(); got != 2 {
+		t.Errorf("dials = %d, want 2: a report about a replaced connection dialed away a working connection", got)
+	}
+	if got := len(eventsOf[ConnectionLost](rec)); got != 1 {
+		t.Errorf("ConnectionLost events = %d for one disconnection, want 1", got)
+	}
+	if st := c.Status(); st.ReconnectAttempt != 0 {
+		t.Errorf("Status().ReconnectAttempt = %d, want 0: the binding is not reconnecting", st.ReconnectAttempt)
 	}
 }

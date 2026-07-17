@@ -88,6 +88,16 @@ type Client struct {
 
 	// closeOnce guards the whole shutdown sequence, making Close idempotent.
 	closeOnce sync.Once
+	// lossHook, when non-nil, runs at the head of claimLoss, before the claim.
+	// It is a test seam and nothing sets it in production.
+	//
+	// It exists because the race it exposes is otherwise untestable: the window
+	// it stands in is a few instructions wide, it needs a specific interleaving
+	// of three goroutines to matter, and the bug it guards against showed up in
+	// roughly one full-suite run in ten — as an unexplained hang, not as
+	// anything that named itself. A guard whose regression test relies on that
+	// happening again is not a guard. See TestLossClaimIsAtomicWithTheSwap.
+	lossHook func()
 	// caps are the client capabilities settled at Connect. A reconnect
 	// re-advertises exactly these: what the host can serve is a property of the
 	// host, so it must not drift across a reconnection.
@@ -136,6 +146,10 @@ type Client struct {
 	// reconnectAttempt is the reconnect attempt currently in flight, or 0 when
 	// the binding is not reconnecting.
 	reconnectAttempt int
+	// lossReported records that the current connection's death has already been
+	// claimed by one request, so the others that observe it stay quiet. It is
+	// cleared by the swap that installs a new connection. See claimLoss.
+	lossReported bool
 }
 
 // Connect establishes a binding: it validates def, opens a transport, performs
@@ -457,7 +471,10 @@ func (c *Client) fail(ctx context.Context, op string, err error, fallback Failur
 // the close there would be the worst version of the bug: the conn is
 // established, Connect returns nil, and nothing else holds a reference to it.
 // The transport is therefore closed regardless of what the machine says, and
-// closing it twice is impossible (connOnce), so racing Close is harmless.
+// closing it twice is impossible — closeConn takes the conn out of the Client
+// under the lock, so whoever takes it is the only one who closes it and a racing
+// Close finds nothing left to do. See closeConn for why that is ownership rather
+// than a sync.Once.
 func (c *Client) unwind(ctx context.Context, out *Error) error {
 	c.recordFailure(out)
 	// A refused transition means shutdown is already running. Either way the

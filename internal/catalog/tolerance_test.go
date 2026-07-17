@@ -1,6 +1,7 @@
 package catalog_test
 
 import (
+	"encoding/json"
 	"errors"
 	"slices"
 	"strings"
@@ -231,4 +232,64 @@ func hasWarning(warnings []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// TestInputSchemaIsRequired covers the invariant the design names first among
+// the unsafe tolerances: an invalid input schema is never replaced with
+// unconstrained arguments.
+//
+// internal/protocol enforces this too, and today Discover is the only thing that
+// fills a Builder, so this layer's check is unreachable in production. It is
+// tested anyway because it is the invariant whose failure is silent — a tool
+// with no schema is not a broken tool, it is a tool a model may call with
+// anything, and it looks healthy in a catalog. A guard that only exists for the
+// day someone adds a second caller is worth exactly as much as the test that
+// proves it works.
+func TestInputSchemaIsRequired(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		schema json.RawMessage
+	}{
+		{"absent", nil},
+		{"empty", json.RawMessage("")},
+		{"whitespace only", json.RawMessage("   ")},
+		{"a JSON null", json.RawMessage("null")},
+		{"a JSON array", json.RawMessage(`["type"]`)},
+		{"a bare string", json.RawMessage(`"object"`)},
+		{"malformed JSON that starts like an object", json.RawMessage(`{"type":`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			spec := protocol.ToolSpec{RawName: "search", InputSchema: tt.schema}
+			// Permissive: no compatibility profile may buy a tool its way out of
+			// having an input schema. That is the whole point of the invariant —
+			// it is not a tolerance, so there is nothing to permit.
+			_, err := catalog.Builder{
+				Binding:    "b",
+				Tools:      []protocol.ToolSpec{spec},
+				Tolerances: permissive,
+			}.Build()
+			if err == nil {
+				t.Fatalf("Build() error = nil for a tool whose input schema is %s: a model could call it with anything", tt.name)
+			}
+			var defect *catalog.DefectError
+			if !errors.As(err, &defect) {
+				t.Errorf("Build() error = %v (%T), want a *catalog.DefectError", err, err)
+			}
+		})
+	}
+
+	// The control: a well-formed schema builds, so the guard rejects the defect
+	// and not the family.
+	if _, err := (catalog.Builder{
+		Binding:    "b",
+		Tools:      []protocol.ToolSpec{toolSpec("search")},
+		Tolerances: permissive,
+	}).Build(); err != nil {
+		t.Errorf("Build() error = %v for a tool with a valid input schema", err)
+	}
 }

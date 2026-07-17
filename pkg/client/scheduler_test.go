@@ -396,4 +396,14 @@ func TestSchedulerAdmissionCountsAgainstTheCallDeadline(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("the queued call took %v to give up, want it bounded by its deadline", elapsed)
 	}
+
+	// The load-bearing assertion, and without it this test is vacuous: the
+	// deadline class alone cannot tell "the scheduler never admitted it" from
+	// "it was admitted and then expired inside a conn that is blocking anyway",
+	// so a client with no scheduler at all — or one leaking slots — passes on
+	// the class check. Where the call *stopped* is what distinguishes them, and
+	// a call refused at admission never reaches the server.
+	if got := conn.callNames(); len(got) != 1 {
+		t.Errorf("calls that reached the server = %d (%v), want 1: the queued call was admitted past the binding's budget rather than waiting for it", len(got), got)
+	}
 }

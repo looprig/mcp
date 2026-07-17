@@ -210,6 +210,58 @@ func (ConnectionRestored) event() {}
 func (ServerLog) event()          {}
 func (RequestProgress) event()    {}
 
+// # Auth state and elicitation: deferred, and why
+//
+// The design's event set also lists auth state and the elicitation lifecycle.
+// Neither is here, and the reasons are different from each other.
+//
+// Elicitation has no producer. Handlers.Elicitation is declared, but nothing
+// calls it: internal/protocol's session registers the SDK's progress and logging
+// handlers and no elicitation handler, so no server request ever reaches this
+// module. An event for it would be unemittable.
+//
+// Auth state has a producer and no seam. This is worth stating precisely,
+// because the obvious reading — "nothing authenticates yet" — is false and would
+// send whoever picks this up looking in the wrong place:
+//
+//   - pkg/auth models the posture fully and tracks it live: auth.Status,
+//     auth.State (anonymous/required/authenticated/expired/denied/failed), and
+//     OAuthProvider.Status(), which reports what the last completed flow
+//     established without blocking or performing I/O.
+//   - pkg/transport/streamablehttp authenticates for real: Config.Auth is an
+//     auth.HeaderProvider consulted per request, and its diagnostics record the
+//     first auth failure (see recordAuthError/authError), which already reaches
+//     callers as a classified FailureAuth* error.
+//
+// What is missing is the wire between them, and it is more than a field:
+//
+//   - protocol.ConnectConfig has OnLog and OnListChanged but no OnAuth. Adding
+//     one means either importing pkg/auth into internal/protocol — inverting the
+//     module's layering, since protocol is the SDK boundary and today depends on
+//     nothing above it — or mirroring auth.State into a neutral enum here, the
+//     way client.State mirrors lifecycle.State.
+//   - a transport holds an auth.HeaderProvider, whose only method is Headers.
+//     It cannot observe a posture through that interface: reaching Status()
+//     needs an optional-interface assertion, which is a new cross-package
+//     contract rather than a wiring detail.
+//   - auth.Status is a snapshot, not a stream, so *when* to read it is a policy
+//     decision — realistically after each Headers call, in a transport's
+//     per-request path, with change detection so that a steady state does not
+//     emit an event per request.
+//   - lifecycle.StateAuthenticating is declared and never entered in production
+//     as a direct consequence: Connect goes starting -> discovering, because
+//     nothing tells it that this binding's transport authenticates at all. That
+//     needs its own seam (the client must know before it dials, not after).
+//
+// So the work is a protocol contract, a transport contract, an observation
+// policy, and a lifecycle seam — across three packages, two of them outside this
+// phase. It is deferred deliberately rather than approximated: an
+// AuthStateChanged that only ever fired on failure would be a worse contract
+// than none, and inferring "authenticated" from "the server did not refuse us"
+// would put this module's guess where pkg/auth deliberately reports a fact (see
+// StatusOf: the states that are not derivable are built by the flow that learns
+// them).
+
 func (CatalogStale) event()     {}
 func (CatalogCandidate) event() {}
 func (CatalogRefreshed) event() {}
