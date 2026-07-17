@@ -83,6 +83,13 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 	caps.Elicitation = servesElicit
 	servesSample := caps.Sampling && s.cfg.OnSample != nil
 	caps.Sampling = servesSample
+	// Roots is gated on its provider for exactly the reason elicitation and
+	// sampling are: a capability is only honorable when the application both
+	// asked for it and installed something that can answer it. A nil OnRoots
+	// with Capabilities.Roots set would otherwise advertise roots the SDK could
+	// only answer empty — advertise-without-honor.
+	servesRoots := caps.Roots && s.cfg.OnRoots != nil
+	caps.Roots = servesRoots
 
 	opts := &mcp.ClientOptions{
 		// Explicit, always: a nil Capabilities makes the SDK advertise roots
@@ -163,6 +170,18 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 		Title:   s.cfg.Client.Title,
 	}, opts)
 
+	// Roots are the one client-side capability the SDK answers from a set the
+	// client supplies, rather than by dispatching to a handler: its listRoots
+	// returns whatever AddRoots installed. So the provider is consulted once
+	// here, before the handshake, and its roots are what a server sees when it
+	// calls roots/list. Consulted only when servesRoots — a provider must not be
+	// called for a capability that will not be advertised.
+	if servesRoots {
+		if err := s.installRoots(ctx, client); err != nil {
+			return InitializeResult{}, err
+		}
+	}
+
 	cs, err := client.Connect(ctx, s.transport, nil)
 	if err != nil {
 		return InitializeResult{}, fmt.Errorf("mcp handshake: %w", err)
@@ -234,6 +253,33 @@ func (s *Session) established() (*mcp.ClientSession, error) {
 		return nil, errNotInitialized
 	}
 	return s.cs, nil
+}
+
+// installRoots consults the config's roots provider and installs the result on
+// the SDK client, so a server calling roots/list receives exactly those roots.
+//
+// It bounds what a provider hands over: a root with no URI has no identity and
+// is dropped, and no more than MaxRoots are installed. The provider's roots are
+// the only ones a server ever learns — nothing here manufactures a host
+// filesystem root. A provider error fails the handshake rather than proceeding
+// to advertise roots that cannot be answered.
+func (s *Session) installRoots(ctx context.Context, client *mcp.Client) error {
+	roots, err := s.cfg.OnRoots(ctx)
+	if err != nil {
+		return fmt.Errorf("roots provider: %w", err)
+	}
+	sdkRoots := make([]*mcp.Root, 0, len(roots))
+	for _, r := range roots {
+		if r.URI == "" {
+			continue
+		}
+		if len(sdkRoots) >= MaxRoots {
+			break
+		}
+		sdkRoots = append(sdkRoots, &mcp.Root{URI: r.URI, Name: r.Name})
+	}
+	client.AddRoots(sdkRoots...)
+	return nil
 }
 
 // sdkClientCapabilities maps the neutral capability flags onto the SDK's

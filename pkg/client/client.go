@@ -69,6 +69,10 @@ type Client struct {
 	// construction and read-only afterwards. Nil means this binding serves no
 	// sampling and advertises no such capability. See Client.sampleAdapter.
 	samplingHandler SamplingHandler
+	// rootsProvider is the application's roots provider, captured at
+	// construction and read-only afterwards. Nil means this binding exposes no
+	// roots and advertises no such capability. See Client.rootsAdapter.
+	rootsProvider RootsProvider
 	// samples bounds the sampling this binding will serve: how much at once, and
 	// how deep. It is created with the Client and immutable afterwards (it does
 	// its own locking).
@@ -214,6 +218,7 @@ func newClient(def Definition, h Handlers) *Client {
 		stale:         make(map[catalog.Family]struct{}),
 
 		samplingHandler: h.Sampling,
+		rootsProvider:   h.Roots,
 		samples:         newSampleGate(def.Limits.MaxSamplingDepth, def.Limits.MaxSamplingConcurrency),
 		sched: sched.New(sched.Config{
 			MaxConcurrent: def.Limits.MaxConcurrentRequests,
@@ -260,6 +265,7 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 		OnListChanged: c.onListChanged,
 		OnElicit:      c.elicitAdapter(),
 		OnSample:      c.sampleAdapter(),
+		OnRoots:       c.rootsAdapter(),
 	})
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)

@@ -145,7 +145,35 @@ type ConnectConfig struct {
 	// host is always entitled to do — sampling spends the host's money, and
 	// "no" is a complete answer.
 	OnSample func(context.Context, SampleRequest) (SampleResult, error)
+
+	// OnRoots supplies the filesystem roots this client exposes to the server.
+	// Nil means no roots are served — and, because a capability with nothing
+	// behind it must never reach the wire, nil also means the roots capability
+	// is not advertised however Capabilities is set (see Session.Initialize).
+	//
+	// Unlike the other callbacks it is not a server request handler: the SDK
+	// answers roots/list from a set the client supplies, so this is consulted
+	// once, at Initialize, to populate that set. The roots it returns are the
+	// only ones a server ever learns — this module never invents host
+	// filesystem roots of its own. Returning an error fails the handshake:
+	// establishing a binding that advertises roots it cannot determine would be
+	// advertise-without-honor, the very thing the gating exists to prevent.
+	OnRoots func(context.Context) ([]Root, error)
 }
+
+// Root is a filesystem root a client exposes to a server, neutral and bounded.
+// Exposing one grants a server knowledge of a path, never access to it. URI is
+// the root's canonical identity (a file:// URI); Name is an optional display
+// name.
+type Root struct {
+	URI  string
+	Name string
+}
+
+// MaxRoots caps how many roots one client will advertise, so a misbehaving
+// provider cannot hand an unbounded set to the SDK. A root without a URI has no
+// identity and is dropped rather than sent; the cap bounds what remains.
+const MaxRoots = 64
 
 // ListFamily names the catalog family a list-change notification refers to. It
 // is this package's own enum rather than internal/catalog's Family because

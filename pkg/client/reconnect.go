@@ -317,6 +317,8 @@ func (c *Client) reconnectOnce(ctx context.Context) error {
 		// capability (c.caps is re-advertised verbatim) with nothing behind it.
 		OnElicit: c.elicitAdapter(),
 		OnSample: c.sampleAdapter(),
+		// And its roots: a reconnected server must learn the same workspace view.
+		OnRoots: c.rootsAdapter(),
 	})
 	if err != nil {
 		return c.classify(dialCtx, opReconnect, err, FailureTransportClosed)
