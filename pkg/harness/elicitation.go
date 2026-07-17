@@ -604,8 +604,16 @@ func (e *elicitor) translateURL(req client.ElicitRequest) (*translation, error) 
 				RequiresCompletion: req.ElicitationID != "",
 			},
 			Prompt: gate.Prompt{
-				Title:    title,
-				Body:     body,
+				Title: title,
+				Body:  body,
+				// The origin travels as a field, not only as prose. It is what
+				// the human's trust decision is made on, and gate.ValidateGate
+				// REQUIRES a bare one here so a renderer can display it AS a
+				// validated origin rather than parsing it back out of Body.
+				// This is the same value bareOrigin already validated for the
+				// durable DisplayOrigin — one origin, one check, two places
+				// that need it.
+				Origin:   origin,
 				Controls: elicitControls(),
 			},
 			// Never restorable. gate.ValidateGate REFUSES a restorable open-url

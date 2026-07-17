@@ -861,8 +861,17 @@ func TestURLElicitationKeepsTheURLOutOfDurableRecords(t *testing.T) {
 	if req.Restorable {
 		t.Error("Restorable = true; an open-url gate can never be restored")
 	}
-	if err := gate.ValidateGate(gate.Gate{Kind: req.Kind, Restorable: req.Restorable}); err != nil {
+	// The whole envelope is validated, not a reconstruction of two fields of it:
+	// ValidateGate also requires the Prompt carry a bare origin, and a check
+	// that omitted the Prompt would pass while the adapter shipped a gate no
+	// renderer could trust.
+	if err := gate.ValidateGate(gate.Gate{Kind: req.Kind, Prompt: req.Prompt, Restorable: req.Restorable}); err != nil {
 		t.Errorf("the gate this adapter builds is one ValidateGate refuses: %v", err)
+	}
+	// The origin reaches the renderer structurally. Prose in Body is a
+	// convention; this field is the contract.
+	if req.Prompt.Origin != "https://idp.example.com" {
+		t.Errorf("Prompt.Origin = %q, want the validated bare origin", req.Prompt.Origin)
 	}
 
 	payload, ok := req.Payload.(gate.OpenURLPayload)
