@@ -96,6 +96,56 @@ func TestRealServerElicitsAHuman(t *testing.T) {
 	}
 }
 
+// TestRealServerElicitsAURL is the url-mode twin of TestRealServerElicitsAHuman,
+// and the reason the advertisement names its modes. A server may only send a url
+// elicitation to a client whose capability carries `url` — the check has no
+// "assume it works" fallback, unlike form's. So this test is a direct probe of
+// what sdkClientCapabilities put on the wire at initialize.
+//
+// Non-vacuity: advertise a bare &mcp.ElicitationCapabilities{} (the old code) and
+// the server refuses before the handler is ever consulted — the tool comes back
+// IsError with `client does not support "url" elicitation`, and this fails at the
+// IsError check. Note the failure arrives as a tool *result*, not a transport
+// error, which is exactly why the gap survived: a test that only asserted
+// CallTool's error would pass against the broken advertisement.
+func TestRealServerElicitsAURL(t *testing.T) {
+	t.Parallel()
+
+	const actionURL = "https://example.invalid/authorize?token=abc"
+
+	h := &scriptedElicitor{res: client.ElicitResult{Action: client.ElicitAccept}}
+	c := fixtureClient(t, client.Handlers{Elicitation: h}, func(d *client.Definition) {
+		d.Capabilities.Elicitation = true
+	}, "-elicit")
+
+	res, err := c.CallTool(testCtx(t), mcptest.ToolElicit,
+		json.RawMessage(`{"mode":"url","url":"`+actionURL+`"}`), client.CallOpts{})
+	if err != nil {
+		t.Fatalf("CallTool(%q) error = %v", mcptest.ToolElicit, err)
+	}
+	if res.IsError {
+		t.Fatalf("the server could not elicit a url: %s", resultText(t, res))
+	}
+	if got, want := resultText(t, res), mcptest.ElicitAnswerPrefix+"accept"; got != want {
+		t.Errorf("the tool reported %q, want %q", got, want)
+	}
+
+	reqs := h.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("the handler was called %d times, want 1", len(reqs))
+	}
+	if reqs[0].Mode != client.ElicitModeURL {
+		t.Errorf("ElicitRequest.Mode = %v, want url", reqs[0].Mode)
+	}
+	if reqs[0].URL != actionURL {
+		t.Errorf("ElicitRequest.URL = %q, want the server's %q", reqs[0].URL, actionURL)
+	}
+	// A url elicitation carries no form: the human goes and does the thing.
+	if len(reqs[0].Schema) != 0 {
+		t.Errorf("a url elicitation carried a schema: %s", reqs[0].Schema)
+	}
+}
+
 // TestRealServerElicitationDecline: a decline is a person's answer and reaches
 // the server as one, rather than as a failure.
 func TestRealServerElicitationDecline(t *testing.T) {

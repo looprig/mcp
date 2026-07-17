@@ -229,7 +229,26 @@ func sdkClientCapabilities(c ClientCapabilities) *mcp.ClientCapabilities {
 		caps.Sampling = &mcp.SamplingCapabilities{}
 	}
 	if c.Elicitation {
-		caps.Elicitation = &mcp.ElicitationCapabilities{}
+		// Both modes, explicitly. Setting Elicitation non-nil suppresses the SDK's
+		// own inference (client.go guards it with `if caps.Elicitation == nil`), so
+		// whatever is written here is the whole advertisement — the SDK will not
+		// fill in the gaps.
+		//
+		// Form is named rather than left to the empty-struct default. A bare {} is
+		// only form-capable via the spec's "if neither is set, assume Form"
+		// back-compat rule; saying it outright is what we mean and does not lean on
+		// a fallback. URL must be named because nothing infers it: the SDK never
+		// sets URL under any protocol version, and a server checks `caps.URL != nil`
+		// with no fallback — so a bare {} makes url-mode elicitation unreachable.
+		//
+		// Advertising both is honest because ElicitationHandler is one mode-complete
+		// interface: a single Elicit(ctx, ElicitRequest) whose Mode field is always
+		// a declared mode. A handler that cannot service a mode declines that
+		// request at runtime (the modeled outcome); it is not a narrower capability.
+		caps.Elicitation = &mcp.ElicitationCapabilities{
+			Form: &mcp.FormElicitationCapabilities{},
+			URL:  &mcp.URLElicitationCapabilities{},
+		}
 	}
 	return caps
 }
