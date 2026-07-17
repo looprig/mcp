@@ -347,7 +347,28 @@ func (c *Client) serving(op string) (protocol.Conn, uint64, error) {
 // spent it waiting on the server. It also keeps the deadline computed exactly
 // once, before the send, with nothing after that point able to move it.
 func (c *Client) admit(ctx, callCtx context.Context, op string, class sched.Class) (context.Context, func(), error) {
-	reqCtx, release, err := c.sched.Begin(callCtx, class)
+	// A request issued from inside a sampling handler is re-entrant, and a
+	// re-entrant tool call must not queue behind the tool-call serializer.
+	//
+	// The chain is: a tool call is in flight, holding the ClassCall permit; the
+	// server it called asks for sampling while it waits; the host's handler calls
+	// back into this client to make another tool call. That inner call cannot get
+	// the ClassCall permit — the outer call it descends from is still holding it,
+	// and will not release it until the sampling round-trip the inner call is part
+	// of returns. Queueing the inner call behind that permit is a deadlock that
+	// only the request deadline breaks. So a re-entrant tool call is admitted
+	// without the serializer, bounded instead by the sampling depth and
+	// concurrency caps that already govern the chain (see sampleGate) and still
+	// counted against the connection's concurrency budget. Non-re-entrant calls
+	// are unaffected: they serialize exactly as before, which is the default
+	// posture other tests assert.
+	depth := sampleDepthOf(ctx)
+	admitClass := class
+	if depth > 0 && class == sched.ClassCall {
+		admitClass = sched.ClassReentrantCall
+	}
+
+	reqCtx, release, err := c.sched.Begin(callCtx, admitClass)
 	if err == nil {
 		// A request issued from inside a sampling handler is the one causal link
 		// in a sampling chain this module can see: it is why the server has work
@@ -355,8 +376,8 @@ func (c *Client) admit(ctx, callCtx context.Context, op string, class sched.Clas
 		// registered for exactly as long as it is outstanding, so that a sampling
 		// request arriving meanwhile is attributed to it rather than treated as a
 		// fresh one. See sampleGate.
-		if d := sampleDepthOf(ctx); d > 0 {
-			leave := c.samples.enterChain(d)
+		if depth > 0 {
+			leave := c.samples.enterChain(depth)
 			return reqCtx, func() { leave(); release() }, nil
 		}
 		return reqCtx, release, nil

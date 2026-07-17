@@ -90,6 +90,13 @@ type fakeConn struct {
 	// sampling depth tests need, since the thing they assert on is what happens
 	// *while* a call issued from a sampling handler is outstanding.
 	callEntered chan struct{}
+	// onCallTool, when non-nil, runs inside CallTool with the call's context and
+	// its 1-based index, while the call is conceptually in flight. It is how a
+	// test makes a server sample *during* a tools/call: the outer call is holding
+	// the tool-call permit at this point, so a sampling handler that calls back in
+	// is the reentrancy the scheduler must not deadlock on. See the connectCfg
+	// field for how it reaches the installed OnSample callback.
+	onCallTool func(ctx context.Context, index int)
 	// callReleased, when non-nil, blocks CallTool until it is closed: every
 	// call, or just one of them when holdCall names it.
 	callReleased chan struct{}
@@ -233,6 +240,10 @@ func (c *fakeConn) CallTool(ctx context.Context, rawName string, _ json.RawMessa
 	c.calls = append(c.calls, rawName)
 	index := len(c.calls)
 	c.mu.Unlock()
+
+	if c.onCallTool != nil {
+		c.onCallTool(ctx, index)
+	}
 
 	live := c.live.Add(1)
 	defer c.live.Add(-1)
@@ -388,6 +399,13 @@ func (t *fakeTransport) Connect(ctx context.Context, cfg protocol.ConnectConfig)
 	// reported success with no connection" bugs, which a bare `conn == nil`
 	// check misses and which then panics inside Connect on the caller's
 	// goroutine.
+	if t.conn != nil {
+		// The conn keeps the config it was dialed with, so a fake that must reach
+		// a callback the client installed (e.g. OnSample, to simulate a server
+		// sampling mid-call) can find it. Set before the conn is returned and read
+		// only from CallTool, which cannot run until Connect has returned.
+		t.conn.connectCfg = cfg
+	}
 	return t.conn, nil
 }
 

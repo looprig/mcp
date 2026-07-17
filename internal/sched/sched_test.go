@@ -102,6 +102,76 @@ func TestToolCallsSerializedByDefault(t *testing.T) {
 	}
 }
 
+// TestReentrantCallBypassesTheSerializer is Fix #6 at the scheduler level: a
+// re-entrant tool call must not queue behind the ClassCall permit an outer call
+// is holding — that is the deadlock a sampling handler falls into when it calls
+// back into the client — while an ordinary tool call must still serialize.
+func TestReentrantCallBypassesTheSerializer(t *testing.T) {
+	t.Parallel()
+
+	// AllowParallel false, so callLock is a real cap-1 serializer; a generous
+	// budget so the concurrency bound is never what admits or blocks anything.
+	s := New(Config{MaxConcurrent: 8})
+
+	// The outer tool call holds the serializer, as it would while a server it
+	// called is asking the host for sampling.
+	_, releaseOuter := begin(t, s, ClassCall)
+	defer releaseOuter()
+
+	// A re-entrant call admits at once despite the held permit.
+	admitted := make(chan struct{})
+	go func() {
+		ctx, release, err := s.Begin(context.Background(), ClassReentrantCall)
+		if err != nil || ctx == nil {
+			return // leaves admitted unclosed → the test fails on timeout
+		}
+		defer release()
+		close(admitted)
+	}()
+	select {
+	case <-admitted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a re-entrant call queued behind the ClassCall permit: the self-deadlock Fix #6 removes")
+	}
+
+	// An ordinary tool call still serializes: it must NOT be admitted while the
+	// outer call holds the permit. This is the regression guard the fix must not
+	// trip — re-entrancy is the exception, not a general widening.
+	blocked := make(chan struct{})
+	go func() {
+		ctx, release, err := s.Begin(context.Background(), ClassCall)
+		if err != nil || ctx == nil {
+			return
+		}
+		defer release()
+		close(blocked)
+	}()
+	select {
+	case <-blocked:
+		t.Fatal("an ordinary tool call was admitted while another held the permit: serialization regressed")
+	case <-time.After(100 * time.Millisecond):
+		// Correct: still serialized behind the outer call.
+	}
+}
+
+// TestReentrantCallCountsAgainstTheBudget: bypassing the serializer is not
+// bypassing the bound. A re-entrant call still consumes a concurrency slot, so a
+// budget of one that is already spent blocks it.
+func TestReentrantCallCountsAgainstTheBudget(t *testing.T) {
+	t.Parallel()
+
+	s := New(Config{MaxConcurrent: 1})
+
+	_, release := begin(t, s, ClassRequest) // spends the only slot
+	defer release()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if _, _, err := s.Begin(ctx, ClassReentrantCall); err == nil {
+		t.Fatal("a re-entrant call was admitted past a spent budget: the bound must still apply")
+	}
+}
+
 // TestAllowParallelCalls: the opt-in is real, and it is bounded by the budget
 // rather than unlimited.
 func TestAllowParallelCalls(t *testing.T) {
@@ -499,9 +569,10 @@ func TestClassStringsAreExhaustive(t *testing.T) {
 	t.Parallel()
 
 	want := map[Class]string{
-		ClassCall:    "call",
-		ClassRequest: "request",
-		ClassControl: "control",
+		ClassCall:          "call",
+		ClassRequest:       "request",
+		ClassControl:       "control",
+		ClassReentrantCall: "reentrant_call",
 	}
 	for c := ClassCall; c < classSentinel; c++ {
 		if got := c.String(); got != want[c] {

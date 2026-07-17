@@ -66,15 +66,29 @@ const (
 	// ClassControl is an operation whose state transitions require ordering:
 	// lifecycle, auth, catalog refresh. Control operations run one at a time.
 	ClassControl
+	// ClassReentrantCall is a tool call issued from within a sampling handler,
+	// while the tool call that provoked the sampling is still in flight and still
+	// holding the ClassCall permit. It is a call — it may have effects — but it
+	// must NOT take that permit: the outer call it descends from holds it and will
+	// not release it until the sampling round-trip this call is part of returns,
+	// so queueing behind it is a self-deadlock that only the deadline breaks.
+	//
+	// It is therefore admitted without the tool-call serializer, and bounded
+	// instead by the sampling depth and concurrency caps that already govern the
+	// chain (the client's sampleGate). It still counts against the concurrency
+	// budget like every other in-flight request: raising a serialization
+	// constraint is not the same as removing a budget.
+	ClassReentrantCall
 
 	classSentinel // must remain last; tests derive the declared range from it
 )
 
 // classNames maps each class to its stable lowercase identifier.
 var classNames = [classSentinel]string{
-	ClassCall:    "call",
-	ClassRequest: "request",
-	ClassControl: "control",
+	ClassCall:          "call",
+	ClassRequest:       "request",
+	ClassControl:       "control",
+	ClassReentrantCall: "reentrant_call",
 }
 
 // String returns the class's stable identifier, or "unknown".
@@ -237,6 +251,11 @@ func (s *Scheduler) lockFor(class Class) chan struct{} {
 		return s.callLock
 	case ClassControl:
 		return s.controlLock
+	case ClassReentrantCall:
+		// No serialization lock, deliberately: a re-entrant call must not queue
+		// behind the ClassCall permit its outer call is still holding. Its bound
+		// is the concurrency budget alone, plus the sampling caps upstream.
+		return nil
 	default:
 		return nil
 	}

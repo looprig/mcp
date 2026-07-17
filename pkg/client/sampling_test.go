@@ -439,6 +439,77 @@ func TestSamplingDepthIgnoresUnchainedCalls(t *testing.T) {
 	<-callDone
 }
 
+// TestNestedSamplingDoesNotDeadlock is Fix #6: a server that samples during a
+// tools/call, whose handler calls back into the same client, must not deadlock
+// on the tool-call serializer the outer call is holding.
+//
+// The shape is the probe's: AllowParallelCalls is off (the default, cap-1
+// serializer), the outer tool call holds the permit, and the sampling handler
+// it provokes makes a re-entrant tool call. Before the fix that inner call
+// queued behind the permit its own outer call held and died on the deadline;
+// after it, the re-entrant call is admitted without the serializer and
+// completes at once.
+func TestNestedSamplingDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+
+	conn := okConn()
+
+	var c *Client
+	var nestedErr error
+	var nestedOnce sync.Once
+	h := &recordingSampler{
+		res: SampleResult{Model: "test-model"},
+		onSample: func(ctx context.Context) {
+			// The host, from inside its sampling handler, makes another tool call
+			// on the same client — the reentrancy that used to self-deadlock. It
+			// must pass ctx on, which is what carries the sampling depth that marks
+			// the call re-entrant.
+			nestedOnce.Do(func() {
+				_, nestedErr = c.CallTool(ctx, "echo", nil, CallOpts{})
+			})
+		},
+	}
+
+	var tr *fakeTransport
+	c, tr, _ = samplingClientWithConn(t, h, conn, func(d *Definition) {
+		// Serialized tool calls — the default and the whole precondition for the
+		// deadlock. A finite request deadline so a regression fails fast, as a
+		// timeout, rather than hanging the suite.
+		d.AllowParallelCalls = false
+		d.Timeouts.Request = 700 * time.Millisecond
+		d.Limits.MaxSamplingDepth = 4
+		d.Limits.MaxSamplingConcurrency = 4
+	})
+
+	onSample := tr.lastConfig().OnSample
+	// The server samples while the outer tool call (index 1) is in flight and
+	// holding the serializer.
+	conn.onCallTool = func(ctx context.Context, index int) {
+		if index == 1 {
+			_, _ = onSample(ctx, sampleReq())
+		}
+	}
+
+	start := time.Now()
+	res, err := c.CallTool(context.Background(), "echo", nil, CallOpts{})
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("outer CallTool() error = %v, want it to complete", err)
+	}
+	if res.IsError {
+		t.Error("outer CallTool() returned a tool error, want success")
+	}
+	if nestedErr != nil {
+		t.Errorf("nested CallTool() error = %v, want it to complete rather than deadlock on the serializer", nestedErr)
+	}
+	// A deadlocked reentrant call only unblocks when its deadline fires (~700ms);
+	// a working one returns in microseconds. The threshold is well clear of both.
+	if elapsed > 400*time.Millisecond {
+		t.Errorf("the exchange took %v, near the request deadline: the reentrant call is deadlocking", elapsed)
+	}
+}
+
 // TestSamplingGate covers the gate's arithmetic directly, including the
 // boundaries a client-level test cannot easily sit on.
 func TestSamplingGate(t *testing.T) {
