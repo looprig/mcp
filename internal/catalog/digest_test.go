@@ -21,8 +21,12 @@ import (
 // is not already the zero the mutation might collide with.
 func richBuilder() catalog.Builder {
 	return catalog.Builder{
-		Binding:         "github",
-		Number:          4,
+		Binding: "github",
+		Number:  4,
+		// The default profile's policy: the sweep mutates raw names into shapes
+		// that need normalizing, and under a strict policy Build would reject
+		// them rather than digest them.
+		Tolerances:      catalog.Tolerances{InvalidOutputSchema: true, NormalizeDisplayNames: true},
 		ProtocolVersion: "2025-06-18",
 		Capabilities: protocol.ServerCapabilities{
 			Tools:              true,
@@ -160,6 +164,14 @@ func TestDigestIgnoresNonContent(t *testing.T) {
 		{"compatibility decisions", func(b *catalog.Builder) {
 			b.Decisions = []catalog.Decision{{Family: catalog.FamilyPrompts, Action: catalog.ActionSkippedNotAdvertised}}
 		}},
+		// Host policy, like a ToolFilter: two hosts with different
+		// compatibility profiles must agree on whether they are looking at the
+		// same server. What a tolerance *changed* is covered through the value
+		// it changed — a normalized ModelName, an absent OutputSchema — so
+		// nothing about the server's offering escapes by this exclusion.
+		{"compatibility tolerances", func(b *catalog.Builder) {
+			b.Tolerances = catalog.Tolerances{}
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -190,10 +202,12 @@ func TestDigestIsSensitiveToEveryContentField(t *testing.T) {
 	// not named here must move the digest. Paths are matched with the "[0]"
 	// element markers stripped, so naming a field covers it wherever it appears.
 	excluded := map[string]string{
-		"Number":         "an ordinal, not content",
-		"Warnings":       "derived from content already covered",
-		"Decisions":      "derived from capabilities already covered",
-		"Tools.Warnings": "derived: a tolerated defect is a function of what the server sent, and what survived it is already covered",
+		"Number":                   "an ordinal, not content",
+		"Warnings":                 "derived from content already covered",
+		"Decisions":                "derived from capabilities already covered",
+		"Tools.Warnings":           "derived: a tolerated defect is a function of what the server sent, and what survived it is already covered",
+		"Tolerances":               "host policy, not server truth: see TestDigestIgnoresNonContent",
+		"Tools.OutputSchemaDefect": "derived diagnostic: the schema it condemns is absent from the generation either way, which the OutputSchema presence flag already covers",
 	}
 	isExcluded := func(path string) bool {
 		clean := strings.ReplaceAll(path, "[0]", "")

@@ -84,12 +84,30 @@ func FromSDKTool(t *mcp.Tool, b Bounds) (ToolSpec, error) {
 			// Dropping already achieves what the bound exists for — the
 			// oversized document is not retained — so there is nothing left
 			// to protect by failing the tool as well.
+			//
+			// Recorded structurally as well as in the warning: whether the drop
+			// is tolerated at all is the caller's compatibility policy (see
+			// OutputSchemaDefect), and a policy must not be made to read
+			// English.
+			spec.OutputSchemaDefect = boundDefect(err.Error())
 			spec.warn(fmt.Sprintf("output schema dropped: %v", err))
 		} else {
 			spec.OutputSchema = out
 		}
 	}
 	return spec, nil
+}
+
+// MaxDefectBytes bounds a recorded defect reason. The text comes from an error
+// this package produced, but it can quote a server's own bytes (a JSON decoder
+// naming the offending token), so it is bounded like anything else that came
+// from a peer.
+const MaxDefectBytes = 256
+
+// boundDefect truncates a defect reason to MaxDefectBytes.
+func boundDefect(s string) string {
+	out, _ := limits.TruncateText(s, MaxDefectBytes)
+	return out
 }
 
 // warn appends a bounded warning, dropping anything past MaxWarnings.

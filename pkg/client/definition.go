@@ -146,6 +146,13 @@ type Definition struct {
 	ToolFilter ToolFilter
 	// AllowParallelCalls opts in to bounded parallel tool calls.
 	AllowParallelCalls bool
+	// Compat is the named, versioned compatibility profile: how far this
+	// binding will bend for a server that does not implement the specification
+	// perfectly. The zero value selects ProfileDefault.
+	//
+	// It is part of the binding's secret-free configuration identity; see
+	// Profile.Digest.
+	Compat Profile
 	// Reconnect governs rebuilding a connection that failed transiently. The
 	// zero value reconnects under the default bounds.
 	Reconnect ReconnectPolicy
@@ -185,7 +192,19 @@ func (d Definition) Validate() error {
 	if d.Transport == nil {
 		return NewError(FailureInvalidConfig, d.Name, "validate", "Transport is nil", nil)
 	}
+	// The profile is validated before the transport check that consults it: an
+	// unusable profile must be reported as itself, not as whatever it happens to
+	// permit.
+	compat := d.Compat
+	if compat.isZero() {
+		compat = ProfileDefault
+	}
+	if err := compat.validate(); err != nil {
+		return NewError(FailureInvalidConfig, d.Name, "validate", err.Error(), nil)
+	}
+	d.Compat = compat
 	for _, err := range []error{
+		d.checkTransportCompat(),
 		d.Timeouts.validate(),
 		d.Limits.validate(),
 		d.ToolFilter.validate(),
@@ -210,6 +229,10 @@ func (d Definition) normalized() Definition {
 	d.ToolFilter = d.ToolFilter.clone()
 	d.Refresh = d.Refresh.withDefaults()
 	d.Reconnect = d.Reconnect.withDefaults()
+	if d.Compat.isZero() {
+		d.Compat = ProfileDefault
+	}
+	d.Compat = d.Compat.clone()
 	if d.LogLevel == "" {
 		d.LogLevel = DefaultLogLevel
 	}

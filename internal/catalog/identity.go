@@ -117,7 +117,19 @@ func validateRawName(f Family, name string) error {
 // because a rename is a catalog change: it produces a new digest, a new
 // generation, and an adoption at a safe boundary, rather than a silent
 // substitution under a live turn.
-func assignModelNames(binding string, tools []Tool) error {
+// Normalization is a compatibility tolerance, so it is gated: normalize reports
+// whether this binding's profile permits it. Qualification is not — every name
+// is prefixed and binding-qualified whatever the profile says, because that is
+// this module's own namespacing and not a concession to a server. What the
+// tolerance covers is a raw name that does not survive qualification unchanged:
+// one carrying characters an inference provider will not accept, or one long
+// enough that the qualified form must be truncated to fit. Under a strict
+// profile such a tool is rejected rather than renamed.
+//
+// It reports whether the tolerance was actually needed, which is not the same as
+// whether it was permitted: a well-behaved server produces no normalization
+// under any profile.
+func assignModelNames(binding string, tools []Tool, normalize bool) (applied bool, err error) {
 	candidates := make([]string, len(tools))
 	counts := make(map[string]int, len(tools))
 	for i, t := range tools {
@@ -129,6 +141,21 @@ func assignModelNames(binding string, tools []Tool) error {
 	assigned := make(map[string]struct{}, len(tools))
 	for i := range tools {
 		name := candidates[i]
+		// A name that sanitization changed, or that must be cut to fit, or that
+		// collides with a sibling only because of one of those two: each is a
+		// raw name this module cannot show a model as it stands.
+		lossy := sanitizeNamePart(tools[i].RawName) != tools[i].RawName ||
+			len(name) > MaxModelNameBytes ||
+			counts[name] > 1
+		if lossy {
+			if !normalize {
+				return false, &DefectError{
+					Family: FamilyTools,
+					Reason: fmt.Sprintf("tool %q cannot be shown to a model under its own name, and this binding's compatibility profile does not tolerate normalizing it", tools[i].RawName),
+				}
+			}
+			applied = true
+		}
 		if len(name) > MaxModelNameBytes || counts[name] > 1 {
 			name = suffixedName(name, digestName(binding, tools[i].RawName))
 		}
@@ -138,7 +165,7 @@ func assignModelNames(binding string, tools []Tool) error {
 			// rather than impossible, and the failure mode if it were ignored is
 			// that one tool's calls silently route to another — so it is a hard
 			// failure, not a warning.
-			return &DefectError{
+			return false, &DefectError{
 				Family: FamilyTools,
 				Reason: fmt.Sprintf("tool %q cannot be given a unique model-facing name: %q is taken", tools[i].RawName, name),
 			}
@@ -146,7 +173,7 @@ func assignModelNames(binding string, tools []Tool) error {
 		assigned[name] = struct{}{}
 		tools[i].ModelName = name
 	}
-	return nil
+	return applied, nil
 }
 
 // suffixedName truncates name to leave room for a digest suffix and appends it.

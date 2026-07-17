@@ -327,9 +327,10 @@ func (c *Client) discover(ctx context.Context, conn protocol.Conn, res protocol.
 		// The first ordinal this binding hands out, and the same counter every
 		// later refresh draws from: generations are numbered by one source, so
 		// no two of them can ever share a number.
-		Number:    c.reserveGeneration(),
-		Handshake: res,
-		Limits:    c.def.Limits.catalog(),
+		Number:     c.reserveGeneration(),
+		Handshake:  res,
+		Limits:     c.def.Limits.catalog(),
+		Tolerances: c.def.Compat.tolerances(),
 	})
 	if err != nil {
 		return c.fail(ctx, opDiscover, err, discoveryClass(err))
@@ -340,10 +341,10 @@ func (c *Client) discover(ctx context.Context, conn protocol.Conn, res protocol.
 	c.mu.Unlock()
 
 	// An MCP server sends no log messages until a level is set, so a binding
-	// that installed a log handler and never asked would sit in silence and be
-	// unable to tell it from a quiet server. Only ask when there is both a
-	// handler to receive them and a server that advertised logging.
-	if c.logHandler != nil && res.Capabilities.Logging {
+	// that wanted them and never asked would sit in silence and be unable to
+	// tell it from a quiet server. Only ask when there is both somewhere to
+	// deliver them (see wantsLogs) and a server that advertised logging.
+	if c.wantsLogs() && res.Capabilities.Logging {
 		if err := conn.SetLogLevel(ctx, string(c.def.LogLevel)); err != nil {
 			// Logs are diagnostics. A server that will not enable them is not a
 			// reason to refuse an otherwise-working binding, so this is
@@ -377,17 +378,37 @@ func discoveryClass(err error) FailureClass {
 // nil, so a log arriving for a binding that wants none is dropped at the
 // boundary rather than converted first.
 func (c *Client) logAdapter() func(protocol.LogRecord) {
-	if c.logHandler == nil {
+	if !c.wantsLogs() {
 		return nil
 	}
 	return func(r protocol.LogRecord) {
-		c.logHandler(LogMessage{
+		if c.logHandler != nil {
+			c.logHandler(LogMessage{
+				Binding: c.def.Name,
+				Level:   LogLevel(r.Level),
+				Logger:  r.Logger,
+				Text:    r.Text,
+			})
+		}
+		c.emit(ServerLog{
 			Binding: c.def.Name,
 			Level:   LogLevel(r.Level),
 			Logger:  r.Logger,
 			Text:    r.Text,
+			At:      time.Now(),
 		})
 	}
+}
+
+// wantsLogs reports whether anything on this binding would receive a server log.
+//
+// Either handler counts, and that is the whole reason this exists: a server
+// sends no logs at all until a level is asked for, so an application that
+// observes a binding through events alone would otherwise install an Event
+// handler, never install a Log handler, and sit in a silence indistinguishable
+// from a quiet server.
+func (c *Client) wantsLogs() bool {
+	return c.logHandler != nil || c.eventHandler != nil
 }
 
 // isNilConn reports whether a transport handed back no connection.
@@ -528,6 +549,7 @@ func (c *Client) Status() Status {
 		TransportKind:  c.def.Transport.Kind(),
 		RedactedOrigin: c.def.Transport.RedactedOrigin(),
 		StaleFamilies:  c.staleFamilies(),
+		CompatProfile:  c.def.Compat.String(),
 	}
 
 	c.mu.Lock()

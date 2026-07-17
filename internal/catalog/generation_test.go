@@ -130,7 +130,10 @@ func TestBuildBoundedAtLimits(t *testing.T) {
 	t.Run("name at exactly the limit is accepted", func(t *testing.T) {
 		t.Parallel()
 		name := strings.Repeat("a", catalog.MaxRawNameBytes)
-		g := mustBuild(t, catalog.Builder{Binding: "b", Tools: []protocol.ToolSpec{
+		// Permissive: a name this long cannot be shown to a model as it stands,
+		// so it needs the normalization tolerance. What is under test here is
+		// the raw-name bound, not the policy.
+		g := mustBuild(t, catalog.Builder{Binding: "b", Tolerances: permissive, Tools: []protocol.ToolSpec{
 			{RawName: name, InputSchema: json.RawMessage(`{"type":"object"}`)},
 		}})
 		if _, ok := g.ToolByRawName(name); !ok {

@@ -273,6 +273,8 @@ func TestConnectHappyPath(t *testing.T) {
 		// A ready binding has adopted its first catalog, so Status reports it.
 		CatalogGeneration: 1,
 		CatalogDigest:     c.Catalog().Digest,
+		// A Definition that names no profile gets the default one.
+		CompatProfile: ProfileDefault.String(),
 	}
 	want.LastChange = got.LastChange
 	if want.CatalogDigest == "" {

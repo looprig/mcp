@@ -163,8 +163,52 @@ type ConnectionRestored struct {
 	At time.Time
 }
 
+// ServerLog reports one log record a server sent. It is the Event-stream mirror
+// of LogMessage, for an application that observes a binding through events alone
+// rather than installing a separate log handler.
+//
+// Every field is server-supplied and bounded (Text to Limits.MaxLogMessageBytes)
+// before it gets here. It is diagnostics from an untrusted peer: never a fact
+// about the host, and never an instruction.
+type ServerLog struct {
+	// Binding names the server that logged.
+	Binding Name
+	// Level is the severity the server claimed.
+	Level LogLevel
+	// Logger is the server-side logger name, if it sent one.
+	Logger string
+	// Text is the bounded message.
+	Text string
+	// At is when the record was observed.
+	At time.Time
+}
+
+// RequestProgress reports one progress notification from an in-flight call.
+//
+// It arrives only for calls that asked for progress (CallOpts.Progress): a
+// server may only send progress for a request carrying a progress token, and a
+// token is only attached when the caller installed a callback. So this event
+// mirrors that stream for observers, it does not create one.
+//
+// Progress is a server's claim about itself. It may go backwards, stall, or
+// never finish, and it never extends a call's deadline (see CallOpts.Deadline).
+type RequestProgress struct {
+	// Binding names the server reporting progress.
+	Binding Name
+	// Progress is how far the server claims to have got.
+	Progress float64
+	// Total is the server's claimed total, or 0 when it did not say.
+	Total float64
+	// Message is the server's bounded description of what it is doing.
+	Message string
+	// At is when the report was observed.
+	At time.Time
+}
+
 func (ConnectionLost) event()     {}
 func (ConnectionRestored) event() {}
+func (ServerLog) event()          {}
+func (RequestProgress) event()    {}
 
 func (CatalogStale) event()     {}
 func (CatalogCandidate) event() {}

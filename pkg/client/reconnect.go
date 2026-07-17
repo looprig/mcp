@@ -163,14 +163,18 @@ func (c *Client) isCurrentConn(epoch uint64) bool {
 	return epoch == c.connEpoch
 }
 
-// asError renders an arbitrary cause as an *Error of the given class, for a
-// bounded event message.
+// asError renders an arbitrary cause as an *Error of the given class.
+//
+// An untyped cause gets an explicit message rather than its own text, for the
+// reason failureMessage documents: what reaches an event must be text this
+// module wrote about a failure it classified, never a transport's rendering of a
+// URL it was given.
 func asError(binding Name, op string, class FailureClass, cause error) *Error {
 	var typed *Error
 	if errors.As(cause, &typed) {
 		return typed
 	}
-	return NewError(class, binding, op, "", cause)
+	return NewError(class, binding, op, "the binding's connection failed", cause)
 }
 
 // runReconnector is the reconnect worker. Like the refresher it is the only
@@ -307,10 +311,11 @@ func (c *Client) reconnectOnce(ctx context.Context) error {
 	}
 
 	gen, err := catalog.Discover(dialCtx, conn, catalog.Config{
-		Binding:   string(c.def.Name),
-		Number:    c.reserveGeneration(),
-		Handshake: res,
-		Limits:    c.def.Limits.catalog(),
+		Binding:    string(c.def.Name),
+		Number:     c.reserveGeneration(),
+		Handshake:  res,
+		Limits:     c.def.Limits.catalog(),
+		Tolerances: c.def.Compat.tolerances(),
 	})
 	if err != nil {
 		return c.abandon(ctx, conn, c.classify(dialCtx, opReconnect, err, discoveryClass(err)))
@@ -328,7 +333,7 @@ func (c *Client) reconnectOnce(ctx context.Context) error {
 	// alone: it is the only holder of the reference now.
 	c.closeQuietly(ctx, old)
 
-	if c.logHandler != nil && res.Capabilities.Logging {
+	if c.wantsLogs() && res.Capabilities.Logging {
 		if err := conn.SetLogLevel(dialCtx, string(c.def.LogLevel)); err != nil {
 			c.recordFailure(NewError(FailureServerProtocol, c.def.Name, opReconnect,
 				"the server refused to set a log level; its logs will not arrive", err))

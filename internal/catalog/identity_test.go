@@ -10,11 +10,17 @@ import (
 	"github.com/looprig/mcp/internal/protocol"
 )
 
+// permissive is the compatibility policy of the module's default profile: the
+// safe tolerances, all applied. Name construction is only exercised at all under
+// a policy that permits normalizing a name — a strict profile rejects such a
+// tool outright, which is what TestNormalizationIsGatedByPolicy covers.
+var permissive = catalog.Tolerances{InvalidOutputSchema: true, NormalizeDisplayNames: true}
+
 // buildTools is a shorthand for a catalog of nothing but tools with the given
 // raw names.
 func buildTools(t *testing.T, binding string, rawNames ...string) *catalog.Generation {
 	t.Helper()
-	b := catalog.Builder{Binding: binding}
+	b := catalog.Builder{Binding: binding, Tolerances: permissive}
 	for _, n := range rawNames {
 		b.Tools = append(b.Tools, protocol.ToolSpec{
 			RawName:     n,

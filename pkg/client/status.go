@@ -123,6 +123,11 @@ type Status struct {
 	// failing — which State (degraded) and Failure describe.
 	StaleFamilies []string
 
+	// CompatProfile is the binding's compatibility profile as "name/vN". It is
+	// part of the binding's configuration identity; Profile.Digest is the
+	// checkable form.
+	CompatProfile string
+
 	// ReconnectAttempt is the reconnect attempt currently in flight, counting
 	// from 1, or 0 when the binding is not reconnecting. It is the retry state
 	// an operator reads to tell "trying" from "stuck": a binding that stays on

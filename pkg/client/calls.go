@@ -407,6 +407,17 @@ func (c *Client) progressAdapter(fn func(Progress)) func(protocol.ProgressUpdate
 			Total:    u.Total,
 			Message:  u.Message,
 		})
+		// Mirrored to the event stream for observers. Deliberately inside the
+		// nil check rather than outside it: an event here must not be the thing
+		// that puts a progress token on the wire, because that would make
+		// installing an observer change what the server is asked to do.
+		c.emit(RequestProgress{
+			Binding:  c.def.Name,
+			Progress: u.Progress,
+			Total:    u.Total,
+			Message:  u.Message,
+			At:       time.Now(),
+		})
 	}
 }
 

@@ -213,10 +213,11 @@ func (c *Client) refreshOnce(ctx context.Context) error {
 	defer release()
 
 	gen, err := catalog.Discover(fetchCtx, conn, catalog.Config{
-		Binding:   string(c.def.Name),
-		Number:    c.reserveGeneration(),
-		Handshake: handshake,
-		Limits:    c.def.Limits.catalog(),
+		Binding:    string(c.def.Name),
+		Number:     c.reserveGeneration(),
+		Handshake:  handshake,
+		Limits:     c.def.Limits.catalog(),
+		Tolerances: c.def.Compat.tolerances(),
 	})
 	if err != nil {
 		// A refresh is how a binding with no traffic finds out its connection
@@ -319,7 +320,11 @@ func candidateFacts(candidate, adopted *catalog.Generation) (number uint64, dige
 func (c *Client) reportRefreshFailure(err error, retrying bool) {
 	var typed *Error
 	if !errors.As(err, &typed) {
-		typed = NewError(FailureCatalogStale, c.def.Name, opRefresh, "", err)
+		// An explicit message, not the cause's own text: see failureMessage for
+		// why an event never renders a wrapped error. The cause is still
+		// wrapped, so it remains available to a caller that has the error
+		// itself — it just does not travel to an event handler.
+		typed = NewError(FailureCatalogStale, c.def.Name, opRefresh, "the catalog refresh failed", err)
 	}
 	c.recordFailure(typed)
 
@@ -338,15 +343,35 @@ func (c *Client) reportRefreshFailure(err error, retrying bool) {
 	})
 }
 
-// failureMessage renders an error's bounded text for an event. It mirrors
-// recordFailure's rule: Msg when there is one, and the Error's own bounded
-// rendering otherwise — never the raw wrapped text, whose length and content a
-// server chooses.
+// failureMessage renders an error's text for an event, and is the redaction
+// boundary for everything this module publishes to an EventHandler.
+//
+// It carries the *Error's own Msg and nothing else. Msg is written by this
+// module, at the site that classified the failure, and is bounded at
+// construction (NewError) — so it is text we chose, about a failure we
+// classified.
+//
+// What it deliberately does not do is fall back to the wrapped cause's text, the
+// way Error.Error does. A wrapped cause is a transport's or a server's own
+// error, and those are exactly where a credential ends up in practice: net/http
+// renders the request URL into its errors verbatim, userinfo and all, so
+// `dial https://user:token@host` is one wrapped error away from every event
+// handler, journal and telemetry sink an application installs. The design's rule
+// for events is explicit — "authorization URLs containing secrets, headers,
+// tokens ... are excluded" — and bounding that text would only make the leak
+// shorter.
+//
+// The cost is that an *Error constructed with no Msg contributes only its class.
+// That is the right trade: a class is always safe and usually enough, and the
+// remedy is to write a message at the classification site, which the emitters
+// here do.
 func failureMessage(err *Error) string {
 	if err.Msg != "" {
 		return err.Msg
 	}
-	return boundMessage(err.Error())
+	// No message was written for this failure. Say what is known — the class —
+	// rather than reaching for text this module did not author.
+	return "the binding reported a " + err.Class.String() + " failure"
 }
 
 // adoptedNumber returns the adopted generation's ordinal, or 0.

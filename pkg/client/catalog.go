@@ -177,6 +177,11 @@ type Catalog struct {
 	// Warnings records defects tolerated during discovery, such as a dropped
 	// tool. It is bounded.
 	Warnings []string
+	// AppliedTolerances are the compatibility tolerances this generation
+	// actually needed, in a deterministic order. It is empty for a server that
+	// implements the specification faithfully — it reports what was bent, not
+	// what the binding's profile would have allowed.
+	AppliedTolerances []Tolerance
 }
 
 // Valid reports whether c describes an adopted generation. It is false for the
@@ -248,6 +253,11 @@ func (c *Client) projectCatalog(gen *catalog.Generation) Catalog {
 		Capabilities: fromProtocolCapabilities(gen.Capabilities()),
 		Instructions: gen.Instructions(),
 		Warnings:     gen.Warnings(),
+	}
+	for _, tol := range gen.AppliedTolerances() {
+		if public, ok := fromCatalogTolerance(tol); ok {
+			out.AppliedTolerances = append(out.AppliedTolerances, public)
+		}
 	}
 
 	for _, t := range gen.Tools() {

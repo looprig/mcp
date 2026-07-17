@@ -280,6 +280,16 @@ type ToolSpec struct {
 	// Warnings records defects tolerated during conversion (e.g. a dropped
 	// output schema). Bounded by MaxWarnings.
 	Warnings []string
+	// OutputSchemaDefect is the bounded reason this tool's optional output
+	// schema was dropped, or empty when there was nothing wrong with it (which
+	// includes the ordinary case of a server sending none at all).
+	//
+	// It exists so that dropping the schema is a *decision* the layer above can
+	// make rather than one this conversion makes for it. The drop is the safe
+	// tolerance, but whether it is applied is compatibility policy — a strict
+	// profile rejects the tool instead — and policy cannot be expressed by
+	// pattern-matching the text of a warning.
+	OutputSchemaDefect string
 }
 
 // ToolAnnotations mirrors the server's behavioural hints. The tri-state hints

@@ -87,6 +87,9 @@ type Config struct {
 	Handshake protocol.InitializeResult
 	// Limits bounds the fetch.
 	Limits Limits
+	// Tolerances is the compatibility policy the generation is built under. The
+	// zero value tolerates nothing.
+	Tolerances Tolerances
 }
 
 // Discover fetches every advertised catalog family and builds a Generation.
@@ -110,6 +113,7 @@ func Discover(ctx context.Context, l Lister, cfg Config) (*Generation, error) {
 	b := Builder{
 		Binding:         cfg.Binding,
 		Number:          cfg.Number,
+		Tolerances:      cfg.Tolerances,
 		ProtocolVersion: cfg.Handshake.ProtocolVersion,
 		Capabilities:    caps,
 		Server:          cfg.Handshake.Server,
