@@ -203,10 +203,19 @@ type factory struct {
 // New validates cfg and returns a stdio TransportFactory.
 //
 // It fails closed: every violation is an *client.Error of class
-// FailureInvalidConfig, and nothing is started, resolved or read from the
-// environment until Connect. Config errors name the offending field, and the
-// command — which is not a secret — but never an argument's or a variable's
-// value, which may be.
+// FailureInvalidConfig. Config errors name the offending field, and the command
+// — which is not a secret — but never an argument's or a variable's value,
+// which may be.
+//
+// No process is started until Connect. The COMMAND, though, is resolved here:
+// New calls exec.LookPath, which reads $PATH and yields the absolute path
+// stored on the factory (see Config.Command). That is deliberate — a command
+// that does not exist is a configuration error, and it is worth learning at
+// construction rather than on a connection attempt later.
+//
+// Config.Env is the opposite and stays so: New only validates the allowlist's
+// shape, and the variables' VALUES are read from the environment at Connect, so
+// a factory built early does not capture an environment that has since changed.
 func New(cfg Config) (client.TransportFactory, error) {
 	fail := func(msg string) error {
 		return client.NewError(client.FailureInvalidConfig, "", opNew, msg, nil)
