@@ -146,7 +146,23 @@ type Definition struct {
 	ToolFilter ToolFilter
 	// AllowParallelCalls opts in to bounded parallel tool calls.
 	AllowParallelCalls bool
+	// LogLevel is the minimum severity of server log message to request. Zero
+	// means DefaultLogLevel.
+	//
+	// It only takes effect when Handlers.Log is installed and the server
+	// advertises logging: a server sends nothing until a level is set, so this
+	// is what turns its logs on, and there is no point turning them on with
+	// nowhere to deliver them.
+	LogLevel LogLevel
 }
+
+// DefaultLogLevel is the level requested when Definition.LogLevel is empty.
+//
+// Info rather than Debug: a binding that installed a log handler wants to know
+// what the server is doing, not to receive its trace output — and the debug
+// stream of a chatty server is a volume problem that arrives on the
+// connection's notification goroutine. A host that wants more asks for it.
+const DefaultLogLevel = LogInfo
 
 // Validate checks the whole definition and fails closed: the first violation
 // is returned as a *Error with class FailureInvalidConfig, binding d.Name,
@@ -162,6 +178,7 @@ func (d Definition) Validate() error {
 		d.Timeouts.validate(),
 		d.Limits.validate(),
 		d.ToolFilter.validate(),
+		d.LogLevel.validate(),
 	} {
 		if err != nil {
 			return NewError(FailureInvalidConfig, d.Name, "validate", err.Error(), nil)
@@ -178,5 +195,8 @@ func (d Definition) normalized() Definition {
 	d.Timeouts = d.Timeouts.withDefaults()
 	d.Limits = d.Limits.withDefaults()
 	d.ToolFilter = d.ToolFilter.clone()
+	if d.LogLevel == "" {
+		d.LogLevel = DefaultLogLevel
+	}
 	return d
 }

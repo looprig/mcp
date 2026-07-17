@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -38,7 +39,7 @@ import (
 	"github.com/looprig/mcp/pkg/auth"
 	"github.com/looprig/mcp/pkg/client"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/looprig/mcp/internal/protocol"
 )
 
 // newFixtureServer starts the fixture over Streamable HTTP and returns its URL.
@@ -83,20 +84,27 @@ func connectFixture(t *testing.T, cfg Config) *conn {
 	return c.(*conn)
 }
 
-// callTool drives a real tool call over the established session. It reaches
-// through internal/protocol's SDK escape hatch because the neutral tool API is
-// a later task: what is under test is that this transport carries MCP traffic,
-// and a real tool call is what proves it.
-func callTool(ctx context.Context, c *conn, name string, args map[string]any) (*mcp.CallToolResult, error) {
-	return c.session.SDKSession().CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
+// callTool drives a real tool call over the established connection, through the
+// same neutral API a consumer uses. What is under test is that this transport
+// carries MCP traffic, and a real tool call is what proves it.
+//
+// args is a map here purely for the call sites' convenience: it is marshalled
+// straight to the raw JSON the protocol layer takes, which is what a tool's
+// arguments are on the wire.
+func callTool(ctx context.Context, c *conn, name string, args map[string]any) (protocol.ToolResult, error) {
+	raw, err := json.Marshal(args)
+	if err != nil {
+		return protocol.ToolResult{}, err
+	}
+	return c.CallTool(ctx, name, raw, protocol.CallOptions{})
 }
 
 // resultText flattens a tool result's text content.
-func resultText(t *testing.T, res *mcp.CallToolResult) string {
+func resultText(t *testing.T, res protocol.ToolResult) string {
 	t.Helper()
 	var b strings.Builder
 	for _, content := range res.Content {
-		if text, ok := content.(*mcp.TextContent); ok {
+		if text, ok := content.(protocol.TextContent); ok {
 			b.WriteString(text.Text)
 		}
 	}

@@ -48,6 +48,20 @@ type Conn interface {
 	// ListResourceTemplates fetches one page of resource templates.
 	ListResourceTemplates(ctx context.Context, cursor string) (ResourceTemplatePage, error)
 
+	// CallTool invokes a tool by its raw server name. args is passed through
+	// verbatim; validating it against the tool's schema is the caller's job.
+	// Cancelling ctx cancels the call at the protocol level.
+	CallTool(ctx context.Context, rawName string, args json.RawMessage, opts CallOptions) (ToolResult, error)
+	// GetPrompt fetches a prompt's messages.
+	GetPrompt(ctx context.Context, name string, args map[string]string) (PromptResult, error)
+	// ReadResource reads a resource by its opaque URI.
+	ReadResource(ctx context.Context, uri string) (ResourceResult, error)
+	// Subscribe asks the server to report changes to a resource.
+	Subscribe(ctx context.Context, uri string) error
+	// SetLogLevel asks the server to send logs at or above level. A server
+	// sends none until this is called.
+	SetLogLevel(ctx context.Context, level string) error
+
 	// Close releases the connection's resources.
 	Close(ctx context.Context) error
 }
@@ -84,6 +98,14 @@ type ConnectConfig struct {
 	// Wire caps what a transport buffers off the network, before any of it is
 	// parsed. The client passes a normalized (all-positive) value.
 	Wire WireLimits
+	// OnLog receives the server's log messages, already bounded. Nil drops
+	// them.
+	//
+	// It is a callback on the config rather than a method on Conn because a log
+	// is unsolicited: it belongs to no request, so there is nothing to return
+	// it from. It is invoked on the connection's notification goroutine and
+	// blocks it, so an implementation must not do work.
+	OnLog func(LogRecord)
 }
 
 // WireLimits bounds untrusted bytes at the point they arrive, which is a
@@ -168,15 +190,15 @@ type Bounds struct {
 	// MaxTextBytes caps one text (or embedded-resource text) payload before
 	// it is truncated.
 	MaxTextBytes int
-	// MaxStructuredBytes caps one structured-content document. Not read by
-	// any converter yet: structured content arrives on CallToolResult, whose
-	// conversion lands in a later task and enforces this. It is carried here
-	// so the client's Limits map onto one complete Bounds view.
+	// MaxStructuredBytes caps one structured-content document, enforced by
+	// FromSDKCallToolResult.
 	MaxStructuredBytes int
 	// MaxBinaryItemBytes caps one binary (image/audio/blob) item.
 	MaxBinaryItemBytes int
 	// MaxBinaryItems caps how many binary items one content list may carry.
 	MaxBinaryItems int
+	// MaxLogBytes caps one server log message's text.
+	MaxLogBytes int
 }
 
 // MaxWarnings caps the Warnings a single conversion may report, so a hostile

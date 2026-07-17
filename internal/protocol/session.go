@@ -37,11 +37,16 @@ type Session struct {
 	transport mcp.Transport
 	cfg       ConnectConfig
 
-	// mu guards cs and started. It is never held across a call into the SDK:
-	// Close can legally race Initialize, and the SDK does its own locking.
+	// mu guards cs, started and progress. It is never held across a call into
+	// the SDK, nor across a progress callback: Close can legally race
+	// Initialize, the SDK does its own locking, and a callback is foreign code.
 	mu      sync.Mutex
 	started bool
 	cs      *mcp.ClientSession
+	// progress maps a call's progress token to its callback, for the calls
+	// currently in flight. Entries are added by CallTool and removed by its
+	// defer, so the map is bounded by concurrency, not by call count.
+	progress map[string]func(ProgressUpdate)
 }
 
 // NewSession returns an uninitialized Session that will speak MCP over t.
@@ -77,6 +82,17 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 		// and nothing here can serve is exactly the fail-open this module
 		// does not do.
 		Capabilities: sdkClientCapabilities(s.cfg.Capabilities),
+		// The two server-initiated streams that belong to a request rather than
+		// to a capability. Both are registered unconditionally: progress routes
+		// only to a call that asked for it, and a log with no OnLog installed is
+		// dropped — registering them costs nothing and un-registering them
+		// would mean a notification arriving with nowhere to go.
+		ProgressNotificationHandler: func(_ context.Context, req *mcp.ProgressNotificationClientRequest) {
+			s.onProgress(req.Params)
+		},
+		LoggingMessageHandler: func(_ context.Context, req *mcp.LoggingMessageRequest) {
+			s.onLog(req.Params)
+		},
 	})
 
 	cs, err := client.Connect(ctx, s.transport, nil)
@@ -150,20 +166,6 @@ func (s *Session) established() (*mcp.ClientSession, error) {
 		return nil, errNotInitialized
 	}
 	return s.cs, nil
-}
-
-// SDKSession returns the underlying SDK session, or nil before Initialize.
-//
-// It is an escape hatch for the packages inside this module that are allowed to
-// speak SDK (see the leak guard's allowlist) and is not, and must not become, a
-// way around this package's conversions: everything a caller above the boundary
-// consumes still arrives as a neutral, bounded type. It is what lets a
-// transport's own tests drive real MCP traffic, and it dies with the task that
-// gives them converted call methods to use instead.
-func (s *Session) SDKSession() *mcp.ClientSession {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.cs
 }
 
 // sdkClientCapabilities maps the neutral capability flags onto the SDK's

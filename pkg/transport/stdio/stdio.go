@@ -30,6 +30,7 @@ package stdio
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -69,6 +70,12 @@ const (
 	opListPrompts           = "list_prompts"
 	opListResources         = "list_resources"
 	opListResourceTemplates = "list_resource_templates"
+	// The request operations.
+	opCallTool     = "call_tool"
+	opGetPrompt    = "get_prompt"
+	opReadResource = "read_resource"
+	opSubscribe    = "subscribe"
+	opSetLogLevel  = "set_log_level"
 )
 
 // DefaultStderrLimit is the stderr capture size used when Config.StderrLimit is
@@ -592,6 +599,52 @@ func listVia[P any](
 	return page, nil
 }
 
+// The request methods. Like the list methods they delegate to the session and
+// classify the failure here, where the cause is knowable.
+
+// CallTool invokes a tool by its raw server name.
+func (c *conn) CallTool(ctx context.Context, rawName string, args json.RawMessage, opts protocol.CallOptions) (protocol.ToolResult, error) {
+	res, err := c.session.CallTool(ctx, rawName, args, opts)
+	if err != nil {
+		return protocol.ToolResult{}, c.classify(ctx, opCallTool, err)
+	}
+	return res, nil
+}
+
+// GetPrompt fetches a prompt's messages.
+func (c *conn) GetPrompt(ctx context.Context, name string, args map[string]string) (protocol.PromptResult, error) {
+	res, err := c.session.GetPrompt(ctx, name, args)
+	if err != nil {
+		return protocol.PromptResult{}, c.classify(ctx, opGetPrompt, err)
+	}
+	return res, nil
+}
+
+// ReadResource reads a resource by URI.
+func (c *conn) ReadResource(ctx context.Context, uri string) (protocol.ResourceResult, error) {
+	res, err := c.session.ReadResource(ctx, uri)
+	if err != nil {
+		return protocol.ResourceResult{}, c.classify(ctx, opReadResource, err)
+	}
+	return res, nil
+}
+
+// Subscribe asks the server to report changes to a resource.
+func (c *conn) Subscribe(ctx context.Context, uri string) error {
+	if err := c.session.Subscribe(ctx, uri); err != nil {
+		return c.classify(ctx, opSubscribe, err)
+	}
+	return nil
+}
+
+// SetLogLevel asks the server to send logs at or above level.
+func (c *conn) SetLogLevel(ctx context.Context, level string) error {
+	if err := c.session.SetLogLevel(ctx, level); err != nil {
+		return c.classify(ctx, opSetLogLevel, err)
+	}
+	return nil
+}
+
 // classify turns a session failure into a typed error, distinguishing the two
 // things the SDK reports identically: a server that spoke badly, and a server
 // that is not there any more.
@@ -605,7 +658,7 @@ func (c *conn) classify(ctx context.Context, op string, err error) error {
 	case errors.Is(err, context.Canceled), errors.Is(ctx.Err(), context.Canceled):
 		return client.NewError(client.FailureCancelled, "", op, "the stdio transport was cancelled", err)
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(ctx.Err(), context.DeadlineExceeded):
-		return client.NewError(client.FailureStartupTimeout, "", op,
+		return client.NewError(deadlineClass(op), "", op,
 			"the stdio server did not answer in time", err)
 	}
 	// A failure with a live child is a protocol failure; a failure with a dead
@@ -826,5 +879,22 @@ func closeAll(files ...*os.File) {
 		if f != nil {
 			_ = f.Close()
 		}
+	}
+}
+
+// deadlineClass reports which failure a blown deadline is, for op.
+//
+// The distinction is the caller's to act on, not cosmetic: a startup timeout
+// means the binding never came up and may be retried or dropped, while a
+// deadline on a request means this call ran out of time on a binding that is
+// otherwise fine. Reporting every timeout as a startup timeout — which is what
+// this did when startup was the only thing that could time out — would tell a
+// caller its healthy binding had failed to start.
+func deadlineClass(op string) client.FailureClass {
+	switch op {
+	case opConnect, opInitialize:
+		return client.FailureStartupTimeout
+	default:
+		return client.FailureDeadline
 	}
 }

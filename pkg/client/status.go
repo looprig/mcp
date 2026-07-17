@@ -97,6 +97,15 @@ type Status struct {
 	Failure *Failure
 	// LastChange is when the state last changed.
 	LastChange time.Time
-	// Adopted/candidate catalog digests and retry state arrive with the tasks
-	// that introduce discovery and reconnection.
+
+	// CatalogGeneration is the ordinal of the adopted catalog, or 0 before one
+	// is adopted.
+	CatalogGeneration uint64
+	// CatalogDigest is the hex digest of the adopted catalog, empty before one
+	// is adopted. It identifies the server's offering independently of this
+	// host's policy, so two bindings reporting the same digest are looking at
+	// the same catalog.
+	CatalogDigest string
+	// Candidate catalog digests and retry state arrive with the tasks that
+	// introduce change notifications and reconnection.
 }

@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/looprig/mcp/internal/protocol"
@@ -176,6 +177,24 @@ const (
 	LogAlert     LogLevel = "alert"
 	LogEmergency LogLevel = "emergency"
 )
+
+// logLevels is the set of levels MCP defines. A level is sent to the server
+// verbatim, so an undeclared one is a configuration error rather than something
+// to pass through and let a server reject — or worse, silently ignore, leaving
+// a binding that quietly receives no logs.
+var logLevels = []LogLevel{
+	LogDebug, LogInfo, LogNotice, LogWarning,
+	LogError, LogCritical, LogAlert, LogEmergency,
+}
+
+// validate reports whether l is a level MCP defines. The empty level is valid:
+// it selects DefaultLogLevel.
+func (l LogLevel) validate() error {
+	if l == "" || slices.Contains(logLevels, l) {
+		return nil
+	}
+	return fmt.Errorf("LogLevel: %q is not an MCP log level (want one of %v)", string(l), logLevels)
+}
 
 // LogMessage is one log record a server sent. Every field is server-supplied
 // and bounded before it reaches a handler: Text is truncated to

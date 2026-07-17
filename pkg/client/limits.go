@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/looprig/mcp/internal/catalog"
 	"github.com/looprig/mcp/internal/protocol"
 )
 
@@ -178,6 +179,23 @@ func (l Limits) bounds() protocol.Bounds {
 		MaxStructuredBytes: l.MaxStructuredBytes,
 		MaxBinaryItemBytes: l.MaxBinaryItemBytes,
 		MaxBinaryItems:     l.MaxBinaryItems,
+		MaxLogBytes:        l.MaxLogMessageBytes,
+	}
+}
+
+// catalog projects the discovery-relevant limits onto the narrow view
+// internal/catalog enforces. Call it on a normalized Limits: a non-positive
+// bound there fails closed, rejecting the first page.
+//
+// Templates and concrete resources share MaxResourceCount, applied to each list
+// separately: they are two lists, and a server with many templates is not
+// thereby entitled to fewer resources.
+func (l Limits) catalog() catalog.Limits {
+	return catalog.Limits{
+		MaxPages:     l.MaxCatalogPages,
+		MaxTools:     l.MaxCatalogItems,
+		MaxPrompts:   l.MaxPromptCount,
+		MaxResources: l.MaxResourceCount,
 	}
 }
 

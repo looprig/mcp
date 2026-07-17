@@ -1,0 +1,393 @@
+// This file implements the calls a caller makes against a live binding: tools,
+// prompts, resources, subscriptions.
+//
+// Every one of them goes through the same three gates before it reaches the
+// wire, in this order:
+//
+//  1. the binding is serving (readiness);
+//  2. the server advertised the capability (compatibility);
+//  3. the host permits the call (policy — the ToolFilter).
+//
+// The order is not arbitrary. Each gate is cheaper and more certain than the
+// next thing it protects, and each fails closed with a class the caller can
+// branch on rather than a message it would have to parse.
+
+package client
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/looprig/mcp/internal/catalog"
+	"github.com/looprig/mcp/internal/lifecycle"
+	"github.com/looprig/mcp/internal/protocol"
+)
+
+// Operation names carried by the errors in this file.
+const (
+	opCallTool     = "call_tool"
+	opGetPrompt    = "get_prompt"
+	opReadResource = "read_resource"
+	opSubscribe    = "subscribe"
+)
+
+// Progress is one progress report from an in-flight call. Every field is
+// server-supplied: it is a hint to render, never a fact to act on — a server
+// may claim any progress it likes, including going backwards or never
+// finishing.
+type Progress struct {
+	// Binding names the server reporting progress.
+	Binding Name
+	// Progress is how far the server claims to have got.
+	Progress float64
+	// Total is the server's claimed total, or 0 when it did not say.
+	Total float64
+	// Message is the server's bounded description of what it is doing.
+	Message string
+}
+
+// CallOpts are the per-call options for CallTool.
+type CallOpts struct {
+	// Progress, when non-nil, receives the call's progress notifications.
+	//
+	// Installing it is what asks the server for them: a server may only send
+	// progress for a request that carries a progress token, and a token is only
+	// attached when this is set. So a nil Progress does not merely discard the
+	// notifications — it stops them being generated.
+	//
+	// It is invoked on the connection's notification goroutine and blocks it,
+	// so it must not do work. Hand off anything expensive.
+	//
+	// Progress NEVER extends the call's deadline. See Deadline.
+	Progress func(Progress)
+
+	// Deadline bounds this call. Zero means now plus the binding's
+	// Timeouts.Request.
+	//
+	// It is an absolute instant, fixed before the request is sent, and nothing
+	// the server does afterwards moves it. In particular progress notifications
+	// do not: a deadline that reset on activity would be a deadline the server
+	// controls, and any server — hostile or merely stuck in a retry loop —
+	// could hold a call, a goroutine and a permission open indefinitely just by
+	// remaining chatty. A long-running tool needs a long deadline, which the
+	// caller sets here, deliberately and in advance.
+	//
+	// The caller's ctx applies as well; whichever expires first wins.
+	Deadline time.Time
+}
+
+// ToolResult is the outcome of a tool call.
+//
+// A tool that fails is not an error here: IsError reports a protocol-level tool
+// error — the call reached the server, ran, and the tool says it did not work —
+// and Content carries its explanation. That is the design's rule, and it
+// matters because the two failures need opposite handling: a tool error is
+// information for the model to react to, while a transport error is a fault the
+// host must handle. Collapsing them would either hide a broken connection
+// inside a plausible-looking result, or turn a tool saying "no such file" into
+// a binding failure.
+type ToolResult struct {
+	// IsError reports that the tool itself failed.
+	IsError bool
+	// Content is the unstructured result, already bounded and converted.
+	Content []Content
+	// Structured is the tool's structured result, within
+	// Limits.MaxStructuredBytes. Nil when the server sent none or an
+	// over-bound one was dropped; see Warnings.
+	Structured json.RawMessage
+	// Warnings records defects tolerated while converting the result.
+	Warnings []string
+}
+
+// Prompt is the outcome of GetPrompt.
+//
+// Its messages are external content. They are not promoted into a host's
+// instructions by being fetched: an application that wants a prompt to carry
+// instruction authority must decide that itself.
+type Prompt struct {
+	Description string
+	Messages    []PromptMessage
+}
+
+// PromptMessage is one message of a prompt. Role is the server's string
+// verbatim ("user" or "assistant" in practice).
+type PromptMessage struct {
+	Role    string
+	Content Content
+}
+
+// Resource is the outcome of ReadResource.
+type Resource struct {
+	Contents []ResourceContent
+}
+
+// ResourceContent is one item of a resource's contents. Exactly one of Text or
+// Data is meaningful. Truncated reports that the payload was cut, or that a
+// binary one was refused on a bound and only its metadata survives.
+type ResourceContent struct {
+	// URI is the item's opaque protocol identifier.
+	URI       string
+	MIMEType  string
+	Text      string
+	Data      []byte
+	Truncated bool
+}
+
+// CallTool invokes a tool by its raw server name — the name in
+// ToolSpec.RawName, not the model-facing one.
+//
+// args is the tool's arguments as raw JSON. They are sent verbatim; validating
+// them against the tool's InputSchema is the caller's job, because the caller
+// is the layer that knows which generation's schema it validated against.
+//
+// A tool that reports failure comes back as a ToolResult with IsError set and a
+// nil error. An error return means the call did not produce a result: the
+// binding is not serving, the tool is not available, the deadline expired, the
+// caller cancelled, or the connection failed.
+//
+// Cancelling ctx cancels the call at the protocol level — the server is told to
+// stop, not merely abandoned.
+func (c *Client) CallTool(ctx context.Context, rawName string, args json.RawMessage, opts CallOpts) (ToolResult, error) {
+	conn, err := c.serving(opCallTool)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	if caps, ok := c.serverCapabilities(); !ok || !caps.Tools {
+		return ToolResult{}, c.unsupported(opCallTool, "tools")
+	}
+	// Policy before lookup: a denied tool is refused whether or not it exists,
+	// so a caller cannot use the error to learn what a filtered server offers.
+	if !c.def.ToolFilter.Permits(rawName) {
+		return ToolResult{}, NewError(FailureToolUnavailable, c.def.Name, opCallTool,
+			fmt.Sprintf("tool %q is not permitted by this binding's ToolFilter", rawName), nil)
+	}
+	gen := c.adopted()
+	if gen == nil {
+		return ToolResult{}, NewError(FailureCatalogStale, c.def.Name, opCallTool,
+			"the binding has no adopted catalog", nil)
+	}
+	if _, ok := gen.ToolByRawName(rawName); !ok {
+		return ToolResult{}, NewError(FailureToolUnavailable, c.def.Name, opCallTool,
+			fmt.Sprintf("tool %q is not in the adopted catalog", rawName), nil)
+	}
+
+	callCtx, cancel := c.withDeadline(ctx, opts.Deadline)
+	defer cancel()
+
+	res, err := conn.CallTool(callCtx, rawName, args, protocol.CallOptions{
+		Progress: c.progressAdapter(opts.Progress),
+	})
+	if err != nil {
+		return ToolResult{}, c.callFailure(ctx, callCtx, opCallTool, err)
+	}
+	return ToolResult{
+		IsError:    res.IsError,
+		Content:    fromProtocolContents(res.Content),
+		Structured: res.Structured,
+		Warnings:   res.Warnings,
+	}, nil
+}
+
+// GetPrompt fetches a prompt's messages, substituting args.
+func (c *Client) GetPrompt(ctx context.Context, name string, args map[string]string) (Prompt, error) {
+	conn, err := c.serving(opGetPrompt)
+	if err != nil {
+		return Prompt{}, err
+	}
+	if caps, ok := c.serverCapabilities(); !ok || !caps.Prompts {
+		return Prompt{}, c.unsupported(opGetPrompt, "prompts")
+	}
+
+	callCtx, cancel := c.withDeadline(ctx, time.Time{})
+	defer cancel()
+
+	res, err := conn.GetPrompt(callCtx, name, args)
+	if err != nil {
+		return Prompt{}, c.callFailure(ctx, callCtx, opGetPrompt, err)
+	}
+	out := Prompt{Description: res.Description}
+	if len(res.Messages) > 0 {
+		out.Messages = make([]PromptMessage, len(res.Messages))
+		for i, m := range res.Messages {
+			out.Messages[i] = PromptMessage{Role: m.Role, Content: fromProtocolContent(m.Content)}
+		}
+	}
+	return out, nil
+}
+
+// ReadResource reads a resource by URI.
+//
+// The URI is an opaque protocol identifier the server issued — not a host path.
+// Nothing here resolves it against a filesystem.
+func (c *Client) ReadResource(ctx context.Context, uri string) (Resource, error) {
+	conn, err := c.serving(opReadResource)
+	if err != nil {
+		return Resource{}, err
+	}
+	if caps, ok := c.serverCapabilities(); !ok || !caps.Resources {
+		return Resource{}, c.unsupported(opReadResource, "resources")
+	}
+
+	callCtx, cancel := c.withDeadline(ctx, time.Time{})
+	defer cancel()
+
+	res, err := conn.ReadResource(callCtx, uri)
+	if err != nil {
+		return Resource{}, c.callFailure(ctx, callCtx, opReadResource, err)
+	}
+	out := Resource{}
+	if len(res.Contents) > 0 {
+		out.Contents = make([]ResourceContent, len(res.Contents))
+		for i, rc := range res.Contents {
+			out.Contents[i] = ResourceContent{
+				URI:       rc.URI,
+				MIMEType:  rc.MIMEType,
+				Text:      rc.Text,
+				Data:      rc.Data,
+				Truncated: rc.Truncated,
+			}
+		}
+	}
+	return out, nil
+}
+
+// Subscribe asks the server to report changes to a resource.
+//
+// It is refused unless the server advertised resources *and* subscription:
+// subscribing is a separate capability from reading, and a server that only
+// advertised resources has not promised resources/subscribe exists.
+func (c *Client) Subscribe(ctx context.Context, uri string) error {
+	conn, err := c.serving(opSubscribe)
+	if err != nil {
+		return err
+	}
+	caps, ok := c.serverCapabilities()
+	if !ok || !caps.Resources || !caps.ResourcesSubscribe {
+		return c.unsupported(opSubscribe, "resource subscription")
+	}
+
+	callCtx, cancel := c.withDeadline(ctx, time.Time{})
+	defer cancel()
+
+	if err := conn.Subscribe(callCtx, uri); err != nil {
+		return c.callFailure(ctx, callCtx, opSubscribe, err)
+	}
+	return nil
+}
+
+// serving returns the connection if the binding can carry a call right now.
+//
+// StateReady and StateDegraded both serve: degraded means "working, with a
+// known fault", and refusing calls on it would make a partial fault a total
+// outage. Everything else — starting, discovering, failed, closing, closed —
+// has no business carrying one.
+func (c *Client) serving(op string) (protocol.Conn, error) {
+	state := c.machine.State()
+	switch state {
+	case lifecycle.StateReady, lifecycle.StateDegraded:
+	case lifecycle.StateClosing, lifecycle.StateClosed:
+		return nil, NewError(FailureShutdown, c.def.Name, op, "the binding is closed", nil)
+	default:
+		return nil, NewError(FailureIndeterminate, c.def.Name, op,
+			"the binding is not serving calls (state: "+state.String()+")", nil)
+	}
+
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		// A ready binding always has a conn; this is defence in depth against a
+		// startup path that ever changed.
+		return nil, NewError(FailureIndeterminate, c.def.Name, op, "the binding has no connection", nil)
+	}
+	return conn, nil
+}
+
+// unsupported reports a method the server never promised. It is the design's
+// compatibility rule at the call site: the client checks the server's
+// capabilities before using a method, so an unadvertised one is refused here
+// rather than sent and failed as an ambiguous method-not-found.
+func (c *Client) unsupported(op, what string) *Error {
+	return NewError(FailureUnsupportedProtocol, c.def.Name, op,
+		"the server does not advertise "+what, nil)
+}
+
+// serverCapabilities returns what the adopted generation recorded the server
+// advertising, and whether there is an adopted generation at all.
+func (c *Client) serverCapabilities() (ServerCapabilities, bool) {
+	gen := c.adopted()
+	if gen == nil {
+		return ServerCapabilities{}, false
+	}
+	return fromProtocolCapabilities(gen.Capabilities()), true
+}
+
+// withDeadline derives the call's context.
+//
+// The deadline is computed once, here, before the request is sent. That is what
+// makes "progress does not extend a deadline" true by construction rather than
+// by remembering not to: there is no code path that could move it, because
+// nothing after this point holds the timer.
+func (c *Client) withDeadline(ctx context.Context, deadline time.Time) (context.Context, context.CancelFunc) {
+	if deadline.IsZero() {
+		return context.WithTimeout(ctx, c.def.Timeouts.Request)
+	}
+	// context.WithDeadline already takes the earlier of this and ctx's own, so
+	// a caller can shorten a call but never outlive its own context.
+	return context.WithDeadline(ctx, deadline)
+}
+
+// progressAdapter wraps a caller's progress callback, tagging each update with
+// the binding. A nil callback stays nil, which is what stops a progress token
+// being attached at all.
+func (c *Client) progressAdapter(fn func(Progress)) func(protocol.ProgressUpdate) {
+	if fn == nil {
+		return nil
+	}
+	return func(u protocol.ProgressUpdate) {
+		fn(Progress{
+			Binding:  c.def.Name,
+			Progress: u.Progress,
+			Total:    u.Total,
+			Message:  u.Message,
+		})
+	}
+}
+
+// callFailure classifies a failed call.
+//
+// Both contexts are needed and they mean different things: callCtx expiring is
+// this call's deadline, while ctx expiring is the caller giving up. They are
+// distinguishable only by asking the outer one first — callCtx is derived from
+// ctx, so a cancelled caller cancels both, and reading callCtx alone would
+// report every cancellation as a deadline.
+func (c *Client) callFailure(ctx, callCtx context.Context, op string, err error) error {
+	var typed *Error
+	if errors.As(err, &typed) {
+		// A transport already classified this; it knows better than this layer.
+		return typed
+	}
+	switch {
+	case ctx.Err() != nil:
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return NewError(FailureDeadline, c.def.Name, op, "the caller's context expired", err)
+		}
+		return NewError(FailureCancelled, c.def.Name, op, "the call was cancelled", nil)
+	case errors.Is(callCtx.Err(), context.DeadlineExceeded):
+		return NewError(FailureDeadline, c.def.Name, op, "the call exceeded its deadline", nil)
+	}
+	return NewError(FailureServerProtocol, c.def.Name, op, "", err)
+}
+
+// adopted returns the generation this binding has adopted, or nil.
+//
+// The generation is immutable, so handing the pointer out under the lock and
+// reading it afterwards is sound: whatever it points at cannot change.
+func (c *Client) adopted() *catalog.Generation {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
+}

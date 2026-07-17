@@ -91,13 +91,15 @@ const (
 // Tool names the fixture may expose. MutatedToolName is the tool the "mutate"
 // tool adds and removes; it is never present at startup.
 const (
-	ToolEcho    = "echo"
-	ToolSlow    = "slow"
-	ToolFail    = "fail"
-	ToolBig     = "big"
-	ToolMutate  = "mutate"
-	ToolCrash   = "crash"
-	ToolMutated = "echo2"
+	ToolEcho     = "echo"
+	ToolSlow     = "slow"
+	ToolFail     = "fail"
+	ToolBig      = "big"
+	ToolMutate   = "mutate"
+	ToolCrash    = "crash"
+	ToolMutated  = "echo2"
+	ToolProgress = "progress"
+	ToolLog      = "log"
 )
 
 // Prompt and resource identifiers the fixture exposes when enabled.
@@ -126,6 +128,10 @@ const (
 	MaxSlowMS = 5 * 60 * 1000
 	// MaxBigBytes caps the "big" tool's result.
 	MaxBigBytes = 32 << 20
+	// MaxProgressCount caps how many notifications the "progress" tool emits.
+	MaxProgressCount = 1000
+	// MaxLogBytes caps the "log" tool's message size.
+	MaxLogBytes = 1 << 20
 	// MaxNoiseBytes caps the stderr noise.
 	MaxNoiseBytes = 32 << 20
 	// MaxInstructionsBytes caps the configured instructions string.
@@ -194,7 +200,24 @@ type Config struct {
 	// as the client's "initialized" notification arrives. See NewServer for
 	// what "as soon as" can and cannot mean here.
 	ElicitOnInitialize bool
+
+	// PageSize caps how many items the server returns per list page. Zero uses
+	// the SDK's default (1000), which no fixture catalog comes close to — so a
+	// test that needs to exercise a client's pagination sets this to 1 or 2 and
+	// gets a genuinely multi-page server rather than a simulated one.
+	PageSize int
+
+	// ExtraTools adds this many trivial echo-shaped tools, named
+	// ExtraToolPrefix + index. It exists so a test can build a catalog big
+	// enough to paginate, or big enough to exceed a client's item bound.
+	ExtraTools int
 }
+
+// ExtraToolPrefix names the tools Config.ExtraTools adds.
+const ExtraToolPrefix = "extra_"
+
+// MaxExtraTools caps Config.ExtraTools.
+const MaxExtraTools = 4096
 
 // DefaultCrashExitCode is the "crash" tool's exit status unless configured
 // otherwise.
@@ -213,6 +236,14 @@ func (c Config) Validate() error {
 	if c.Crash && (c.CrashExitCode < 1 || c.CrashExitCode > 125) {
 		return fmt.Errorf("crash exit code: %d out of range [1, 125]", c.CrashExitCode)
 	}
+	if c.PageSize < 0 {
+		// The SDK panics on a negative page size; fail here instead, at
+		// startup, with a message that names the flag.
+		return fmt.Errorf("page size: %d must not be negative", c.PageSize)
+	}
+	if c.ExtraTools < 0 || c.ExtraTools > MaxExtraTools {
+		return fmt.Errorf("extra tools: %d out of range [0, %d]", c.ExtraTools, MaxExtraTools)
+	}
 	return nil
 }
 
@@ -226,7 +257,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 		return nil, fmt.Errorf("mcptest: invalid config: %w", err)
 	}
 
-	opts := &mcp.ServerOptions{Instructions: cfg.Instructions}
+	opts := &mcp.ServerOptions{Instructions: cfg.Instructions, PageSize: cfg.PageSize}
 	if cfg.ElicitOnInitialize {
 		opts.InitializedHandler = elicitOnInitialized
 	}
@@ -238,6 +269,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	}, opts)
 
 	addBaseTools(s)
+	addExtraTools(s, cfg.ExtraTools)
 	if cfg.Mutate {
 		addMutateTool(s)
 	}
@@ -357,6 +389,125 @@ func addBaseTools(s *mcp.Server) {
 		}
 		return textResult(strings.Repeat("x", in.Bytes)), nil, nil
 	})
+
+	addProgressAndLogTools(s)
+}
+
+// ProgressInput is the "progress" tool's argument.
+type ProgressInput struct {
+	Count int  `json:"count" jsonschema:"how many progress notifications to send"`
+	MS    int  `json:"ms,omitempty" jsonschema:"how long to pause between notifications, in milliseconds"`
+	Hang  bool `json:"hang,omitempty" jsonschema:"true to keep reporting progress forever and never reply"`
+}
+
+// LogInput is the "log" tool's argument.
+type LogInput struct {
+	Bytes int    `json:"bytes" jsonschema:"how many bytes of log message to emit"`
+	Level string `json:"level,omitempty" jsonschema:"the level to log at; defaults to info"`
+}
+
+// ProgressMessage is the text the "progress" tool puts on each notification.
+// Tests match on it.
+const ProgressMessage = "working"
+
+// LogFill is the byte the "log" tool repeats to reach the requested size.
+const LogFill = "L"
+
+// addProgressAndLogTools registers the two tools that exercise the
+// server-initiated streams which belong to a request rather than a capability.
+//
+// They exist because neither stream is observable otherwise. A client's
+// progress plumbing can be entirely absent and every other test still passes —
+// nothing in the base fixture ever sends a notification — and a server's log
+// messages are not sent at all until the client sets a level, so "the client
+// forgot to set one" and "the server is quiet" are indistinguishable without a
+// server that will definitely log.
+func addProgressAndLogTools(s *mcp.Server) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        ToolProgress,
+		Description: "Sends progress notifications, then replies. With hang=true it never replies.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ProgressInput) (*mcp.CallToolResult, any, error) {
+		if in.Count < 0 || in.Count > MaxProgressCount {
+			return errorResult(fmt.Sprintf("count: %d out of range [0, %d]", in.Count, MaxProgressCount)), nil, nil
+		}
+		if in.MS < 0 || in.MS > MaxSlowMS {
+			return errorResult(fmt.Sprintf("ms: %d out of range [0, %d]", in.MS, MaxSlowMS)), nil, nil
+		}
+		// The progress token is the client's; without one the spec forbids
+		// sending progress at all, and the SDK would have nothing to address.
+		token := req.Params.GetProgressToken()
+
+		send := func(i int) error {
+			if token == nil {
+				return nil
+			}
+			return req.Session.NotifyProgress(ctx, &mcp.ProgressNotificationParams{
+				ProgressToken: token,
+				Progress:      float64(i + 1),
+				Total:         float64(in.Count),
+				Message:       ProgressMessage,
+			})
+		}
+
+		for i := 0; in.Hang || i < in.Count; i++ {
+			if err := ctx.Err(); err != nil {
+				fmt.Fprintln(os.Stderr, SlowCancelledMarker)
+				return nil, nil, err
+			}
+			if err := send(i); err != nil {
+				return nil, nil, err
+			}
+			if in.MS > 0 {
+				t := time.NewTimer(time.Duration(in.MS) * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					t.Stop()
+					fmt.Fprintln(os.Stderr, SlowCancelledMarker)
+					return nil, nil, ctx.Err()
+				case <-t.C:
+				}
+			}
+		}
+		return textResult(fmt.Sprintf("sent %d", in.Count)), nil, nil
+	})
+
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        ToolLog,
+		Description: "Emits a server log message of the requested size.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in LogInput) (*mcp.CallToolResult, any, error) {
+		if in.Bytes < 0 || in.Bytes > MaxLogBytes {
+			return errorResult(fmt.Sprintf("bytes: %d out of range [0, %d]", in.Bytes, MaxLogBytes)), nil, nil
+		}
+		level := in.Level
+		if level == "" {
+			level = "info"
+		}
+		// Log is a no-op until the client has set a level; that is the SDK
+		// honoring the spec, not a failure, so the tool still replies.
+		err := req.Session.Log(ctx, &mcp.LoggingMessageParams{
+			Level:  mcp.LoggingLevel(level),
+			Logger: ServerName,
+			Data:   strings.Repeat(LogFill, in.Bytes),
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		return textResult(fmt.Sprintf("logged %d bytes at %s", in.Bytes, level)), nil, nil
+	})
+}
+
+// addExtraTools registers n trivial tools, so a test can build a catalog large
+// enough to paginate or to exceed a bound.
+func addExtraTools(s *mcp.Server, n int) {
+	for i := range n {
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        fmt.Sprintf("%s%d", ExtraToolPrefix, i),
+			Description: fmt.Sprintf("Filler tool %d.", i),
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		}, echoHandler)
+	}
 }
 
 // echoHandler is the handler shared by "echo" and, once mutation adds it,

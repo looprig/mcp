@@ -269,8 +269,14 @@ func TestConnectHappyPath(t *testing.T) {
 		Server:          ServerIdentity{Name: "srv", Version: "1.2.3", Title: "Test Server"},
 		TransportKind:   "fake",
 		RedactedOrigin:  "fake://server",
+		// A ready binding has adopted its first catalog, so Status reports it.
+		CatalogGeneration: 1,
+		CatalogDigest:     c.Catalog().Digest,
 	}
 	want.LastChange = got.LastChange
+	if want.CatalogDigest == "" {
+		t.Error("a ready binding reports no catalog digest")
+	}
 	if got.Failure != nil {
 		t.Errorf("Failure = %+v, want nil on a healthy binding", got.Failure)
 	}
@@ -618,7 +624,10 @@ func TestConnectEmitsStateChanges(t *testing.T) {
 		t.Fatalf("Connect() error = %v", err)
 	}
 
-	wantStartup := []State{StateStarting, StateReady}
+	// Discovering is not decoration: a caller watching states must be able to
+	// see that a binding is fetching its catalog, and the design requires the
+	// catalog to be adopted before ready.
+	wantStartup := []State{StateStarting, StateDiscovering, StateReady}
 	if got := rec.states(); !equalStates(got, wantStartup) {
 		t.Fatalf("states after Connect = %v, want %v", got, wantStartup)
 	}
@@ -641,7 +650,7 @@ func TestConnectEmitsStateChanges(t *testing.T) {
 	if err := c.Close(context.Background()); err != nil {
 		t.Fatalf("Close() error = %v", err)
 	}
-	wantAll := []State{StateStarting, StateReady, StateClosing, StateClosed}
+	wantAll := []State{StateStarting, StateDiscovering, StateReady, StateClosing, StateClosed}
 	if got := rec.states(); !equalStates(got, wantAll) {
 		t.Fatalf("states after Close = %v, want %v", got, wantAll)
 	}

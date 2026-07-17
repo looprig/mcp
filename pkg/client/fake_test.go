@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,6 +44,31 @@ type fakeConn struct {
 	listErr error
 	// lists counts every list call.
 	lists atomic.Int32
+
+	// The call surface. callResult is returned by CallTool unless callErr is
+	// set; callBlock makes it wait for ctx instead, which is how a deadline or
+	// a cancellation is exercised without a real slow server.
+	callResult protocol.ToolResult
+	callErr    error
+	callBlock  bool
+	// callProgress, when set, is emitted to the call's progress callback before
+	// CallTool blocks or returns.
+	callProgress []protocol.ProgressUpdate
+
+	promptResult   protocol.PromptResult
+	promptErr      error
+	resourceResult protocol.ResourceResult
+	resourceErr    error
+	subscribeErr   error
+
+	logLevelErr error
+
+	mu sync.Mutex
+	// calls records the raw name of every CallTool, and logLevel the level the
+	// client asked for, so a test can assert on what reached the wire.
+	calls     []string
+	logLevel  string
+	logLevels int
 }
 
 func (c *fakeConn) Initialize(ctx context.Context) (protocol.InitializeResult, error) {
@@ -83,6 +109,65 @@ func (c *fakeConn) ListTools(_ context.Context, cursor string) (protocol.ToolPag
 		return c.toolPages[i], nil
 	}
 	return protocol.ToolPage{Tools: c.tools}, nil
+}
+
+func (c *fakeConn) CallTool(ctx context.Context, rawName string, _ json.RawMessage, opts protocol.CallOptions) (protocol.ToolResult, error) {
+	c.mu.Lock()
+	c.calls = append(c.calls, rawName)
+	c.mu.Unlock()
+
+	for _, u := range c.callProgress {
+		if opts.Progress != nil {
+			opts.Progress(u)
+		}
+	}
+	if c.callBlock {
+		<-ctx.Done()
+		return protocol.ToolResult{}, ctx.Err()
+	}
+	if c.callErr != nil {
+		return protocol.ToolResult{}, c.callErr
+	}
+	return c.callResult, nil
+}
+
+func (c *fakeConn) GetPrompt(_ context.Context, _ string, _ map[string]string) (protocol.PromptResult, error) {
+	if c.promptErr != nil {
+		return protocol.PromptResult{}, c.promptErr
+	}
+	return c.promptResult, nil
+}
+
+func (c *fakeConn) ReadResource(_ context.Context, _ string) (protocol.ResourceResult, error) {
+	if c.resourceErr != nil {
+		return protocol.ResourceResult{}, c.resourceErr
+	}
+	return c.resourceResult, nil
+}
+
+func (c *fakeConn) Subscribe(_ context.Context, _ string) error { return c.subscribeErr }
+
+func (c *fakeConn) SetLogLevel(_ context.Context, level string) error {
+	c.mu.Lock()
+	c.logLevel = level
+	c.logLevels++
+	c.mu.Unlock()
+	return c.logLevelErr
+}
+
+// callNames returns the raw names CallTool was asked for, in order.
+func (c *fakeConn) callNames() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.calls)
+}
+
+// requestedLogLevel returns the level the client asked the server for, and how
+// many times it asked.
+func (c *fakeConn) requestedLogLevel() (string, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.logLevel, c.logLevels
 }
 
 func (c *fakeConn) ListPrompts(context.Context, string) (protocol.PromptPage, error) {

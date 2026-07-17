@@ -16,7 +16,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/looprig/mcp/internal/catalog"
 	"github.com/looprig/mcp/internal/lifecycle"
+	"github.com/looprig/mcp/internal/limits"
 	"github.com/looprig/mcp/internal/protocol"
 )
 
@@ -35,8 +37,14 @@ const (
 const (
 	opConnect    = "connect"
 	opInitialize = "initialize"
+	opDiscover   = "discover"
 	opClose      = "close"
 )
+
+// firstGeneration is the number given to the catalog discovered at startup.
+// Generations are 1-based so that zero can mean "none adopted" (see
+// Catalog.Valid).
+const firstGeneration = 1
 
 // Client is one connection to one MCP server. It is safe for concurrent use.
 // A Client is always either usable or closed: Connect never returns one that
@@ -51,6 +59,9 @@ type Client struct {
 	// the watcher's reference to this Client; it is only ever touched inside
 	// closeOnce.
 	unwatch func()
+	// logHandler is the application's log callback, captured at construction.
+	// It is read-only after that, so it needs no lock.
+	logHandler LogHandler
 
 	// connOnce guards the single Close of conn. Both Connect's unwind path and
 	// Close go through it, so a conn can never be closed twice.
@@ -71,6 +82,10 @@ type Client struct {
 	protocolVersion string
 	failure         *Failure
 	lastChange      time.Time
+	// generation is the adopted catalog, or nil before discovery has published
+	// one. The Generation it points at is immutable, so only the pointer needs
+	// guarding.
+	generation *catalog.Generation
 }
 
 // Connect establishes a binding: it validates def, opens a transport, performs
@@ -111,7 +126,7 @@ func Connect(ctx context.Context, def Definition, h Handlers) (*Client, error) {
 // watcher already registered, so no transition can be missed by a caller's
 // event handler.
 func newClient(def Definition, h Handlers) *Client {
-	c := &Client{def: def, machine: lifecycle.NewMachine()}
+	c := &Client{def: def, machine: lifecycle.NewMachine(), logHandler: h.Log}
 	c.unwatch = c.machine.Watch(func(from, to lifecycle.State) {
 		now := time.Now()
 		c.mu.Lock()
@@ -130,12 +145,12 @@ func newClient(def Definition, h Handlers) *Client {
 	return c
 }
 
-// start runs the startup sequence: configured -> starting -> ready.
+// start runs the startup sequence: configured -> starting -> discovering ->
+// ready.
 //
 // Authentication (StateAuthenticating) is skipped: no transport in this module
-// authenticates yet, and the lifecycle permits starting -> ready directly.
-// Discovery inserts StateDiscovering between the handshake and StateReady when
-// it lands; the transition table already allows it.
+// authenticates yet, and the lifecycle permits starting -> discovering
+// directly.
 func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) error {
 	if err := c.to(lifecycle.StateStarting, opConnect); err != nil {
 		return err
@@ -146,6 +161,7 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 		Capabilities: caps,
 		Bounds:       c.def.Limits.bounds(),
 		Wire:         c.def.Limits.wire(),
+		OnLog:        c.logAdapter(),
 	})
 	if err != nil {
 		return c.fail(ctx, opConnect, err, FailureTransportClosed)
@@ -175,14 +191,95 @@ func (c *Client) start(ctx context.Context, caps protocol.ClientCapabilities) er
 	c.protocolVersion = string(res.ProtocolVersion)
 	c.mu.Unlock()
 
-	// A refused transition here means shutdown overtook startup after the
-	// handshake succeeded. The conn is established at this point, so this
-	// unwinds like any other failed step — the alternative is an open
+	// From here on the conn is established, so every failure — including a
+	// refused transition, which means shutdown overtook startup — unwinds
+	// through the same path that closes it. The alternative is an open
 	// connection owned by nobody.
-	if err := c.to(lifecycle.StateReady, opInitialize); err != nil {
+	if err := c.to(lifecycle.StateDiscovering, opDiscover); err != nil {
+		return c.unwind(ctx, err)
+	}
+	if err := c.discover(ctx, conn, res); err != nil {
+		return err
+	}
+	// Adoption happens before ready (design's discovery step 9): a caller that
+	// observes StateReady can always read the catalog that goes with it.
+	if err := c.to(lifecycle.StateReady, opDiscover); err != nil {
 		return c.unwind(ctx, err)
 	}
 	return nil
+}
+
+// discover fetches the initial catalog and adopts it, and sets the server's log
+// level if this binding wants logs.
+//
+// A discovery failure is terminal for startup: a binding with no catalog has
+// nothing to offer, and pretending otherwise would produce a ready Client whose
+// every call fails. It unwinds like any other startup step, so the transport is
+// closed and the caller gets a typed error.
+func (c *Client) discover(ctx context.Context, conn protocol.Conn, res protocol.InitializeResult) error {
+	gen, err := catalog.Discover(ctx, conn, catalog.Config{
+		Binding:   string(c.def.Name),
+		Number:    firstGeneration,
+		Handshake: res,
+		Limits:    c.def.Limits.catalog(),
+	})
+	if err != nil {
+		return c.fail(ctx, opDiscover, err, discoveryClass(err))
+	}
+
+	c.mu.Lock()
+	c.generation = gen
+	c.mu.Unlock()
+
+	// An MCP server sends no log messages until a level is set, so a binding
+	// that installed a log handler and never asked would sit in silence and be
+	// unable to tell it from a quiet server. Only ask when there is both a
+	// handler to receive them and a server that advertised logging.
+	if c.logHandler != nil && res.Capabilities.Logging {
+		if err := conn.SetLogLevel(ctx, string(c.def.LogLevel)); err != nil {
+			// Logs are diagnostics. A server that will not enable them is not a
+			// reason to refuse an otherwise-working binding, so this is
+			// recorded and startup continues.
+			c.recordFailure(NewError(FailureServerProtocol, c.def.Name, opDiscover,
+				"the server refused to set a log level; its logs will not arrive", err))
+		}
+	}
+	return nil
+}
+
+// discoveryClass maps a discovery failure onto the class a caller branches on.
+//
+// The two catalog classes are genuinely different to a caller: an over-limit
+// catalog is well-formed and might be accepted with a raised bound, while a
+// defective one is broken whatever the bounds are.
+func discoveryClass(err error) FailureClass {
+	var over *limits.OverLimitError
+	if errors.As(err, &over) {
+		return FailureCatalogOverLimit
+	}
+	var defect *catalog.DefectError
+	if errors.As(err, &defect) {
+		return FailureCatalogInvalid
+	}
+	return FailureServerProtocol
+}
+
+// logAdapter wraps the application's log handler into the neutral callback the
+// connection takes, tagging each record with the binding. A nil handler stays
+// nil, so a log arriving for a binding that wants none is dropped at the
+// boundary rather than converted first.
+func (c *Client) logAdapter() func(protocol.LogRecord) {
+	if c.logHandler == nil {
+		return nil
+	}
+	return func(r protocol.LogRecord) {
+		c.logHandler(LogMessage{
+			Binding: c.def.Name,
+			Level:   LogLevel(r.Level),
+			Logger:  r.Logger,
+			Text:    r.Text,
+		})
+	}
 }
 
 // isNilConn reports whether a transport handed back no connection.
@@ -321,6 +418,10 @@ func (c *Client) Status() Status {
 	s.ProtocolVersion = c.protocolVersion
 	s.Server = c.server
 	s.LastChange = c.lastChange
+	if c.generation != nil {
+		s.CatalogGeneration = c.generation.Number()
+		s.CatalogDigest = c.generation.Digest().String()
+	}
 	if c.failure != nil {
 		// Copy: a caller must not be able to rewrite the client's own record.
 		f := *c.failure
