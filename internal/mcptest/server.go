@@ -331,6 +331,22 @@ type BigInput struct {
 // MutateInput is the "mutate" tool's argument.
 type MutateInput struct {
 	Add bool `json:"add" jsonschema:"true to add the echo2 tool, false to remove it"`
+	// Schema re-adds echo2 under a DIFFERENT input schema.
+	//
+	// It exists because "the tool kept its name and changed its contract" is
+	// otherwise unreachable: add/remove can only make a tool appear or vanish,
+	// and a client's schema-drift handling is invisible against a server that
+	// never drifts. With it, one call turns generation N's echo2(text) into
+	// generation N+1's echo2(word) — same name, same server, incompatible
+	// interface.
+	Schema bool `json:"schema,omitempty" jsonschema:"with add, register echo2 under a different input schema"`
+}
+
+// MutatedAltInput is ToolMutated's argument when MutateInput.Schema asked for the
+// alternative schema. The field name differs from EchoInput's, so the tool's
+// input-schema digest differs too — which is the whole point.
+type MutatedAltInput struct {
+	Word string `json:"word" jsonschema:"the word to echo back verbatim"`
 }
 
 // DefaultFailMessage is what "fail" reports when the client sends no message.
@@ -550,16 +566,30 @@ func addMutateTool(s *mcp.Server) {
 		Name:        ToolMutate,
 		Description: "Adds or removes the " + ToolMutated + " tool, triggering tools/list_changed.",
 	}, func(_ context.Context, _ *mcp.CallToolRequest, in MutateInput) (*mcp.CallToolResult, any, error) {
-		if in.Add {
+		if !in.Add {
+			s.RemoveTools(ToolMutated)
+			return textResult("removed " + ToolMutated), nil, nil
+		}
+		// Remove first, even when re-adding: the SDK infers the schema from the
+		// handler's argument type at AddTool, and removing makes the replacement
+		// unambiguous rather than dependent on whether AddTool overwrites.
+		s.RemoveTools(ToolMutated)
+		if in.Schema {
 			mcp.AddTool(s, &mcp.Tool{
 				Name:        ToolMutated,
-				Description: "A second echo, added at runtime.",
+				Description: "A second echo, re-added at runtime under a different schema.",
 				Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
-			}, echoHandler)
-			return textResult("added " + ToolMutated), nil, nil
+			}, func(_ context.Context, _ *mcp.CallToolRequest, in MutatedAltInput) (*mcp.CallToolResult, any, error) {
+				return textResult(in.Word), nil, nil
+			})
+			return textResult("added " + ToolMutated + " with the alternative schema"), nil, nil
 		}
-		s.RemoveTools(ToolMutated)
-		return textResult("removed " + ToolMutated), nil, nil
+		mcp.AddTool(s, &mcp.Tool{
+			Name:        ToolMutated,
+			Description: "A second echo, added at runtime.",
+			Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+		}, echoHandler)
+		return textResult("added " + ToolMutated), nil, nil
 	})
 }
 
