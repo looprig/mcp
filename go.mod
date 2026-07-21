@@ -32,8 +32,6 @@ require (
 	github.com/gookit/color v1.6.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/invopop/jsonschema v0.14.0 // indirect
-	github.com/looprig/core v0.2.0 // indirect
-	github.com/looprig/inference v0.3.0 // indirect
 	github.com/openai/openai-go/v3 v3.42.0 // indirect
 	github.com/pb33f/ordered-map/v2 v2.3.1 // indirect
 	github.com/securego/gosec/v2 v2.28.0 // indirect
@@ -72,7 +70,11 @@ require (
 	honnef.co/go/tools v0.7.0 // indirect
 )
 
-require github.com/looprig/harness v0.0.0
+require (
+	github.com/looprig/core v0.2.0
+	github.com/looprig/harness v0.0.0
+	github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3
+)
 
 replace github.com/looprig/harness => ../harness
 

@@ -10,6 +10,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/mcp/internal/protocol"
 	"github.com/looprig/mcp/pkg/client"
@@ -75,7 +76,7 @@ func notify(t *testing.T, tr *scriptedTransport) {
 
 // managerWith builds and starts a Manager with explicit deps, and closes it on
 // cleanup. It is startedManager's sibling for the tests that need to observe a
-// Reporter or a ScopePolicy.
+// Reporter.
 func managerWith(t *testing.T, deps Deps, bindings ...Binding) *Manager {
 	t.Helper()
 	// Required, like startedManager's: Start's return then means every binding
@@ -139,9 +140,39 @@ func modelNames(defs []tool.Definition) []string {
 	return out
 }
 
+// newExecID mints a fresh execution ID the way the runner does.
+func newExecID(t *testing.T) uuid.UUID {
+	t.Helper()
+	id, err := uuid.New()
+	if err != nil {
+		t.Fatalf("uuid.New: %v", err)
+	}
+	return id
+}
+
+// prepare runs the tool's preparation step the way the runner does: mint an
+// execution ID, call PrepareCall once, and hand back the prepared contract.
+func prepare(t *testing.T, it tool.InvokableTool, args string) tool.PreparedCall {
+	t.Helper()
+	preparer, ok := it.(tool.CallPreparer)
+	if !ok {
+		t.Fatal("an MCP tool does not implement tool.CallPreparer: an unprepared effectful tool fails closed and can never run")
+	}
+	execID := newExecID(t)
+	req, art, err := preparer.PrepareCall(context.Background(), execID, args)
+	if err != nil {
+		t.Fatalf("PrepareCall(%q): %v", args, err)
+	}
+	return tool.PreparedCall{ExecutionID: execID, Request: req, Artifact: art}
+}
+
+// run executes a full prepared call: PrepareCall, then InvokableRun under the
+// prepared contract, exactly as the runner sequences them. MCP tools are
+// direct/external, so the grant slice stays empty.
 func run(t *testing.T, it tool.InvokableTool, args string) *tool.ToolResult {
 	t.Helper()
-	res, err := it.InvokableRun(context.Background(), args)
+	call := prepare(t, it, args)
+	res, err := it.InvokableRun(loop.WithPreparedCall(context.Background(), call), args)
 	if err != nil {
 		t.Fatalf("InvokableRun returned a Go error (%v); an MCP tool's failures are tool results", err)
 	}
@@ -586,10 +617,13 @@ func TestEmptyResultIsNotAnError(t *testing.T) {
 	}
 }
 
-// TestPermissionRequestCarriesNoArguments is design §Permissions: no
-// credentials, no request bodies, no unbounded arguments in a gate or an audit
-// event. The canary is in the arguments, where a real secret would be.
-func TestPermissionRequestCarriesNoArguments(t *testing.T) {
+// TestPrepareCallEmitsStableToolInvokeRequirement is design §Permissions under
+// the preparation boundary: PrepareCall produces exactly one tool.invoke
+// requirement, scoped to the stable MCP binding/tool identity, with an empty
+// grant pair (an MCP tool is direct/external — no executor grant exists) and no
+// durable rule candidates. The canary sits in the arguments, where a real
+// secret would be: nothing the gate or a persisted rule sees may carry it.
+func TestPrepareCallEmitsStableToolInvokeRequirement(t *testing.T) {
 	t.Parallel()
 
 	const canary = "ghp_canary_token_do_not_leak"
@@ -599,28 +633,78 @@ func TestPermissionRequestCarriesNoArguments(t *testing.T) {
 	m := managerWith(t, testDeps(), scriptedBinding("github", ScopeSession, tr))
 	it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__github__search_issues")
 
-	prompter, ok := it.(tool.PermissionPrompter)
+	preparer, ok := it.(tool.CallPreparer)
 	if !ok {
-		t.Fatal("an MCP tool does not implement tool.PermissionPrompter: it would gate as an unknown capability")
+		t.Fatal("an MCP tool does not implement tool.CallPreparer: an unprepared effectful tool fails closed")
 	}
-	req, err := prompter.BuildRequest(args, nil)
+	execID := newExecID(t)
+	req, art, err := preparer.PrepareCall(context.Background(), execID, args)
 	if err != nil {
-		t.Fatalf("BuildRequest: %v", err)
+		t.Fatalf("PrepareCall: %v", err)
 	}
-	if strings.Contains(req.Description(), canary) {
-		t.Errorf("gate description = %q, want it free of the arguments", req.Description())
+
+	// The request is bound to the minted execution ID and validates.
+	if req.ExecutionID != execID.String() {
+		t.Errorf("ExecutionID = %q, want the minted %q", req.ExecutionID, execID)
 	}
-	if strings.Contains(req.ToolName(), canary) {
-		t.Errorf("gate tool name = %q, want it free of the arguments", req.ToolName())
+	if err := tool.ValidateRequest(req); err != nil {
+		t.Errorf("ValidateRequest: %v, want a valid prepared request", err)
+	}
+
+	if len(req.Requirements) != 1 {
+		t.Fatalf("requirements = %d, want exactly one tool.invoke", len(req.Requirements))
+	}
+	requirement := req.Requirements[0]
+	if CapabilityToolInvoke != "tool.invoke" {
+		t.Fatalf("CapabilityToolInvoke = %q, want the product-bound tool.invoke string CodeRig binds", CapabilityToolInvoke)
+	}
+	if requirement.Kind != CapabilityToolInvoke {
+		t.Errorf("Kind = %q, want the consumer-bound tool.invoke", requirement.Kind)
 	}
 	// The identity an approval persists against names the binding AND the raw
-	// tool: a grant on one server must never satisfy a call to another.
-	if req.ToolName() != "mcp:github:search_issues" {
-		t.Errorf("permission identity = %q, want mcp:github:search_issues", req.ToolName())
+	// tool: a rule matched on one server must never satisfy a call to another.
+	want := ToolInvokeIdentity("github", "search_issues")
+	if want != "mcp:github:search_issues" {
+		t.Fatalf("ToolInvokeIdentity = %q, want the documented mcp:<binding>:<raw-tool> encoding", want)
+	}
+	if requirement.Scope != want || requirement.Match != want {
+		t.Errorf("Scope/Match = %q/%q, want both %q", requirement.Scope, requirement.Match, want)
+	}
+	// Direct/external: empty grant pair, and no durable rule candidates —
+	// tool.invoke is always Gated by the consumer, never persisted as a rule
+	// this adapter offers.
+	if requirement.GrantClass != "" || requirement.GrantTarget != "" {
+		t.Errorf("grant pair = %q/%q, want empty: an MCP tool enforces nothing post-decision", requirement.GrantClass, requirement.GrantTarget)
+	}
+	if len(requirement.Candidates) != 0 {
+		t.Errorf("candidates = %v, want none", requirement.Candidates)
 	}
 	// It must still say enough to decide on.
-	if !strings.Contains(req.Description(), "github") || !strings.Contains(req.Description(), "search_issues") {
-		t.Errorf("gate description = %q, want it to name the server and the tool", req.Description())
+	if !strings.Contains(requirement.Description, "github") || !strings.Contains(requirement.Description, "search_issues") {
+		t.Errorf("Description = %q, want it to name the server and the tool", requirement.Description)
+	}
+
+	// Redaction: raw arguments appear nowhere the gate reads.
+	for field, value := range map[string]string{
+		"ToolName":    req.ToolName,
+		"Summary":     req.Summary,
+		"Scope":       requirement.Scope,
+		"Match":       requirement.Match,
+		"Description": requirement.Description,
+	} {
+		if strings.Contains(value, canary) {
+			t.Errorf("%s = %q, want it free of the arguments", field, value)
+		}
+	}
+
+	// The artifact binds the normalized arguments for execution — it is the one
+	// place the arguments travel past preparation.
+	token, ok := art.(tool.TokenArtifact)
+	if !ok {
+		t.Fatalf("artifact = %T, want a tool.TokenArtifact carrying the normalized arguments", art)
+	}
+	if token.Token != args {
+		t.Errorf("artifact = %q, want the validated arguments verbatim", token.Token)
 	}
 
 	auditable, ok := it.(tool.Auditable)
@@ -632,84 +716,141 @@ func TestPermissionRequestCarriesNoArguments(t *testing.T) {
 	}
 }
 
-// TestPermissionScopesComeFromThePolicy checks the host's ScopePolicy decides
-// persistence breadth, and that a policy refusing every scope fails the prompt
-// closed rather than offering nothing to grant.
-func TestPermissionScopesComeFromThePolicy(t *testing.T) {
+// TestPrepareCallIdentityIsStableAcrossCalls: the requirement a persisted rule
+// would match must not vary with the arguments or the execution — same binding,
+// same tool, same Kind/Scope/Match/Description, every call.
+func TestPrepareCallIdentityIsStableAcrossCalls(t *testing.T) {
 	t.Parallel()
 
 	tr := okTransport("srv", "do")
-	deps := testDeps()
-	deps.ScopePolicy = fixedScopePolicy{scopes: []tool.ApprovalScope{tool.ScopeOnce}}
-	m := managerWith(t, deps, scriptedBinding("srv", ScopeSession, tr))
+	m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
 	it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
+	preparer := it.(tool.CallPreparer)
 
-	req, err := it.(tool.PermissionPrompter).BuildRequest(`{}`, nil)
+	first, _, err := preparer.PrepareCall(context.Background(), newExecID(t), `{"q":"alpha"}`)
 	if err != nil {
-		t.Fatalf("BuildRequest: %v", err)
+		t.Fatalf("PrepareCall: %v", err)
 	}
-	if scopes := req.AllowedScopes(); len(scopes) != 1 || scopes[0] != tool.ScopeOnce {
-		t.Errorf("scopes = %v, want the policy's [ScopeOnce]", scopes)
+	second, _, err := preparer.PrepareCall(context.Background(), newExecID(t), `{"entirely":"different","shape":[1,2,3]}`)
+	if err != nil {
+		t.Fatalf("PrepareCall: %v", err)
 	}
-
-	refusing := testDeps()
-	refusing.ScopePolicy = fixedScopePolicy{}
-	m2 := managerWith(t, refusing, scriptedBinding("srv", ScopeSession, okTransport("srv", "do")))
-	it2 := buildOne(t, m2.SessionTools(loopA, "primary"), "mcp__srv__do")
-	if _, err := it2.(tool.PermissionPrompter).BuildRequest(`{}`, nil); err == nil {
-		t.Error("BuildRequest with no scopes succeeded; a policy that refuses must fail the prompt closed")
+	if len(first.Requirements) != 1 || len(second.Requirements) != 1 {
+		t.Fatalf("requirements = %d/%d, want one each", len(first.Requirements), len(second.Requirements))
+	}
+	a, b := first.Requirements[0], second.Requirements[0]
+	if a.Kind != b.Kind || a.Scope != b.Scope || a.Match != b.Match || a.Description != b.Description {
+		t.Errorf("requirement varies across calls:\n  %+v\n  %+v\nwant a stable identity a persisted rule could match", a, b)
 	}
 }
 
-// TestPermissionIdentityFailsClosedWhenOverLong is the aliasing guard.
-//
-// tool.NewExternalRequest bounds a tool name to 128 bytes, and a raw MCP tool
-// name may be longer than that budget leaves. Truncating would make two tools
-// share one identity, so an approval for one would silently authorize the
-// other. Refusing costs a call; aliasing costs the boundary.
-func TestPermissionIdentityFailsClosedWhenOverLong(t *testing.T) {
+// TestPrepareCallRejectsMalformedArguments: invalid input fails at preparation
+// and never reaches the gate or the server (fail-secure; the runner turns the
+// error into a tool-result refusal).
+func TestPrepareCallRejectsMalformedArguments(t *testing.T) {
 	t.Parallel()
 
-	at := &adaptedTool{
-		binding:  "srv",
-		rawTool:  strings.Repeat("x", 200),
-		scopes:   fixedScopePolicy{scopes: defaultScopes},
-		identity: permissionIdentity("srv", strings.Repeat("x", 200)),
+	tr := okTransport("srv", "do")
+	m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
+	it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
+
+	if _, _, err := it.(tool.CallPreparer).PrepareCall(context.Background(), newExecID(t), `{"broken`); err == nil {
+		t.Error("PrepareCall accepted arguments that are not JSON")
 	}
-	req, err := at.BuildRequest(`{}`, nil)
-	if err == nil {
-		t.Fatalf("BuildRequest = %q, want a refusal: a truncated identity is a shared identity", req.ToolName())
+	if tr.conn.calls.Load() != 0 {
+		t.Error("malformed arguments reached the server")
 	}
 }
 
-// TestArgumentNormalization checks what actually reaches the wire.
+// TestArgumentNormalization checks what preparation binds for the wire: absent
+// arguments become an empty object at PrepareCall time, and that is what the
+// server receives.
 func TestArgumentNormalization(t *testing.T) {
 	t.Parallel()
 
-	t.Run("no arguments become an empty object", func(t *testing.T) {
-		t.Parallel()
-		tr := okTransport("srv", "do")
-		m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
-		it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
-		run(t, it, "")
-		if _, args := tr.conn.lastCall(); args != `{}` {
-			t.Errorf("args on the wire = %q, want {}: an empty string is not JSON", args)
-		}
-	})
+	tr := okTransport("srv", "do")
+	m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
+	it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
 
-	t.Run("arguments that are not JSON are refused, not forwarded", func(t *testing.T) {
-		t.Parallel()
-		tr := okTransport("srv", "do")
-		m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
-		it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
-		res := run(t, it, `{"broken`)
-		if !strings.Contains(resultText(res), "not valid JSON") {
-			t.Errorf("result = %q, want a refusal", resultText(res))
-		}
-		if tr.conn.calls.Load() != 0 {
-			t.Error("non-JSON arguments were posted to the server")
-		}
+	_, art, err := it.(tool.CallPreparer).PrepareCall(context.Background(), newExecID(t), "   ")
+	if err != nil {
+		t.Fatalf("PrepareCall: %v", err)
+	}
+	if token, ok := art.(tool.TokenArtifact); !ok || token.Token != `{}` {
+		t.Errorf("artifact = %#v, want {}: an empty string is not JSON", art)
+	}
+
+	run(t, it, "")
+	if _, args := tr.conn.lastCall(); args != `{}` {
+		t.Errorf("args on the wire = %q, want {}", args)
+	}
+}
+
+// TestRunExecutesThePreparedArtifactNotTheRawArguments is the no-reparse rule:
+// what reaches the wire is what preparation validated and the gate decided on,
+// never the raw argsJSON handed to InvokableRun.
+func TestRunExecutesThePreparedArtifactNotTheRawArguments(t *testing.T) {
+	t.Parallel()
+
+	tr := okTransport("srv", "do")
+	m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
+	it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
+
+	call := prepare(t, it, `{"approved":true}`)
+	ctx := loop.WithPreparedCall(context.Background(), call)
+	if _, err := it.InvokableRun(ctx, `{"swapped":"after the prompt"}`); err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if _, args := tr.conn.lastCall(); args != `{"approved":true}` {
+		t.Errorf("args on the wire = %q, want the prepared %q", args, `{"approved":true}`)
+	}
+}
+
+// TestRunFailsClosedWithoutAPreparedCall: an MCP call is effectful, so running
+// outside a prepared contract is refused — as a tool result, never a Go error —
+// and the server is never contacted.
+func TestRunFailsClosedWithoutAPreparedCall(t *testing.T) {
+	t.Parallel()
+
+	tr := okTransport("srv", "do")
+	m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
+	it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
+
+	res, err := it.InvokableRun(context.Background(), `{}`)
+	if err != nil {
+		t.Fatalf("InvokableRun returned a Go error (%v); an MCP tool's failures are tool results", err)
+	}
+	if !strings.HasPrefix(resultText(res), errPrefix) {
+		t.Errorf("result = %q, want a refusal", resultText(res))
+	}
+	if tr.conn.calls.Load() != 0 {
+		t.Error("a call without a prepared contract reached the server")
+	}
+}
+
+// TestRunFailsClosedOnAForeignArtifact: a prepared contract carrying some other
+// tool's artifact type is not this call's — refuse it rather than guess.
+func TestRunFailsClosedOnAForeignArtifact(t *testing.T) {
+	t.Parallel()
+
+	tr := okTransport("srv", "do")
+	m := managerWith(t, testDeps(), scriptedBinding("srv", ScopeSession, tr))
+	it := buildOne(t, m.SessionTools(loopA, "primary"), "mcp__srv__do")
+
+	ctx := loop.WithPreparedCall(context.Background(), tool.PreparedCall{
+		ExecutionID: newExecID(t),
+		Artifact:    &tool.SkillArtifact{Body: "not an MCP artifact"},
 	})
+	res, err := it.InvokableRun(ctx, `{}`)
+	if err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if !strings.HasPrefix(resultText(res), errPrefix) {
+		t.Errorf("result = %q, want a refusal", resultText(res))
+	}
+	if tr.conn.calls.Load() != 0 {
+		t.Error("a foreign artifact reached the server")
+	}
 }
 
 // TestContentConversion is design §Content conversion and limits: every kind

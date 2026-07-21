@@ -80,9 +80,9 @@ import (
 //
 // Rebinding is refused rather than allowed because a Manager's bindings belong to
 // one Session: the connections are live, their elicitations route to one host's
-// gates, and their approvals persist at Session breadth (see defaultScopes). A
-// Manager that changed Sessions under a running server would move all of that
-// somewhere the user never agreed to.
+// gates, and the tool.invoke approvals their calls raise are decided against one
+// host's access source. A Manager that changed Sessions under a running server
+// would move all of that somewhere the user never agreed to.
 var ErrAlreadyBound = fmt.Errorf("mcp: manager is already bound to a session")
 
 // ErrNotBound is returned by an operation that needs a Session from a Manager

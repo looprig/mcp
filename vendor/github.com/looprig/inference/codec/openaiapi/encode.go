@@ -14,6 +14,10 @@ import (
 // struct. Exported so provider packages can embed or extend the result before
 // marshaling (e.g. a provider extension adds an encrypted-response public-key field).
 func BuildChatRequest(req inference.Request, stream bool) (ChatRequest, error) {
+	if err := inference.ValidateRequestFeatures(req); err != nil {
+		return ChatRequest{}, err
+	}
+
 	// Effective sampling: a non-nil per-call Override wins over Model.Sampling.
 	sampling := req.Model.Sampling
 	if req.Override != nil {
@@ -57,6 +61,19 @@ func BuildChatRequest(req inference.Request, stream bool) (ChatRequest, error) {
 				Parameters:  t.Schema,
 			},
 		})
+	}
+	if req.Output != nil {
+		cr.ResponseFormat = &responseFormat{
+			Type: responseFormatJSONSchema,
+			JSONSchema: &jsonSchema{
+				Name:   req.Output.Name,
+				Strict: req.Output.Strict,
+				Schema: req.Output.Schema,
+			},
+		}
+	}
+	if req.ToolChoice == inference.ToolChoiceRequired {
+		cr.ToolChoice = toolChoiceRequired
 	}
 
 	return cr, nil
@@ -102,9 +119,13 @@ func encodeConversation(conv content.Conversation) ([]chatMessage, error) {
 		}}, nil
 
 	case *content.UserMessage:
+		parts, err := encodeContentParts(m.Blocks)
+		if err != nil {
+			return nil, err
+		}
 		return []chatMessage{{
 			Role:    "user",
-			Content: encodeContentParts(m.Blocks),
+			Content: parts,
 		}}, nil
 
 	case *content.AIMessage:
@@ -125,9 +146,13 @@ func encodeConversation(conv content.Conversation) ([]chatMessage, error) {
 		// verbatim, so there the message-level IsError is the only structured signal.
 		// IsError exists for the internal wire form and the display layer, not for
 		// this provider's request.
+		text, err := toolResultText(m.Blocks)
+		if err != nil {
+			return nil, err
+		}
 		return []chatMessage{{
 			Role:       "tool",
-			Content:    textContent(m.Blocks),
+			Content:    text,
 			ToolCallID: m.ToolUseID,
 		}}, nil
 
@@ -147,9 +172,26 @@ func textContent(blocks []content.Block) string {
 	return out
 }
 
-// encodeContentParts returns a plain string when all blocks are text,
-// or a []chatContentPart slice when non-text blocks are present.
-func encodeContentParts(blocks []content.Block) interface{} {
+// toolResultText flattens a tool result's blocks to the plain string the
+// text-only OpenAI tool message carries. Any non-text block yields a typed
+// *UnsupportedBlockError — fail-secure, never a silent drop.
+func toolResultText(blocks []content.Block) (string, error) {
+	var out string
+	for _, b := range blocks {
+		t, ok := b.(*content.TextBlock)
+		if !ok {
+			return "", &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
+		}
+		out += t.Text
+	}
+	return out, nil
+}
+
+// encodeContentParts returns a plain string when all blocks are text, or a
+// []chatContentPart slice when image blocks are present. A block type the
+// dialect does not model in a user turn (audio, document, …) yields a typed
+// *UnsupportedBlockError — fail-secure, never a silent drop.
+func encodeContentParts(blocks []content.Block) (interface{}, error) {
 	allText := true
 	for _, b := range blocks {
 		if _, ok := b.(*content.TextBlock); !ok {
@@ -158,7 +200,7 @@ func encodeContentParts(blocks []content.Block) interface{} {
 		}
 	}
 	if allText {
-		return textContent(blocks)
+		return textContent(blocks), nil
 	}
 
 	parts := make([]chatContentPart, 0, len(blocks))
@@ -168,9 +210,11 @@ func encodeContentParts(blocks []content.Block) interface{} {
 			parts = append(parts, chatContentPart{Type: "text", Text: b.Text})
 		case *content.ImageBlock:
 			parts = append(parts, chatContentPart{Type: "image_url", ImageURL: &imageURLPart{URL: imageURL(b)}})
+		default:
+			return nil, &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
 		}
 	}
-	return parts
+	return parts, nil
 }
 
 // imageURL builds the URL string for an ImageBlock. URL takes precedence over
@@ -214,6 +258,8 @@ func encodeAIMessage(m *content.AIMessage) (chatMessage, error) {
 			})
 		case *content.ThinkingBlock:
 			// Deliberately ignored: thinking is not part of the OpenAI wire format.
+		default:
+			return chatMessage{}, &UnsupportedBlockError{Block: fmt.Sprintf("%T", b)}
 		}
 	}
 

@@ -33,6 +33,7 @@ import (
 
 	"github.com/looprig/core/content"
 	"github.com/looprig/core/uuid"
+	"github.com/looprig/harness/pkg/loop"
 	"github.com/looprig/harness/pkg/tool"
 	"github.com/looprig/mcp/pkg/client"
 )
@@ -64,17 +65,31 @@ const (
 	maxResultTextBytes = 64 << 10
 	// maxResultBlocks caps how many blocks one result may contribute.
 	maxResultBlocks = 32
-	// maxArgsSummaryBytes is not a bound on what is sent — it is the size the
-	// permission summary is allowed to REPORT. See buildRequest.
-	maxArgsSummaryBytes = 1 << 20
 )
 
-// permissionIdentity is the stable capability identity of one MCP tool
-// (design §Permissions). It is what an approval is persisted against, so it
-// must name the binding AND the raw tool: a grant for "search_issues" on the
-// github binding must never satisfy a call to "search_issues" on some other
-// server that happens to use the same word.
-func permissionIdentity(binding, rawTool string) string {
+// CapabilityToolInvoke is the normalized capability kind every external MCP
+// tool emits from preparation. It is a CONSUMER-BOUND kind: the consumer routes
+// it to its own product access source via a gate AccessBinding (the
+// access-profile spec names CodeRig's binding), never to a sandbox profile, and
+// it is never silently mapped to command execution. The gate always resolves it
+// Gated — one combined approval or one persisted rule keyed on the tool
+// identity — so a tool.invoke requirement carries no reusable rule candidates
+// of this adapter's own. The string is the product-bound kind CodeRig binds
+// (coderig-assembly: tools emit "tool.invoke").
+const CapabilityToolInvoke = "tool.invoke"
+
+// ToolInvokeIdentity is the stable capability identity of one MCP tool
+// (requirement Scope and Match). It is what a persisted allow rule is keyed on,
+// so it must be deterministic across calls for the same tool AND name the
+// binding together with the raw tool: a rule for "search_issues" on the github
+// binding must never satisfy a call to "search_issues" on some other server
+// that happens to use the same word.
+//
+// The encoding is "mcp:<binding>:<raw-tool>". Both components are already
+// validated identifiers — the binding by client.Name, the raw tool by the
+// catalog's validateRawName — so the identity is bounded, control-free, and
+// carries no argument material (redaction: the arguments never enter it).
+func ToolInvokeIdentity(binding, rawTool string) string {
 	return "mcp:" + binding + ":" + rawTool
 }
 
@@ -104,17 +119,15 @@ type adaptedTool struct {
 	// route is the binding's live state. Calls go through acquire/release so a
 	// retiring binding can tell when its last turn is done.
 	route *bindingState
-	// identity is the permission identity, precomputed.
+	// identity is the tool.invoke capability identity, precomputed.
 	identity string
-	// scopes decides how broadly an approval for this tool may persist.
-	scopes ScopePolicy
 }
 
-// Compile-time proof of the two contracts this type claims.
+// Compile-time proof of the contracts this type claims.
 var (
-	_ tool.InvokableTool      = (*adaptedTool)(nil)
-	_ tool.PermissionPrompter = (*adaptedTool)(nil)
-	_ tool.Auditable          = (*adaptedTool)(nil)
+	_ tool.InvokableTool = (*adaptedTool)(nil)
+	_ tool.CallPreparer  = (*adaptedTool)(nil)
+	_ tool.Auditable     = (*adaptedTool)(nil)
 )
 
 // Info describes the tool to the model and to Harness's argument validation.
@@ -132,39 +145,88 @@ func (t *adaptedTool) AuditSummary(string) string {
 	return fmt.Sprintf("MCP %s on %s", t.rawTool, t.binding)
 }
 
-// BuildRequest supplies the redacted summary Harness's permission gate shows.
+// PrepareCall is the tool-owned preparation boundary (design §Permissions under
+// the access-profile model). It runs once per call, before any permission
+// decision: it validates the untrusted arguments and emits the typed, redacted
+// tool.invoke requirement the gate evaluates, plus the per-call artifact
+// InvokableRun executes.
 //
-// argsJSON is deliberately unused beyond its length. The design's rule is
-// explicit — no credentials, no full request bodies, no resource contents, no
-// unbounded arguments in a gate or an audit event — and an MCP tool's arguments
-// are a schema this adapter has never seen, from a server it does not trust, so
-// there is no field it could safely whitelist. The user is told which server,
-// which tool, and how much is being sent; the arguments themselves are between
-// the model and the server.
+// Three properties this method is responsible for:
 //
-// It fails closed rather than degrade. An over-long identity is refused instead
-// of truncated: a truncated identity is a shared one, and two tools sharing an
-// identity means an approval granted for one silently authorizes the other. A
-// refused prompt costs a call; an aliased approval costs the boundary itself.
-func (t *adaptedTool) BuildRequest(argsJSON string, _ tool.PreparedArtifact) (tool.PermissionRequest, error) {
-	size := len(argsJSON)
-	if size > maxArgsSummaryBytes {
-		size = maxArgsSummaryBytes
+//   - Redacted. The requirement names the binding, the raw tool, and nothing
+//     else. An MCP tool's arguments are a schema this adapter has never seen,
+//     from a server it does not trust, so there is no field it could safely
+//     surface — and the design's rule is explicit: no credentials, no request
+//     bodies, no unbounded arguments in a gate or an audit event. The arguments
+//     travel only in the opaque artifact, never in the requirement.
+//
+//   - Stable. Scope and Match are ToolInvokeIdentity(binding, rawTool), a
+//     deterministic function of this tool's identity alone. Two calls to the
+//     same tool produce the same requirement, so a persisted allow rule can
+//     match it; a call to a different tool never collides.
+//
+//   - Fail-closed on malformed input. Arguments that are not JSON are refused
+//     HERE — the call is never evaluated and never sent. A prepared request
+//     whose own identity could not be represented safely (a pathological raw
+//     name) is refused the same way rather than handed to the gate.
+func (t *adaptedTool) PrepareCall(_ context.Context, executionID uuid.UUID, argsJSON string) (tool.Request, tool.PreparedArtifact, error) {
+	args, err := callArgs(argsJSON)
+	if err != nil {
+		// Harness has NOT validated these — preparation is where an MCP tool's
+		// arguments are first checked — so a non-JSON payload fails closed at the
+		// boundary rather than being posted to a server that would have to guess.
+		return tool.Request{}, nil, fmt.Errorf("mcp: %w", err)
 	}
-	summary := fmt.Sprintf("Call the %q tool on MCP server %q (%d bytes of arguments).", t.rawTool, t.binding, size)
-	return tool.NewExternalRequest(t.identity, summary, t.scopes.Scopes(t.identity))
+	request := tool.Request{
+		ToolName:    t.modelName,
+		ExecutionID: executionID.String(),
+		Requirements: []tool.Requirement{{
+			Kind:  CapabilityToolInvoke,
+			Scope: t.identity,
+			Match: t.identity,
+			// Redacted: the tool and its server, never the arguments.
+			Description: fmt.Sprintf("call the %q tool on MCP server %q", t.rawTool, t.binding),
+		}},
+	}
+	if err := tool.ValidateRequest(request); err != nil {
+		return tool.Request{}, nil, fmt.Errorf("mcp: prepared request is invalid: %w", err)
+	}
+	// The normalized arguments travel only here — read back at InvokableRun time,
+	// never reparsed from the model-facing argsJSON.
+	return request, tool.TokenArtifact{Token: string(args)}, nil
 }
 
 // InvokableRun performs the call: steps 3-8 of design §Calling a tool. Steps 1
-// and 2 — argument validation against the adopted schema, and the permission
-// decision on the qualified capability — already happened in Harness, which is
-// where they belong.
+// and 2 — argument validation and the permission decision on the qualified
+// capability — already happened: this tool validated the arguments in
+// PrepareCall, and the gate resolved the tool.invoke requirement it emitted. The
+// argsJSON parameter is deliberately ignored; the bytes that go on the wire are
+// the ones preparation validated and the gate decided on, read back from the
+// prepared contract, never reparsed from a model-facing string that could have
+// changed since the prompt.
+//
+// It fails closed without that contract. An MCP call is effectful, so a run with
+// no prepared call on ctx — or one carrying another tool's artifact — is refused
+// as a tool result and the server is never contacted.
 //
 // It never returns a Go error. Every failure it can reach is either the model's
 // information (the tool said no) or the host's problem (the connection died),
 // and neither is a reason to end the turn; the binding's own status carries a
 // fault, and the model gets a bounded "error: " result it can react to.
-func (t *adaptedTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.ToolResult, error) {
+func (t *adaptedTool) InvokableRun(ctx context.Context, _ string) (*tool.ToolResult, error) {
+	// The arguments come from the prepared contract, not the raw call. Without
+	// it (or with a foreign artifact) there is nothing this call was approved to
+	// send, so it fails closed before touching the route.
+	call, ok := loop.PreparedCallFromContext(ctx)
+	if !ok {
+		return textResult(errPrefix + "mcp: permission denied: this call requires its prepared contract"), nil
+	}
+	art, ok := call.Artifact.(tool.TokenArtifact)
+	if !ok {
+		return textResult(errPrefix + "mcp: permission denied: the prepared contract does not carry this call's arguments"), nil
+	}
+	args := json.RawMessage(art.Token)
+
 	// Step 3: the route must still belong to this binding. acquire is the seam
 	// that makes retirement honest — it refuses a binding on its way out, and
 	// the matching release is what lets a retiring one know its last turn is
@@ -180,14 +242,6 @@ func (t *adaptedTool) InvokableRun(ctx context.Context, argsJSON string) (*tool.
 	// whatever now answers to the same raw name.
 	if res := t.checkGeneration(cl); res != nil {
 		return res, nil
-	}
-
-	args, err := callArgs(argsJSON)
-	if err != nil {
-		// Harness validated these against the schema, so this is a defect on
-		// this side of the boundary, not the server's. Refuse rather than post
-		// bytes that are not JSON to a server that will have to guess.
-		return textResult(errPrefix + "mcp: " + err.Error()), nil
 	}
 
 	// Step 5. Deadline is left zero on purpose: the client applies the
@@ -586,10 +640,13 @@ func fill(t *nameTable, entries []bindingTools) error {
 // and a Loop can never end up holding two tools from two generations of one
 // server.
 //
-// Requirements are zero: an MCP tool needs nothing from the Loop's runtime
-// bindings — its route, its credentials and its limits came from the binding's
-// definition. It therefore cannot escalate a Loop's privileges even if the
-// Loop has a workspace, a shell, or a delegate controller bound.
+// The Definition's runtime Requirements are zero: an MCP tool needs nothing
+// from the Loop's runtime bindings — its route, its credentials and its limits
+// came from the binding's definition. It therefore cannot escalate a Loop's
+// privileges even if the Loop has a workspace, a shell, or a delegate
+// controller bound. (This is distinct from the per-call tool.invoke requirement
+// each tool emits at PrepareCall time, which is the access the CALL needs, not a
+// Loop capability the DEFINITION binds.)
 func (m *Manager) bundle(e bindingTools) tool.Definition {
 	names := make([]string, 0, len(e.cat.Tools))
 	tools := make([]tool.InvokableTool, 0, len(e.cat.Tools))
@@ -604,8 +661,7 @@ func (m *Manager) bundle(e bindingTools) tool.Definition {
 			generation:   e.cat.Generation,
 			schemaDigest: spec.InputSchemaDigest,
 			route:        e.route,
-			identity:     permissionIdentity(e.name, spec.RawName),
-			scopes:       m.deps.ScopePolicy,
+			identity:     ToolInvokeIdentity(e.name, spec.RawName),
 		})
 	}
 	// The tools are already built: they are immutable values over a live route,

@@ -38,7 +38,6 @@ import (
 	"github.com/looprig/core/uuid"
 	"github.com/looprig/harness/pkg/event"
 	"github.com/looprig/harness/pkg/gate"
-	"github.com/looprig/harness/pkg/tool"
 )
 
 // Clock reports the current time. It exists so tests can drive timeouts and
@@ -236,43 +235,14 @@ type EventPublisher interface {
 	PublishEvent(ctx context.Context, ev event.Event) error
 }
 
-// ScopePolicy decides how broadly a user may persist an approval for one MCP
-// tool. It is consulted per permission request, so a host may narrow a binding
-// it has come to distrust without restarting it.
-//
-// This is the "binding-wide allow/ask/deny plus tool-specific overrides" seam of
-// design §Permissions, reduced to the part the adapter can honestly own. The
-// adapter does not decide whether a call is permitted — Harness's permission
-// boundary does, exactly as it does for native tools — it decides which
-// persistence breadths the prompt may offer, which is the choice that depends on
-// how far the host trusts a third-party server.
-type ScopePolicy interface {
-	// Scopes returns the approval scopes offered for identity (the
-	// "mcp:<binding>:<raw-tool>" permission identity). Returning an empty slice
-	// is how a policy refuses: NewExternalRequest rejects an empty scope set,
-	// so the call fails closed rather than prompting with nothing to grant.
-	Scopes(identity string) []tool.ApprovalScope
-}
-
-// defaultScopes is the scope set used when Deps.ScopePolicy is nil.
-//
-// Once and Session, never Workspace. A stable permission identity is what makes
-// persistence safe at all (see tool.NewExternalRequest), and "mcp:<binding>:<tool>"
-// is stable — so Session is honest: it lasts as long as the connection the user
-// was looking at when they approved it.
-//
-// Workspace is withheld because it outlives the thing it describes. A workspace
-// approval persists to disk and would silently re-apply to whatever a binding of
-// that name points at next week — a different server version, a different
-// endpoint, a different tool behind the same raw name. That is a decision a host
-// may make with knowledge the adapter does not have, so a host must opt into it
-// through a ScopePolicy rather than receive it by default.
-var defaultScopes = []tool.ApprovalScope{tool.ScopeOnce, tool.ScopeSession}
-
-// fixedScopePolicy is a ScopePolicy that offers the same scopes to every tool.
-type fixedScopePolicy struct{ scopes []tool.ApprovalScope }
-
-func (p fixedScopePolicy) Scopes(string) []tool.ApprovalScope { return p.scopes }
+// Approval persistence breadth is no longer this module's concern. Under the
+// access-profile model the three-action Deny/Gated/Allow decision — and how
+// broadly an Allow may persist — is owned by the harness gate, which resolves
+// the tool.invoke requirement each MCP tool emits from PrepareCall against the
+// consumer's product access source. The adapter's whole permission contribution
+// is that stable, redacted requirement (see tools.go: CapabilityToolInvoke,
+// ToolInvokeIdentity); it holds no scope policy of its own, so there is nothing
+// here to configure or default.
 
 // NoticeKind classifies an adapter notice. The zero value is not a kind.
 type NoticeKind uint8
@@ -457,9 +427,6 @@ type Deps struct {
 	// host allocated a new policy. Deps is where host capabilities live, for
 	// exactly this reason: Gates is not a Binding field either.
 	Sampling SamplingPolicy
-	// ScopePolicy decides approval persistence breadth. Nil selects
-	// defaultScopes.
-	ScopePolicy ScopePolicy
 	// Reporter receives the adapter's own notices — the facts the sealed
 	// Harness event set cannot express. Optional; nil drops them.
 	Reporter Reporter
@@ -470,9 +437,6 @@ type Deps struct {
 // normalized returns deps with its optional members filled in. It never mutates
 // the caller's value.
 func (d Deps) normalized() Deps {
-	if d.ScopePolicy == nil {
-		d.ScopePolicy = fixedScopePolicy{scopes: defaultScopes}
-	}
 	if d.Clock == nil {
 		d.Clock = systemClock{}
 	}

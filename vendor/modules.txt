@@ -150,9 +150,8 @@ github.com/looprig/harness/pkg/gate
 github.com/looprig/harness/pkg/hustle
 github.com/looprig/harness/pkg/identity
 github.com/looprig/harness/pkg/loop
-github.com/looprig/harness/pkg/security
 github.com/looprig/harness/pkg/tool
-# github.com/looprig/inference v0.3.0 => ../inference
+# github.com/looprig/inference v0.3.1-0.20260718005749-13e4d7f173b3 => ../inference
 ## explicit; go 1.26.4
 github.com/looprig/inference
 github.com/looprig/inference/codec

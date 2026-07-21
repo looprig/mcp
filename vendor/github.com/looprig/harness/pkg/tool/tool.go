@@ -1,9 +1,18 @@
 // Package tool defines the dependency-free contract surface for the tools
 // subsystem: the BaseTool/InvokableTool interfaces every tool implements, the
-// ToolResult value tools return, and the optional capability interfaces the
-// runner probes for via type assertion. It imports only internal/content (plus
-// stdlib); it must never import internal/agent/loop or tools/, so both can
-// depend on it without a cycle.
+// ToolResult value tools return, the tool-owned preparation boundary
+// (CallPreparer, Request, Requirement, RuleCandidate — see preparation.go), and
+// the optional capability interfaces the runner probes for via type assertion.
+// It imports only core packages (plus stdlib); it must never import pkg/loop,
+// the runtime internals, or a concrete tools module, so all of them can depend
+// on it without a cycle.
+//
+// Ownership: tools own preparation — decoding untrusted arguments, normalizing
+// commands/URLs/paths, resolving canonical resource identities — and produce
+// the typed prepared Request. The three-state Deny/Gated/Allow decision, the
+// single combined approval, and response routing belong to pkg/gate; sandbox
+// profiles and OS enforcement belong to the enforcing consumer behind
+// structural seams; durable rule persistence is consumer-provided.
 package tool
 
 import (
@@ -64,41 +73,48 @@ type Sequential interface {
 	Sequential() bool
 }
 
-// PreparedArtifact is the opaque, per-call artifact a Preparer produces — read by
-// the producing tool at both BuildRequest and InvokableRun time, opaque to the
+// PreparedArtifact is the opaque, per-call artifact a CallPreparer produces — read
+// by the producing tool at both PrepareCall and InvokableRun time, opaque to the
 // runner. Sealed via an unexported marker so only deliberate types satisfy it (no
 // bare any): a type in another package cannot supply the unexported method, so it
 // cannot masquerade as a PreparedArtifact. Concrete artifacts therefore live in
-// this package alongside the seal (mirroring PermissionRequest).
+// this package alongside the seal.
 type PreparedArtifact interface{ preparedArtifact() }
 
 // TokenArtifact is the minimal concrete PreparedArtifact: it carries a single
 // opaque Token (e.g. a content hash or a callID-bound nonce) that the producing
-// tool reads at both BuildRequest and InvokableRun time. It is the simplest
-// artifact a Preparer can return when the bound value is a single string; richer
-// Preparers declare their own concrete artifact type in this package.
+// tool reads at both PrepareCall and InvokableRun time. It is the simplest
+// artifact a CallPreparer can return when the bound value is a single string;
+// richer CallPreparers declare their own concrete artifact type in this package.
 type TokenArtifact struct{ Token string }
 
 func (TokenArtifact) preparedArtifact() {}
 
-// Preparer is the optional capability: compute a per-call artifact ONCE (e.g. a
-// TOCTOU-safe snapshot + hash), bound to the call by ToolExecutionID. The runner
-// invokes Prepare right after minting the callID (and validating args) and threads
-// the artifact to BOTH the permission decision (via BuildRequest) and execution
-// (via the per-call ctx). A Prepare error is fail-secure: the call is not executed
-// and no gate is opened.
-type Preparer interface {
-	Prepare(ctx context.Context, callID uuid.UUID, argsJSON string) (PreparedArtifact, error)
+// CallPreparer is the tool-owned preparation boundary: decode and validate the
+// untrusted argsJSON, normalize commands/URLs/paths, resolve canonical resource
+// identities, and produce the typed access Request for this call plus an
+// optional opaque per-call artifact the tool reads back at execution time.
+//
+// The runner mints executionID once per call and invokes PrepareCall exactly
+// once, before any permission evaluation; invalid input fails here and never
+// reaches the gate. A pure tool returns an empty Request (no requirements). A
+// tool that does NOT implement CallPreparer is treated as an unprepared
+// effectful tool and fails closed: the call is never evaluated or executed.
+type CallPreparer interface {
+	PrepareCall(ctx context.Context, executionID uuid.UUID, argsJSON string) (Request, PreparedArtifact, error)
 }
 
-// PermissionPrompter is implemented by tools whose execution may require user
-// approval. BuildRequest derives a sealed PermissionRequest from the
-// (untrusted) argsJSON for the approval prompt; it returns an error when the
-// args cannot be parsed into a request. prepared is the per-call artifact a
-// Preparer tool produced for THIS call (nil for non-Preparer tools, which ignore
-// it — behavior identical).
-type PermissionPrompter interface {
-	BuildRequest(argsJSON string, prepared PreparedArtifact) (PermissionRequest, error)
+// PreparedCall is the prepared execution contract for one tool call: the
+// minted execution ID, the validated typed Request, the tool's opaque per-call
+// artifact, and — after the combined gate resolves — the fresh execution-bound
+// grant tokens issued for THIS call. Tokens travel only here, never in an
+// ambient grant context, a prompt, a journal, or an audit record. The Grants
+// slice is owned by the runner; readers must not mutate it.
+type PreparedCall struct {
+	ExecutionID uuid.UUID
+	Request     Request
+	Artifact    PreparedArtifact
+	Grants      []string
 }
 
 // Auditable is implemented by tools that can emit a redacted, length-capped
@@ -152,7 +168,3 @@ type ArgvRunner interface {
 type GrantedRunner interface {
 	RunCommandWithGrants(ctx context.Context, dir, command string, grants []string) (output []byte, exitCode int, err error)
 }
-
-// PermissionRequest (the sealed approval-prompt contract returned by
-// PermissionPrompter.BuildRequest) and ApprovalScope are declared in
-// permission_request.go alongside their concrete implementers.
