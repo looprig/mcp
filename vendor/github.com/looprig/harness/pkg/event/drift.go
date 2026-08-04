@@ -29,6 +29,8 @@ const (
 	DriftAgentName     DriftCategory = "agent_name"
 	DriftAdapter       DriftCategory = "adapter"
 	DriftRuntimeSkills DriftCategory = "runtime_skills"
+	DriftHookPolicy    DriftCategory = "hook_policy"
+	DriftRuntime       DriftCategory = "runtime"
 	DriftApp           DriftCategory = "app"
 )
 
@@ -86,6 +88,7 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 	if baseline.ExternalCapabilityRev != candidate.ExternalCapabilityRev {
 		add(DriftExternal, "", baseline.ExternalCapabilityRev, candidate.ExternalCapabilityRev, DriftInfo)
 	}
+	assessRuntime(baseline, candidate, add)
 	assessTools(baseline, candidate, add)
 	assessDirectional(DriftConfinement,
 		baseline.ConfinementRev, candidate.ConfinementRev,
@@ -95,6 +98,33 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 		baseline.PermissionStrictness, candidate.PermissionStrictness, add)
 	if baseline.PermissionPosture != candidate.PermissionPosture {
 		add(DriftPermission, "posture", baseline.PermissionPosture, candidate.PermissionPosture, DriftWarn)
+	}
+	if baseline.PermissionReviewConfigured != candidate.PermissionReviewConfigured {
+		// Widening (no classifiers -> classifiers configured) must never resume
+		// silently (design §21: never silently resumes with a different
+		// reviewer). Narrowing (classifiers -> none) is fewer automated
+		// decisions, strictly more human control, so it stays Info.
+		severity := DriftInfo
+		if candidate.PermissionReviewConfigured {
+			severity = DriftWarn
+		}
+		add(DriftPermission, "review_configured",
+			boolID(baseline.PermissionReviewConfigured), boolID(candidate.PermissionReviewConfigured), severity)
+	} else if baseline.PermissionReviewConfigured && candidate.PermissionReviewConfigured &&
+		baseline.PermissionReviewPolicyRev != candidate.PermissionReviewPolicyRev {
+		// Both sides stay configured, but the review POLICY's own identity
+		// changed underneath the still-enabled reviewer (e.g. a strict custom
+		// policy replaced by a looser default). This is the directional
+		// counterpart of the review_configured Warn above, for the
+		// posture-narrows-invisibly gap an opaque TopologyRev-only comparison
+		// cannot catch: TopologyRev also folds in ordinary loop topology, so
+		// its own drift stays Info (below) even though it happens to also
+		// change here. Direction is unknowable from a revision LABEL alone
+		// (unlike PermissionStrictness/ConfinementStrictness, a review
+		// policy carries no ordered level), so this fails secure exactly
+		// like assessDirectional's unknown-direction case: any change warns.
+		add(DriftPermission, "review_policy_rev",
+			baseline.PermissionReviewPolicyRev, candidate.PermissionReviewPolicyRev, DriftWarn)
 	}
 	if baseline.WorkspaceRoot != candidate.WorkspaceRoot {
 		add(DriftWorkspace, "", baseline.WorkspaceRoot, candidate.WorkspaceRoot, DriftWarn)
@@ -110,6 +140,9 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 	}
 	if baseline.RuntimeSkills != candidate.RuntimeSkills {
 		add(DriftRuntimeSkills, "", boolID(baseline.RuntimeSkills), boolID(candidate.RuntimeSkills), DriftWarn)
+	}
+	if baseline.HookPolicyRev != candidate.HookPolicyRev {
+		add(DriftHookPolicy, "", baseline.HookPolicyRev, candidate.HookPolicyRev, DriftWarn)
 	}
 	assessAppFields(baseline.AppFields, candidate.AppFields, add)
 
@@ -127,6 +160,18 @@ func AssessDrift(baseline, candidate ConfigManifest) DriftAssessment {
 		return a.New < b.New
 	})
 	return assessment
+}
+
+func assessRuntime(baseline, candidate ConfigManifest, add func(DriftCategory, string, string, string, DriftSeverity)) {
+	if baseline.RuntimeProfile != candidate.RuntimeProfile {
+		add(DriftRuntime, "profile", baseline.RuntimeProfile, candidate.RuntimeProfile, DriftWarn)
+	}
+	if baseline.RuntimeCatalogRev != candidate.RuntimeCatalogRev {
+		add(DriftRuntime, "catalog_rev", baseline.RuntimeCatalogRev, candidate.RuntimeCatalogRev, DriftWarn)
+	}
+	if baseline.RuntimeIdentityRev != candidate.RuntimeIdentityRev {
+		add(DriftRuntime, "identity_rev", baseline.RuntimeIdentityRev, candidate.RuntimeIdentityRev, DriftWarn)
+	}
 }
 
 func assessTools(baseline, candidate ConfigManifest, add func(DriftCategory, string, string, string, DriftSeverity)) {
