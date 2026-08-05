@@ -160,7 +160,7 @@ func (s *Session) CallTool(ctx context.Context, rawName string, args json.RawMes
 		defer s.removeProgress(token)
 	}
 
-	res, err := cs.CallTool(ctx, params)
+	res, err := cs.CallTool(ctx, withLogLevel(s, params))
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("tools/call %q: %w", rawName, err)
 	}
@@ -245,7 +245,7 @@ func (s *Session) GetPrompt(ctx context.Context, name string, args map[string]st
 	if name == "" {
 		return PromptResult{}, errors.New("protocol: prompt name is empty")
 	}
-	res, err := cs.GetPrompt(ctx, &mcp.GetPromptParams{Name: name, Arguments: args})
+	res, err := cs.GetPrompt(ctx, withLogLevel(s, &mcp.GetPromptParams{Name: name, Arguments: args}))
 	if err != nil {
 		return PromptResult{}, fmt.Errorf("prompts/get %q: %w", name, err)
 	}
@@ -287,7 +287,7 @@ func (s *Session) ReadResource(ctx context.Context, uri string) (ResourceResult,
 	if uri == "" {
 		return ResourceResult{}, errors.New("protocol: resource URI is empty")
 	}
-	res, err := cs.ReadResource(ctx, &mcp.ReadResourceParams{URI: uri})
+	res, err := cs.ReadResource(ctx, withLogLevel(s, &mcp.ReadResourceParams{URI: uri}))
 	if err != nil {
 		return ResourceResult{}, fmt.Errorf("resources/read %q: %w", uri, err)
 	}
@@ -367,6 +367,11 @@ func (s *Session) Unsubscribe(ctx context.Context, uri string) error {
 // It is required, not optional: an MCP server sends nothing until the client
 // sets a level, so a client that installs a log handler and never calls this
 // receives silence and cannot tell it from a quiet server.
+//
+// The level is also remembered on the session (see withLogLevel): on a peer
+// negotiating protocol >= 2026-07-28, the legacy logging/setLevel RPC this
+// method sends is not enough on its own to keep the promise above — see
+// withLogLevel's comment for why.
 func (s *Session) SetLogLevel(ctx context.Context, level string) error {
 	cs, err := s.established()
 	if err != nil {
@@ -376,7 +381,55 @@ func (s *Session) SetLogLevel(ctx context.Context, level string) error {
 	if err := cs.SetLoggingLevel(ctx, &mcp.SetLoggingLevelParams{Level: mcp.LoggingLevel(level)}); err != nil {
 		return fmt.Errorf("logging/setLevel %q: %w", level, err)
 	}
+	s.mu.Lock()
+	s.logLevel = level
+	s.mu.Unlock()
 	return nil
+}
+
+// withLogLevel stamps the session's active log level onto p's request
+// metadata, when one has been set, and returns p.
+//
+// It is applied at CallTool, GetPrompt and ReadResource — the multi round-trip
+// methods (SEP-2322) whose handlers are where a server does the work that
+// might log — because of a wire-level fact about SDK v1.7.0 that the legacy
+// logging/setLevel RPC alone does not survive: on a peer negotiating protocol
+// >= 2026-07-28, the SDK ties a server's effective log level to the request
+// that is "in flight" rather than to the session (SEP-2575) —
+// ServerSession.Log reads it from that specific request's
+// `_meta["io.modelcontextprotocol/logLevel"]`, and resets the session's
+// stored level to whatever (or nothing) that value says on *every* request
+// that carries the new protocol's metadata. logging/setLevel itself never
+// carries that metadata, so its effect would otherwise be undone by the very
+// next such call this session makes. Stamping the active level onto each of
+// them here is what keeps SetLogLevel's contract — "sends log messages at or
+// above level" — true across calls on such a peer, instead of true only until
+// the next one.
+//
+// It is a no-op, correctly, in two cases: SetLogLevel was never called (there
+// is nothing to keep alive), and the peer negotiated an older protocol (the
+// SDK never overwrites the level there, so nothing needs re-asserting, and the
+// stray _meta key is simply ignored by a server that does not look for it).
+func withLogLevel[P interface {
+	GetMeta() map[string]any
+	SetMeta(map[string]any)
+}](s *Session, p P) P {
+	s.mu.Lock()
+	level := s.logLevel
+	s.mu.Unlock()
+	if level == "" {
+		return p
+	}
+	m := p.GetMeta()
+	if m == nil {
+		m = map[string]any{}
+	}
+	_, ok := m[mcp.MetaKeyLogLevel] //lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577); this key is also exactly what keeps this working for peers >=2026-07-28
+	if !ok {
+		m[mcp.MetaKeyLogLevel] = level //lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+	}
+	p.SetMeta(m)
+	return p
 }
 
 // progressTokenBytes is the entropy in a progress token. A token only has to be

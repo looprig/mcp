@@ -37,9 +37,10 @@ type Session struct {
 	transport mcp.Transport
 	cfg       ConnectConfig
 
-	// mu guards cs, started and progress. It is never held across a call into
-	// the SDK, nor across a progress callback: Close can legally race
-	// Initialize, the SDK does its own locking, and a callback is foreign code.
+	// mu guards cs, started, progress and logLevel. It is never held across a
+	// call into the SDK, nor across a progress callback: Close can legally
+	// race Initialize, the SDK does its own locking, and a callback is
+	// foreign code.
 	mu      sync.Mutex
 	started bool
 	cs      *mcp.ClientSession
@@ -47,6 +48,11 @@ type Session struct {
 	// currently in flight. Entries are added by CallTool and removed by its
 	// defer, so the map is bounded by concurrency, not by call count.
 	progress map[string]func(ProgressUpdate)
+	// logLevel is the level most recently requested through SetLogLevel, or
+	// empty if it was never called. See withLogLevel in call.go for why a
+	// second copy of this is stamped onto every outgoing request rather than
+	// left to the one logging/setLevel call that set it.
+	logLevel string
 }
 
 // NewSession returns an uninitialized Session that will speak MCP over t.

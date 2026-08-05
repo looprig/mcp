@@ -455,18 +455,6 @@ func TestProgressFromARealServer(t *testing.T) {
 // notification arrives, and the payload is bounded.
 func TestServerLogsReachTheHandler(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on a Task 8/9-scale fix: under SDK v1.7.0 at protocol " +
-		">=2026-07-28, ServerSession.Log's effective level is no longer driven " +
-		"by the legacy logging/setLevel RPC (which still succeeds but stops " +
-		"controlling emission) — the SDK's own doc comment says the level is " +
-		"meant to come from the triggering tools/call request's `_meta` (SEP-2575), " +
-		"which this wrapper does not populate. Wire-traced with mcp.LoggingTransport: " +
-		"logging/setLevel is ack'd, tools/call succeeds, but no notifications/message " +
-		"is ever written to the wire. Fixing this needs new per-call meta plumbing " +
-		"this module doesn't have yet; out of Task 1's compile-break scope — see " +
-		"docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8 (not " +
-		"currently named in its 'Sampling|Roots|Elicit' legacy-feature check; " +
-		"flag for that task to also cover logging).")
 
 	const limit = 512
 
