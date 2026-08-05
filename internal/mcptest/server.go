@@ -224,6 +224,13 @@ type Config struct {
 	// ExtraToolPrefix + index. It exists so a test can build a catalog big
 	// enough to paginate, or big enough to exceed a client's item bound.
 	ExtraTools int
+
+	// Stateless serves the Streamable HTTP handler in stateless mode
+	// (SEP-2567), which is what lets a client negotiate spec revision
+	// 2026-07-28: no Mcp-Session-Id, no server-initiated requests, GET and
+	// DELETE answered 405. Meaningless for the stdio and SSE fixtures, whose
+	// constructors refuse it.
+	Stateless bool
 }
 
 // ExtraToolPrefix names the tools Config.ExtraTools adds.

@@ -44,7 +44,11 @@ func NewHTTPHandler(cfg Config) (http.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil), nil
+	var opts *mcp.StreamableHTTPOptions
+	if cfg.Stateless {
+		opts = &mcp.StreamableHTTPOptions{Stateless: true}
+	}
+	return mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, opts), nil
 }
 
 // NewSSEHandler builds a configured fixture server and returns it as an
@@ -62,6 +66,10 @@ func NewHTTPHandler(cfg Config) (http.Handler, error) {
 //
 // It shares NewHTTPHandler's restrictions, for the same reasons.
 func NewSSEHandler(cfg Config) (http.Handler, error) {
+	if cfg.Stateless {
+		return nil, fmt.Errorf("mcptest: Config.Stateless is not supported over the legacy SSE transport: " +
+			"stateless is a Streamable HTTP mode (SEP-2567); use NewHTTPHandler")
+	}
 	s, err := newHTTPServer(cfg)
 	if err != nil {
 		return nil, err

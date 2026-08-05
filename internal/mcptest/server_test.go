@@ -10,10 +10,12 @@ package mcptest_test
 import (
 	"bytes"
 	"errors"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/looprig/mcp/internal/mcptest"
+	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 func TestConfigValidate(t *testing.T) {
@@ -117,3 +119,50 @@ func TestWriteNoiseReportsWriteErrors(t *testing.T) {
 type errWriter struct{}
 
 func (errWriter) Write([]byte) (int, error) { return 0, errors.New("no") }
+
+func TestStatelessHandlerNegotiates20260728(t *testing.T) {
+	t.Parallel()
+	h, err := mcptest.NewHTTPHandler(mcptest.Config{Stateless: true})
+	if err != nil {
+		t.Fatalf("NewHTTPHandler() error = %v", err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
+	cs, err := probe.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: srv.URL}, nil)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer cs.Close()
+	if got := cs.InitializeResult().ProtocolVersion; got != "2026-07-28" {
+		t.Errorf("negotiated %q, want 2026-07-28", got)
+	}
+}
+
+func TestStatefulHandlerCapsAt20251125(t *testing.T) {
+	t.Parallel()
+	h, err := mcptest.NewHTTPHandler(mcptest.Config{})
+	if err != nil {
+		t.Fatalf("NewHTTPHandler() error = %v", err)
+	}
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
+	cs, err := probe.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: srv.URL}, nil)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer cs.Close()
+	if got := cs.InitializeResult().ProtocolVersion; got != "2025-11-25" {
+		t.Errorf("negotiated %q, want 2025-11-25 (stateful HTTP caps below 2026-07-28)", got)
+	}
+}
+
+func TestSSEHandlerRefusesStateless(t *testing.T) {
+	t.Parallel()
+	if _, err := mcptest.NewSSEHandler(mcptest.Config{Stateless: true}); err == nil {
+		t.Fatal("NewSSEHandler(Stateless) succeeded, want a refusal: the legacy transport predates the concept")
+	}
+}
