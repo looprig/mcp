@@ -4,10 +4,11 @@ An MCP (Model Context Protocol) **client** for Looprig. It lets a Harness agent
 consume existing MCP servers; it does not expose Harness agents as MCP servers.
 
 The module wraps the official [go-sdk](https://github.com/modelcontextprotocol/go-sdk)
-(pinned at v1.6.1) **without leaking its types**: no SDK type appears in any
+(pinned at v1.7.0) **without leaking its types**: no SDK type appears in any
 `pkg/...` exported API. Only `internal/protocol`, `internal/mcptest`, and
 `pkg/transport/*` may import the SDK, and `internal/protocol/leakguard_test.go`
-enforces both halves of that rule.
+enforces both halves of that rule. Supported MCP spec revisions: 2024-11-05
+through 2026-07-28.
 
 Design doc: `../harness/docs/plans/2026-07-16-mcp-client-module-design.md`
 
