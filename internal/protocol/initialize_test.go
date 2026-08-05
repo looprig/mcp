@@ -6,6 +6,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/looprig/mcp/internal/limits"
 	"github.com/looprig/mcp/internal/protocol"
 )
 
@@ -21,8 +22,23 @@ func initBounds() protocol.Bounds {
 	}
 }
 
+// tightTextBounds is initBounds with MaxTextBytes cut down to max, so a
+// table case can exercise truncation without special-casing the shared
+// assertion.
+func tightTextBounds(max int) protocol.Bounds {
+	b := initBounds()
+	b.MaxTextBytes = max
+	return b
+}
+
 func TestFromSDKInitializeResult(t *testing.T) {
 	t.Parallel()
+
+	// truncatedInstructions is what a 4096-byte instructions string becomes
+	// once bounded to 16 bytes, computed via the same TruncateText the
+	// conversion itself uses rather than hand-derived, so the case can't
+	// silently drift from limits' truncation-marker behavior.
+	truncatedInstructions, _ := limits.TruncateText(strings.Repeat("a", 4096), 16)
 
 	tests := []struct {
 		name    string
@@ -108,6 +124,41 @@ func TestFromSDKInitializeResult(t *testing.T) {
 				ProtocolVersion: "v",
 				Capabilities:    protocol.ServerCapabilities{Resources: true},
 			},
+		},
+		{
+			// The SDK normalizes a server/discover response into this same
+			// shape (see mcp.Client.discover): nil capabilities and a nil
+			// ServerInfo are both legal when the server omits them.
+			name: "discover-sourced result with no capabilities or server info",
+			in: &mcp.InitializeResult{
+				ProtocolVersion: "2026-07-28",
+			},
+			bounds: initBounds(),
+			want: protocol.InitializeResult{
+				ProtocolVersion: "2026-07-28",
+			},
+		},
+		{
+			name: "discover-sourced instructions are truncated like any other",
+			in: &mcp.InitializeResult{
+				ProtocolVersion: "2026-07-28",
+				Instructions:    strings.Repeat("a", 4096),
+			},
+			bounds: tightTextBounds(16),
+			want: protocol.InitializeResult{
+				ProtocolVersion: "2026-07-28",
+				Instructions:    truncatedInstructions,
+			},
+		},
+		{
+			name: "empty version from discover is still rejected",
+			in: &mcp.InitializeResult{
+				Instructions: "be nice",
+				Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
+				ServerInfo:   &mcp.Implementation{Name: "srv", Version: "1"},
+			},
+			bounds:  initBounds(),
+			wantErr: true,
 		},
 	}
 
