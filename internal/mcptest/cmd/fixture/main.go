@@ -18,6 +18,7 @@
 //	-crash-exit-code int   the status "crash" exits with (default 7)
 //	-noise-bytes int       bytes of chatter to write to stderr at startup
 //	-elicit-on-initialize  send an elicitation request once the client is initialized
+//	-legacy-protocol       pin the session to protocol revisions <= mcptest.LegacyProtocolVersion
 //
 // stdin and stdout are the MCP transport and carry nothing else. Diagnostics
 // go to stderr.
@@ -71,7 +72,12 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
-	if err := server.Run(ctx, &mcp.StdioTransport{}); err != nil {
+	var transport mcp.Transport = &mcp.StdioTransport{}
+	if cfg.LegacyProtocol {
+		transport = mcptest.PinLegacyProtocol(transport)
+	}
+
+	if err := server.Run(ctx, transport); err != nil {
 		// A cancelled context is how a signalled shutdown ends. It is not a
 		// failure, and reporting it as one would make every test that
 		// terminates the fixture look like a broken fixture.
@@ -96,6 +102,7 @@ func parseFlags() mcptest.Config {
 	flag.IntVar(&cfg.NoiseBytes, "noise-bytes", 0, "bytes of chatter to write to stderr at startup")
 	flag.BoolVar(&cfg.ElicitOnInitialize, "elicit-on-initialize", false, "send an elicitation request once the client reports initialized")
 	flag.BoolVar(&cfg.Elicit, "elicit", false, "add the elicit tool, which asks the client a question while answering a tool call")
+	flag.BoolVar(&cfg.LegacyProtocol, "legacy-protocol", false, "pin the session to protocol revisions <= mcptest.LegacyProtocolVersion")
 	flag.IntVar(&cfg.PageSize, "page-size", 0, "maximum items per list page (0 uses the SDK default)")
 	flag.IntVar(&cfg.ExtraTools, "extra-tools", 0, "number of filler tools to expose, for exercising pagination and item bounds")
 	flag.Parse()

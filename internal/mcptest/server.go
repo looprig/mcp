@@ -102,6 +102,13 @@ const (
 	ToolProgress = "progress"
 	ToolLog      = "log"
 	ToolElicit   = "elicit"
+	// ToolElicitMRTR is ToolElicit's counterpart: it asks the same question
+	// through the multi round-trip mechanism (SEP-2322) — returning
+	// InputRequests and reading the answer back from a retry's
+	// InputResponses — instead of an ad hoc ServerSession.Elicit call. See
+	// addElicitMRTRTool for why it is a second tool rather than a rewrite of
+	// ToolElicit's handler.
+	ToolElicitMRTR = "elicit_mrtr"
 )
 
 // Prompt and resource identifiers the fixture exposes when enabled.
@@ -231,6 +238,17 @@ type Config struct {
 	// DELETE answered 405. Meaningless for the stdio and SSE fixtures, whose
 	// constructors refuse it.
 	Stateless bool
+
+	// LegacyProtocol pins the stdio fixture (cmd/fixture) to protocol
+	// revisions at or before mcptest.LegacyProtocolVersion, via
+	// PinLegacyProtocol. It exists for tests that need a real server to make
+	// an ad hoc ServerSession.Elicit / ListRoots / CreateMessage call: SDK
+	// v1.7.0 forbids all three once the negotiated version reaches
+	// 2026-07-28 (SEP-2322), and offers no other way to request an older
+	// version from a test peer. Meaningless over HTTP, where
+	// StreamableServerTransport already implements
+	// mcp.ProtocolVersionSupporter on its own; only cmd/fixture consults it.
+	LegacyProtocol bool
 }
 
 // ExtraToolPrefix names the tools Config.ExtraTools adds.
@@ -264,6 +282,15 @@ func (c Config) Validate() error {
 	if c.ExtraTools < 0 || c.ExtraTools > MaxExtraTools {
 		return fmt.Errorf("extra tools: %d out of range [0, %d]", c.ExtraTools, MaxExtraTools)
 	}
+	if c.Stateless && c.ElicitOnInitialize {
+		// Stateless mode (SEP-2567) forbids server-initiated requests
+		// entirely, and ElicitOnInitialize's send would try one anyway: it
+		// does not hang (the goroutine's error goes to stderr, see
+		// elicitOnInitialized), but it can never succeed, so the combination
+		// is refused here rather than left as a silent no-op a test could
+		// mistake for coverage.
+		return errors.New("stateless mode cannot serve ElicitOnInitialize: stateless forbids server-initiated requests")
+	}
 	return nil
 }
 
@@ -295,6 +322,7 @@ func NewServer(cfg Config) (*mcp.Server, error) {
 	}
 	if cfg.Elicit {
 		addElicitTool(s)
+		addElicitMRTRTool(s)
 	}
 	if cfg.Crash {
 		addCrashTool(s, cfg.CrashExitCode)
@@ -743,6 +771,69 @@ func addElicitTool(s *mcp.Server) {
 			return errorResult(fmt.Sprintf("elicit failed: %v", err)), nil, nil
 		}
 		return textResult(ElicitAnswerPrefix + res.Action), nil, nil
+	})
+}
+
+// elicitMRTRRequestID is the InputRequests key ToolElicitMRTR's handler uses.
+// A constant is enough because the tool only ever asks one question per call.
+const elicitMRTRRequestID = "elicit"
+
+// addElicitMRTRTool registers ToolElicitMRTR: the same question ToolElicit
+// asks, but through the multi round-trip mechanism (SEP-2322) — returning
+// InputRequests instead of calling ServerSession.Elicit ad hoc, and reading
+// the human's answer back from CallToolParams.InputResponses on the retry the
+// SDK's client-side MRTR middleware issues.
+//
+// It is a second tool, deliberately, rather than a rewrite of ToolElicit's
+// handler. ToolElicit's ad hoc call is what several tests drive against a
+// protocol pinned to mcptest.LegacyProtocolVersion, to prove this module's
+// ServerSession.Elicit wrapping still works for peers ≤2025-11-25 (SEP-2577's
+// deprecation window) — including the SDK's own client-side capability and
+// mode validation ahead of it (see client.go's elicit), which fires before an
+// MRTR retry is ever attempted and would otherwise surface as a transport
+// error from CallTool rather than the tool-level refusal those tests pin.
+// Folding MRTR into that same handler would have made those tests exercise a
+// different code path than the one they are named for, so
+// TestElicitationStateless is built its own tool instead.
+func addElicitMRTRTool(s *mcp.Server) {
+	mcp.AddTool(s, &mcp.Tool{
+		Name:        ToolElicitMRTR,
+		Description: "Asks the client for human input via multi round-trip requests, and reports the action it answered with.",
+		Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+	}, func(_ context.Context, req *mcp.CallToolRequest, in ElicitInput) (*mcp.CallToolResult, any, error) {
+		if resp, ok := req.Params.InputResponses[elicitMRTRRequestID]; ok {
+			res, ok := resp.(*mcp.ElicitResult)
+			if !ok {
+				return errorResult(fmt.Sprintf("elicit failed: unexpected input response %T", resp)), nil, nil
+			}
+			return textResult(ElicitAnswerPrefix + res.Action), nil, nil
+		}
+
+		message := in.Message
+		if message == "" {
+			message = ElicitMessage
+		}
+		mode := in.Mode
+		if mode == "" {
+			// The SDK infers this same default (form, unless a URL/id is set)
+			// ahead of an ad hoc Elicit call — see its unexported
+			// ElicitParams.inferElicitMode — but nothing does it for an
+			// InputRequests entry, which goes straight to the client's own
+			// mode switch (client.go's elicit) with whatever this tool put
+			// here.
+			mode = "form"
+			if in.URL != "" {
+				mode = "url"
+			}
+		}
+		params := &mcp.ElicitParams{Mode: mode, Message: message, URL: in.URL}
+		if in.Schema {
+			params.RequestedSchema = json.RawMessage(
+				`{"type":"object","properties":{"name":{"type":"string"}}}`)
+		}
+		return &mcp.CallToolResult{
+			InputRequests: mcp.InputRequestMap{elicitMRTRRequestID: params},
+		}, nil, nil
 	})
 }
 

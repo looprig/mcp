@@ -53,6 +53,12 @@ func TestConfigValidate(t *testing.T) {
 			cfg:     mcptest.Config{Instructions: strings.Repeat("a", mcptest.MaxInstructionsBytes+1)},
 			wantErr: true,
 		},
+		{
+			name:    "stateless with elicit-on-initialize is rejected",
+			cfg:     mcptest.Config{Stateless: true, ElicitOnInitialize: true},
+			wantErr: true,
+		},
+		{name: "legacy protocol alone is valid", cfg: mcptest.Config{LegacyProtocol: true}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
