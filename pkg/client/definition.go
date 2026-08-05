@@ -50,11 +50,20 @@ func (n Name) Validate() error {
 // caller is prepared to serve for this connection. Everything defaults to
 // off: a capability the host cannot actually honor must not be advertised.
 type ClientCapabilities struct {
-	// Elicitation lets the server ask the human for input mid-operation.
+	// Elicitation lets the server ask the human for input mid-operation. The
+	// server-initiated form of this feature is deprecated in spec revision
+	// 2026-07-28 (SEP-2577) and served via multi-round-trip requests there; it
+	// remains fully functional against peers negotiating ≤2025-11-25.
 	Elicitation bool
-	// Sampling lets the server request LLM completions from the client.
+	// Sampling lets the server request LLM completions from the client. The
+	// server-initiated form of this feature is deprecated in spec revision
+	// 2026-07-28 (SEP-2577) and served via multi-round-trip requests there; it
+	// remains fully functional against peers negotiating ≤2025-11-25.
 	Sampling bool
-	// Roots exposes filesystem roots to the server.
+	// Roots exposes filesystem roots to the server. The server-initiated form
+	// of this feature is deprecated in spec revision 2026-07-28 (SEP-2577)
+	// and served via multi-round-trip requests there; it remains fully
+	// functional against peers negotiating ≤2025-11-25.
 	Roots bool
 }
 

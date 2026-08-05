@@ -16,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -69,6 +71,98 @@ func TestClientConnectStateless(t *testing.T) {
 	}
 	if res.IsError {
 		t.Errorf("CallTool(echo) tool error: %+v", res.Content)
+	}
+}
+
+// statelessElicitor answers every elicitation the same way, and records what
+// it was asked. It is a minimal local copy of scriptedElicitor
+// (pkg/client/elicit_integration_test.go:28): that type is in another
+// package's test build and cannot be imported.
+type statelessElicitor struct {
+	mu   sync.Mutex
+	seen []client.ElicitRequest
+}
+
+func (e *statelessElicitor) Elicit(_ context.Context, req client.ElicitRequest) (client.ElicitResult, error) {
+	e.mu.Lock()
+	e.seen = append(e.seen, req)
+	e.mu.Unlock()
+	return client.ElicitResult{Action: client.ElicitAccept, Content: json.RawMessage(`{"name":"ada"}`)}, nil
+}
+
+// clientResultText flattens a client.ToolResult's text content. It is
+// resultText's counterpart for client.ToolResult (streamablehttp_integration_
+// test.go's resultText works on the lower-level protocol.ToolResult), needed
+// here because this test drives the call through pkg/client rather than
+// through a raw *httpconn.Conn.
+func clientResultText(t *testing.T, res client.ToolResult) string {
+	t.Helper()
+	var b strings.Builder
+	for _, c := range res.Content {
+		if text, ok := c.(client.Text); ok {
+			b.WriteString(text.Text)
+		}
+	}
+	return b.String()
+}
+
+// TestElicitationStateless: on 2026-07-28 a server cannot call the client, so
+// the elicit tool comes back input-required and the SDK's MRTR middleware
+// invokes our handler and retries. The application-visible contract — the
+// handler sees the server's prompt, the answer reaches the tool — is identical
+// to the legacy flow, and that identity is what this test pins.
+//
+// It drives mcptest.ToolElicitMRTR, not mcptest.ToolElicit: the latter still
+// calls ServerSession.Elicit ad hoc, which stateless mode cannot serve at all
+// (there is no session to push a server-initiated request over). ToolElicitMRTR
+// is the fixture's MRTR-native twin, built for exactly this — see its doc
+// comment in internal/mcptest/server.go for why it is a second tool rather
+// than a rewrite of ToolElicit's handler.
+func TestElicitationStateless(t *testing.T) {
+	t.Parallel()
+
+	url := newFixtureServer(t, mcptest.Config{Stateless: true, Elicit: true})
+	f, err := New(Config{Endpoint: url})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	el := &statelessElicitor{}
+	def := client.Definition{Name: "fixture", Transport: f}
+	def.Capabilities.Elicitation = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c, err := client.Connect(ctx, def, client.Handlers{Elicitation: el})
+	if err != nil {
+		t.Fatalf("client.Connect() error = %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer closeCancel()
+		_ = c.Close(closeCtx)
+	})
+
+	res, err := c.CallTool(ctx, mcptest.ToolElicitMRTR, json.RawMessage(`{}`), client.CallOpts{})
+	if err != nil {
+		t.Fatalf("CallTool(elicit) error = %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool(elicit) tool error: %+v", res.Content)
+	}
+
+	// The server was told what the human said — the same assertion
+	// TestRealServerElicitsAHuman makes over stdio, pinning that MRTR's
+	// application-visible outcome matches the legacy ad hoc flow's.
+	if got, want := clientResultText(t, res), mcptest.ElicitAnswerPrefix+"accept"; got != want {
+		t.Errorf("the tool reported %q, want %q", got, want)
+	}
+
+	el.mu.Lock()
+	seen := len(el.seen)
+	el.mu.Unlock()
+	if seen != 1 {
+		t.Errorf("elicitation handler invoked %d times, want 1", seen)
 	}
 }
 

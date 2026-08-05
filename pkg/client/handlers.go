@@ -124,6 +124,10 @@ type ElicitResult struct {
 // elicitation timeout.
 //
 // Installing one is what allows the elicitation capability to be advertised.
+//
+// The server-initiated form of this feature is deprecated in spec revision
+// 2026-07-28 (SEP-2577) and served via multi-round-trip requests there; it
+// remains fully functional against peers negotiating ≤2025-11-25.
 type ElicitationHandler interface {
 	Elicit(ctx context.Context, req ElicitRequest) (ElicitResult, error)
 }
@@ -185,6 +189,10 @@ type SampleResult struct {
 // error of class FailureSamplingDenied is how a host refuses one.
 //
 // Installing one is what allows the sampling capability to be advertised.
+//
+// The server-initiated form of this feature is deprecated in spec revision
+// 2026-07-28 (SEP-2577) and served via multi-round-trip requests there; it
+// remains fully functional against peers negotiating ≤2025-11-25.
 type SamplingHandler interface {
 	Sample(ctx context.Context, req SampleRequest) (SampleResult, error)
 }
@@ -202,6 +210,10 @@ type Root struct {
 // whenever the server asks, so a host may narrow the set at any time.
 //
 // Installing one is what allows the roots capability to be advertised.
+//
+// The server-initiated form of this feature is deprecated in spec revision
+// 2026-07-28 (SEP-2577) and served via multi-round-trip requests there; it
+// remains fully functional against peers negotiating ≤2025-11-25.
 type RootsProvider interface {
 	Roots(ctx context.Context) ([]Root, error)
 }
