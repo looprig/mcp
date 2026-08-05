@@ -37,7 +37,7 @@ Define small interfaces at the package that consumes them when substitution, tes
 **Amend this file when approved.** Once a package is approved, add it here so future sessions know it is sanctioned:
 
 <!-- Approved external packages -->
-- `github.com/modelcontextprotocol/go-sdk` v1.6.1 — the official MCP Go SDK; this module wraps it. **Approved 2026-07-16.** Constraint: SDK types stay behind `pkg/client`/`internal/protocol` and must never leak from any `pkg/...` exported API.
+- `github.com/modelcontextprotocol/go-sdk` v1.7.0 — the official MCP Go SDK; this module wraps it. **Approved 2026-07-16.** Constraint: SDK types stay behind `pkg/client`/`internal/protocol` and must never leak from any `pkg/...` exported API. Upgraded 2026-08-05 for all-protocol support (docs/plans/2026-08-05-protocol-upgrade-design.md).
 - Dev tools (tool directive only): `github.com/securego/gosec/v2/cmd/gosec` (security static analysis), `golang.org/x/vuln/cmd/govulncheck` (official Go vulnerability scanner), `honnef.co/go/tools/cmd/staticcheck` (extended static analysis).
 
 That list is exhaustive. Nothing else is approved.

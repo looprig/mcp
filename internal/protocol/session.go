@@ -167,6 +167,7 @@ func (s *Session) Initialize(ctx context.Context) (InitializeResult, error) {
 	// would invite one. (Setting both handlers is a documented SDK panic; only
 	// this one is ever set.)
 	if servesSample {
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		opts.CreateMessageHandler = func(ctx context.Context, req *mcp.CreateMessageRequest) (*mcp.CreateMessageResult, error) {
 			return s.onSample(ctx, req.Params)
 		}
@@ -276,6 +277,7 @@ func (s *Session) installRoots(ctx context.Context, client *mcp.Client) error {
 	if err != nil {
 		return fmt.Errorf("roots provider: %w", err)
 	}
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	sdkRoots := make([]*mcp.Root, 0, len(roots))
 	for _, r := range roots {
 		if r.URI == "" {
@@ -284,8 +286,10 @@ func (s *Session) installRoots(ctx context.Context, client *mcp.Client) error {
 		if len(sdkRoots) >= MaxRoots {
 			break
 		}
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		sdkRoots = append(sdkRoots, &mcp.Root{URI: r.URI, Name: r.Name})
 	}
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	client.AddRoots(sdkRoots...)
 	return nil
 }
@@ -299,6 +303,7 @@ func sdkClientCapabilities(c ClientCapabilities) *mcp.ClientCapabilities {
 	if c.Roots {
 		// RootsV2, not Roots: the SDK derives the deprecated field from it and
 		// ignores a value written to the old one.
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		caps.RootsV2 = &mcp.RootCapabilities{ListChanged: true}
 	}
 	if c.Sampling {
@@ -311,6 +316,7 @@ func sdkClientCapabilities(c ClientCapabilities) *mcp.ClientCapabilities {
 		// `if caps.Sampling == nil`), so this is the whole advertisement — which
 		// is the point: the SDK would otherwise add Tools on its own the moment
 		// a tool-bearing handler were registered.
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		caps.Sampling = &mcp.SamplingCapabilities{}
 	}
 	if c.Elicitation {

@@ -8,7 +8,7 @@ tool (
 	honnef.co/go/tools/cmd/staticcheck
 )
 
-require github.com/modelcontextprotocol/go-sdk v1.6.1
+require github.com/modelcontextprotocol/go-sdk v1.7.0
 
 require (
 	cloud.google.com/go v0.123.0 // indirect
@@ -60,6 +60,7 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/telemetry v0.0.0-20260717140457-bdb89881bb75 // indirect
 	golang.org/x/text v0.40.0 // indirect
+	golang.org/x/time v0.15.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
 	golang.org/x/vuln v1.6.0 // indirect
 	google.golang.org/api v0.291.0 // indirect

@@ -52,9 +52,10 @@ func TestFromSDKInitializeResult(t *testing.T) {
 				Instructions:    "be nice",
 				ServerInfo:      &mcp.Implementation{Name: "srv", Version: "1.2.3", Title: "Server"},
 				Capabilities: &mcp.ServerCapabilities{
-					Tools:       &mcp.ToolCapabilities{},
-					Prompts:     &mcp.PromptCapabilities{},
-					Resources:   &mcp.ResourceCapabilities{Subscribe: true},
+					Tools:     &mcp.ToolCapabilities{},
+					Prompts:   &mcp.PromptCapabilities{},
+					Resources: &mcp.ResourceCapabilities{Subscribe: true},
+					//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 					Logging:     &mcp.LoggingCapabilities{},
 					Completions: &mcp.CompletionCapabilities{},
 				},

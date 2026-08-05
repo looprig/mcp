@@ -354,8 +354,10 @@ func FromSDKContent(c mcp.Content, b Bounds) (Content, error) {
 
 	case *mcp.ResourceLink:
 		return unsupported(KindResourceLink, c), nil
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	case *mcp.ToolUseContent:
 		return unsupported(KindToolUse, c), nil
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	case *mcp.ToolResultContent:
 		return unsupported(KindToolResult, c), nil
 	default:
@@ -399,8 +401,10 @@ func unsupportedSize(c mcp.Content) int {
 	switch v := c.(type) {
 	case *mcp.ResourceLink:
 		return len(v.URI) + len(v.Name) + len(v.Title) + len(v.Description) + len(v.MIMEType)
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	case *mcp.ToolUseContent:
 		return len(v.ID) + len(v.Name)
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	case *mcp.ToolResultContent:
 		return len(v.ToolUseID)
 	default:

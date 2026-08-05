@@ -24,7 +24,10 @@ func sampleBounds() protocol.Bounds {
 }
 
 // textMsg builds a well-formed text message.
+//
+//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 func textMsg(role, text string) *mcp.SamplingMessage {
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	return &mcp.SamplingMessage{Role: mcp.Role(role), Content: &mcp.TextContent{Text: text}}
 }
 
@@ -32,17 +35,20 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
+		name string
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		params  *mcp.CreateMessageParams
 		want    protocol.SampleRequest
 		wantErr bool
 	}{
 		{
 			name: "happy path",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens:    100,
 				SystemPrompt: "be brief",
-				Messages:     []*mcp.SamplingMessage{textMsg("user", "hi")},
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+				Messages: []*mcp.SamplingMessage{textMsg("user", "hi")},
 			},
 			want: protocol.SampleRequest{
 				SystemPrompt: "be brief",
@@ -52,8 +58,10 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 		},
 		{
 			name: "both roles",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens: 1,
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 				Messages: []*mcp.SamplingMessage{
 					textMsg("user", "a"),
 					textMsg("assistant", "b"),
@@ -73,9 +81,12 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 			// field on SampleRequest for a server's preference, so a handler
 			// cannot honor one.
 			name: "server steering fields are dropped",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
-				MaxTokens:        5,
-				Messages:         []*mcp.SamplingMessage{textMsg("user", "hi")},
+				MaxTokens: 5,
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+				Messages: []*mcp.SamplingMessage{textMsg("user", "hi")},
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 				ModelPreferences: &mcp.ModelPreferences{Hints: []*mcp.ModelHint{{Name: "expensive-model"}}},
 				Temperature:      2,
 				StopSequences:    []string{"stop"},
@@ -93,22 +104,26 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "no messages",
+			name: "no messages",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:  &mcp.CreateMessageParams{MaxTokens: 1, Messages: nil},
 			wantErr: true,
 		},
 		{
-			name:    "nil message",
+			name: "nil message",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:  &mcp.CreateMessageParams{MaxTokens: 1, Messages: []*mcp.SamplingMessage{nil}},
 			wantErr: true,
 		},
 		{
-			name:    "unknown role",
+			name: "unknown role",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:  &mcp.CreateMessageParams{MaxTokens: 1, Messages: []*mcp.SamplingMessage{textMsg("system", "hi")}},
 			wantErr: true,
 		},
 		{
-			name:    "empty role",
+			name: "empty role",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:  &mcp.CreateMessageParams{MaxTokens: 1, Messages: []*mcp.SamplingMessage{textMsg("", "hi")}},
 			wantErr: true,
 		},
@@ -116,8 +131,10 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 			// Refused, not dropped: a conversation with a message removed is a
 			// different conversation from the one the server sent.
 			name: "non-text content is refused",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens: 1,
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 				Messages: []*mcp.SamplingMessage{
 					{Role: "user", Content: &mcp.ImageContent{Data: []byte{1}, MIMEType: "image/png"}},
 				},
@@ -126,26 +143,31 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 		},
 		{
 			name: "nil content",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens: 1,
-				Messages:  []*mcp.SamplingMessage{{Role: "user", Content: nil}},
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+				Messages: []*mcp.SamplingMessage{{Role: "user", Content: nil}},
 			},
 			wantErr: true,
 		},
 		{
-			name:    "zero maxTokens",
+			name: "zero maxTokens",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:  &mcp.CreateMessageParams{MaxTokens: 0, Messages: []*mcp.SamplingMessage{textMsg("user", "hi")}},
 			wantErr: true,
 		},
 		{
-			name:    "negative maxTokens",
+			name: "negative maxTokens",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:  &mcp.CreateMessageParams{MaxTokens: -1, Messages: []*mcp.SamplingMessage{textMsg("user", "hi")}},
 			wantErr: true,
 		},
 		{
 			// Clamped, not refused: it is still only a request, and the client
 			// caps it against the host's own limit.
-			name:   "oversized maxTokens clamps to MaxInt",
+			name: "oversized maxTokens clamps to MaxInt",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{MaxTokens: math.MaxInt64, Messages: []*mcp.SamplingMessage{textMsg("user", "hi")}},
 			want: protocol.SampleRequest{
 				Messages:  []protocol.SampleMessage{{Role: protocol.SampleRoleUser, Text: "hi"}},
@@ -154,10 +176,12 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 		},
 		{
 			name: "conversation exactly at the bound",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens:    1,
 				SystemPrompt: strings.Repeat("s", 16),
-				Messages:     []*mcp.SamplingMessage{textMsg("user", strings.Repeat("u", 16))},
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+				Messages: []*mcp.SamplingMessage{textMsg("user", strings.Repeat("u", 16))},
 			},
 			want: protocol.SampleRequest{
 				SystemPrompt: strings.Repeat("s", 16),
@@ -167,19 +191,23 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 		},
 		{
 			name: "conversation one byte over the bound",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens:    1,
 				SystemPrompt: strings.Repeat("s", 16),
-				Messages:     []*mcp.SamplingMessage{textMsg("user", strings.Repeat("u", 17))},
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+				Messages: []*mcp.SamplingMessage{textMsg("user", strings.Repeat("u", 17))},
 			},
 			wantErr: true,
 		},
 		{
 			name: "system prompt alone over the bound",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens:    1,
 				SystemPrompt: strings.Repeat("s", 33),
-				Messages:     []*mcp.SamplingMessage{textMsg("user", "hi")},
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+				Messages: []*mcp.SamplingMessage{textMsg("user", "hi")},
 			},
 			wantErr: true,
 		},
@@ -188,8 +216,10 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 			// bound with no total is not a bound: a server would send more
 			// messages, which is exactly what this case does.
 			name: "many small messages are bounded in aggregate",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params: &mcp.CreateMessageParams{
 				MaxTokens: 1,
+				//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 				Messages: []*mcp.SamplingMessage{
 					textMsg("user", strings.Repeat("a", 10)),
 					textMsg("user", strings.Repeat("b", 10)),
@@ -232,9 +262,11 @@ func TestFromSDKCreateMessageParams(t *testing.T) {
 func TestFromSDKCreateMessageParamsReportsOverLimit(t *testing.T) {
 	t.Parallel()
 
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	_, err := protocol.FromSDKCreateMessageParams(&mcp.CreateMessageParams{
 		MaxTokens: 1,
-		Messages:  []*mcp.SamplingMessage{textMsg("user", strings.Repeat("u", 33))},
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+		Messages: []*mcp.SamplingMessage{textMsg("user", strings.Repeat("u", 33))},
 	}, sampleBounds())
 
 	var over *limits.OverLimitError
@@ -343,10 +375,12 @@ func FuzzFromSDKCreateMessageParams(f *testing.F) {
 
 	f.Fuzz(func(t *testing.T, system, role, text string, tokens int64) {
 		b := sampleBounds()
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		got, err := protocol.FromSDKCreateMessageParams(&mcp.CreateMessageParams{
 			MaxTokens:    tokens,
 			SystemPrompt: system,
-			Messages:     []*mcp.SamplingMessage{textMsg(role, text)},
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
+			Messages: []*mcp.SamplingMessage{textMsg(role, text)},
 		}, b)
 		if err != nil {
 			return

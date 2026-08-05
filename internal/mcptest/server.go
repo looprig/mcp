@@ -518,7 +518,9 @@ func addProgressAndLogTools(s *mcp.Server) {
 		}
 		// Log is a no-op until the client has set a level; that is the SDK
 		// honoring the spec, not a failure, so the tool still replies.
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		err := req.Session.Log(ctx, &mcp.LoggingMessageParams{
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			Level:  mcp.LoggingLevel(level),
 			Logger: ServerName,
 			Data:   strings.Repeat(LogFill, in.Bytes),

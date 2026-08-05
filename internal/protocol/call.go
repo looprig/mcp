@@ -372,6 +372,7 @@ func (s *Session) SetLogLevel(ctx context.Context, level string) error {
 	if err != nil {
 		return err
 	}
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	if err := cs.SetLoggingLevel(ctx, &mcp.SetLoggingLevelParams{Level: mcp.LoggingLevel(level)}); err != nil {
 		return fmt.Errorf("logging/setLevel %q: %w", level, err)
 	}
@@ -442,6 +443,8 @@ func (s *Session) onProgress(params *mcp.ProgressNotificationParams) {
 }
 
 // onLog converts and delivers a server log message.
+//
+//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 func (s *Session) onLog(params *mcp.LoggingMessageParams) {
 	if params == nil || s.cfg.OnLog == nil {
 		return
@@ -493,6 +496,8 @@ func (s *Session) onResourceUpdated(params *mcp.ResourceUpdatedNotificationParam
 // must nil-check first" is a contract every sibling converter here declines to
 // rely on. It matches the treatment of a nil Data payload, which is likewise
 // empty rather than fatal.
+//
+//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 func FromSDKLogParams(params *mcp.LoggingMessageParams, b Bounds) LogRecord {
 	if params == nil {
 		return LogRecord{}

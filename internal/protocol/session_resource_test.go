@@ -88,17 +88,29 @@ func TestResourceUpdateReachesTheCallback(t *testing.T) {
 		t.Fatalf("Session.Subscribe() error = %v", err)
 	}
 
-	if err := server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: subURI}); err != nil {
-		t.Fatalf("Server.ResourceUpdated() error = %v", err)
-	}
-
-	select {
-	case u := <-updates:
-		if u.URI != subURI {
-			t.Errorf("update URI = %q, want %q", u.URI, subURI)
+	// Since the SDK bump to v1.7.0, Subscribe's "subscriptions/listen" call
+	// (SEP-2575) is fire-and-forget on the client side (see
+	// defaultSendingMethodHandler's special case for methodSubscriptionsListen
+	// in vendor/.../mcp/shared.go): it returns once the request is dispatched,
+	// not once the server has registered the subscription. So the first emit
+	// can legitimately race ahead of that registration; retry until it lands or
+	// the deadline expires.
+	deadline := time.Now().Add(sessionTimeout)
+	for {
+		if err := server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: subURI}); err != nil {
+			t.Fatalf("Server.ResourceUpdated() error = %v", err)
 		}
-	case <-time.After(sessionTimeout):
-		t.Fatal("no resource update reached the callback: the notification handler is unwired")
+		select {
+		case u := <-updates:
+			if u.URI != subURI {
+				t.Errorf("update URI = %q, want %q", u.URI, subURI)
+			}
+			return
+		case <-time.After(200 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("no resource update reached the callback: the notification handler is unwired")
+			}
+		}
 	}
 }
 
@@ -118,28 +130,70 @@ func TestUnsubscribeStopsUpdates(t *testing.T) {
 		t.Fatalf("Session.Subscribe() error = %v", err)
 	}
 
-	// While subscribed the pipe is demonstrably live.
-	if err := server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: subURI}); err != nil {
-		t.Fatalf("Server.ResourceUpdated() error = %v", err)
+	// While subscribed the pipe is demonstrably live. Retry the emit: since the
+	// SDK bump to v1.7.0, Subscribe's "subscriptions/listen" call (SEP-2575) is
+	// fire-and-forget on the client side (see TestResourceUpdateReachesTheCallback),
+	// so the first emit can race ahead of the server registering the subscription.
+	deadline := time.Now().Add(sessionTimeout)
+	for {
+		if err := server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: subURI}); err != nil {
+			t.Fatalf("Server.ResourceUpdated() error = %v", err)
+		}
+		gotFirst := false
+		select {
+		case <-updates:
+			gotFirst = true
+		case <-time.After(200 * time.Millisecond):
+			if time.Now().After(deadline) {
+				t.Fatal("the first update never arrived; the test cannot prove unsubscribe stops a live stream")
+			}
+		}
+		if gotFirst {
+			break
+		}
 	}
-	select {
-	case <-updates:
-	case <-time.After(sessionTimeout):
-		t.Fatal("the first update never arrived; the test cannot prove unsubscribe stops a live stream")
+
+	// Drain any stragglers: each retry above broadcast its own update, and a
+	// slow one can still be in flight, or already buffered, after the first hit
+	// unblocked the loop. Waiting out a quiet window with nothing arriving is
+	// what makes the "no update after Unsubscribe" assertion below trustworthy.
+drain:
+	for {
+		select {
+		case <-updates:
+		case <-time.After(300 * time.Millisecond):
+			break drain
+		}
 	}
 
 	if err := s.Unsubscribe(ctx, subURI); err != nil {
 		t.Fatalf("Session.Unsubscribe() error = %v", err)
 	}
 
-	// Now the server has no subscriber for this URI, so the emit reaches no one.
-	if err := server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: subURI}); err != nil {
-		t.Fatalf("Server.ResourceUpdated() error = %v", err)
-	}
-	select {
-	case u := <-updates:
-		t.Errorf("an update arrived after Unsubscribe: %q", u.URI)
-	case <-time.After(200 * time.Millisecond):
-		// Correct: an unsubscribed session receives no further updates.
+	// Eventually the server has no subscriber for this URI, so an emit reaches
+	// no one — but not necessarily the very next one. Since the SDK bump to
+	// v1.7.0, Unsubscribe cancels the background "subscriptions/listen" stream
+	// (SEP-2575) and returns without waiting for the server to process that
+	// cancellation (see ClientSession.Unsubscribe in vendor/.../mcp/client.go):
+	// the cancellation notice travels to the server asynchronously, so an emit
+	// issued immediately after Unsubscribe returns can still land once while it
+	// is in flight. The claim under test is that delivery stops, not that it
+	// stops within one RPC: retry until a whole window passes with nothing
+	// delivered, and fail only if delivery never stops within sessionTimeout.
+	settleDeadline := time.Now().Add(sessionTimeout)
+	for {
+		if err := server.ResourceUpdated(ctx, &mcp.ResourceUpdatedNotificationParams{URI: subURI}); err != nil {
+			t.Fatalf("Server.ResourceUpdated() error = %v", err)
+		}
+		select {
+		case u := <-updates:
+			if time.Now().After(settleDeadline) {
+				t.Fatalf("an update (%q) kept arriving after Unsubscribe throughout sessionTimeout", u.URI)
+			}
+			// Still settling: the server had not yet processed the
+			// cancellation. Try again.
+		case <-time.After(300 * time.Millisecond):
+			return // A whole window passed silent: delivery has stopped.
+		}
 	}
 }

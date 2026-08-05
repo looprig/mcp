@@ -400,32 +400,38 @@ func TestFromSDKLogParams(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name     string
+		name string
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		params   *mcp.LoggingMessageParams
 		wantText string
 	}{
 		{
-			name:     "a string payload is used as-is",
+			name: "a string payload is used as-is",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:   &mcp.LoggingMessageParams{Level: "info", Logger: "srv", Data: "hello"},
 			wantText: "hello",
 		},
 		{
-			name:     "a structured payload is rendered as JSON",
+			name: "a structured payload is rendered as JSON",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:   &mcp.LoggingMessageParams{Level: "info", Data: map[string]any{"k": "v"}},
 			wantText: `{"k":"v"}`,
 		},
 		{
-			name:     "a nil payload is empty, not a panic",
+			name: "a nil payload is empty, not a panic",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:   &mcp.LoggingMessageParams{Level: "info"},
 			wantText: "",
 		},
 		{
-			name:     "a number payload renders",
+			name: "a number payload renders",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:   &mcp.LoggingMessageParams{Level: "info", Data: 42},
 			wantText: "42",
 		},
 		{
-			name:     "an unrenderable payload is reported, not dropped",
+			name: "an unrenderable payload is reported, not dropped",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			params:   &mcp.LoggingMessageParams{Level: "info", Data: make(chan int)},
 			wantText: "[unrenderable log payload]",
 		},
@@ -459,6 +465,7 @@ func TestLogParamsAreBounded(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			got := protocol.FromSDKLogParams(&mcp.LoggingMessageParams{
 				Level:  "info",
 				Logger: strings.Repeat("l", 100_000),

@@ -617,7 +617,8 @@ func TestFromSDKContent(t *testing.T) {
 			},
 		},
 		{
-			name:    "sampling-only tool_use content is unsupported",
+			name: "sampling-only tool_use content is unsupported",
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			content: &mcp.ToolUseContent{ID: "1", Name: "t"},
 			bounds:  testBounds(),
 			check: func(t *testing.T, got protocol.Content) {
@@ -655,10 +656,12 @@ func TestFromSDKContent(t *testing.T) {
 			bounds: testBounds(), wantErr: true,
 		},
 		{
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			name: "typed nil tool use", content: (*mcp.ToolUseContent)(nil),
 			bounds: testBounds(), wantErr: true,
 		},
 		{
+			//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 			name: "typed nil tool result", content: (*mcp.ToolResultContent)(nil),
 			bounds: testBounds(), wantErr: true,
 		},

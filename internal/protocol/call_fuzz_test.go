@@ -276,6 +276,7 @@ func FuzzLogParamsDecode(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, body string) {
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		var params mcp.LoggingMessageParams
 		if err := json.Unmarshal([]byte(body), &params); err != nil {
 			return

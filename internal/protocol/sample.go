@@ -138,6 +138,8 @@ var errNoSampleHandler = errors.New("protocol: no sampling handler is installed"
 // the right shape for every failure it can have: a request this module refused
 // to describe, a host that declined to spend, and a model that failed are all
 // "no completion", and a server must learn that rather than wait.
+//
+//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 func (s *Session) onSample(ctx context.Context, params *mcp.CreateMessageParams) (*mcp.CreateMessageResult, error) {
 	fn := s.cfg.OnSample
 	if fn == nil {
@@ -165,6 +167,8 @@ func (s *Session) onSample(ctx context.Context, params *mcp.CreateMessageParams)
 // on*. A truncated conversation is a conversation whose meaning this module
 // silently altered, and the completion of it would be the answer to a question
 // nobody asked.
+//
+//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 func FromSDKCreateMessageParams(params *mcp.CreateMessageParams, b Bounds) (SampleRequest, error) {
 	if params == nil {
 		return SampleRequest{}, fmt.Errorf("%w: sampling/createMessage params", errNilInput)
@@ -274,6 +278,8 @@ func sampleText(c mcp.Content) (string, error) {
 // bound that only ever runs one way is not a bound on the conversation, and the
 // server on the other end of this reply is entitled to the same protection from
 // an unbounded payload that this module gives itself.
+//
+//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 func ToSDKCreateMessageResult(r SampleResult, b Bounds) (*mcp.CreateMessageResult, error) {
 	if r.Model == "" {
 		// The model that ran is part of the answer, per MCP: the server is told
@@ -285,6 +291,7 @@ func ToSDKCreateMessageResult(r SampleResult, b Bounds) (*mcp.CreateMessageResul
 		return nil, fmt.Errorf("sampling completion: %d bytes: %w", len(r.Text),
 			&limits.OverLimitError{What: WhatSampleTextBytes, Limit: b.MaxTextBytes})
 	}
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	return &mcp.CreateMessageResult{
 		Content:    &mcp.TextContent{Text: r.Text},
 		Model:      r.Model,

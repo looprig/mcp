@@ -16,6 +16,7 @@ package streamablehttp
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -428,9 +429,14 @@ func TestRedirectsThatLeaveTheOriginAreRefused(t *testing.T) {
 
 		// The client makes the first request, then follows at most httpsec.MaxRedirects-1
 		// more before CheckRedirect refuses the next: httpsec.MaxRedirects requests reach
-		// the server. What matters is that the number is finite and small.
-		if n := hops.Load(); n > httpsec.MaxRedirects {
-			t.Errorf("the server saw %d POST hops, want at most %d: a redirect loop must be bounded", n, httpsec.MaxRedirects)
+		// the server per logical call. Since the SDK bump to v1.7.0, Connect issues up
+		// to two logical calls before giving up — "server/discover" (SEP-2575), and,
+		// once that also redirect-loops, a legacy "initialize" fallback — each
+		// independently bounded by CheckRedirect. So the server-observed total is
+		// bounded by 2*httpsec.MaxRedirects, not MaxRedirects alone. What matters is
+		// that the number is finite and small.
+		if n := hops.Load(); n > 2*httpsec.MaxRedirects {
+			t.Errorf("the server saw %d POST hops, want at most %d: a redirect loop must be bounded", n, 2*httpsec.MaxRedirects)
 		}
 		if hops.Load() == 0 {
 			t.Error("the server saw no POSTs; the test proved nothing")
@@ -722,11 +728,18 @@ func TestHTTPStatusesAreClassified(t *testing.T) {
 
 // TestCallIsNeverRetried is the load-bearing test of the package comment. A
 // server that fails every request is the case where a retrying client would show
-// itself; exactly one request must arrive.
+// itself; no single JSON-RPC call may reach the server twice.
 //
 // It probes with initialize, which is a POST carrying a JSON-RPC call — the same
 // shape, on the same code path, as a tool call. A tool call itself is probed
 // end-to-end in the integration test, where there is a server that can serve one.
+//
+// Since the SDK bump to v1.7.0, a single Initialize legitimately issues up to
+// two DIFFERENT JSON-RPC calls before giving up: "server/discover" (SEP-2575),
+// and, once that fails, a legacy "initialize" fallback — see
+// vendor/.../mcp/client.go's Connect. That is two distinct requests, not one
+// request retried, so the assertion counts POSTs per JSON-RPC method rather
+// than in aggregate: each individual method must reach the server at most once.
 func TestCallIsNeverRetried(t *testing.T) {
 	t.Parallel()
 
@@ -754,10 +767,17 @@ func TestCallIsNeverRetried(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			var posts atomic.Int64
+			var mu sync.Mutex
+			methodCounts := map[string]int{}
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if r.Method == http.MethodPost {
-					posts.Add(1)
+					var body struct {
+						Method string `json:"method"`
+					}
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					mu.Lock()
+					methodCounts[body.Method]++
+					mu.Unlock()
 				}
 				w.WriteHeader(tt.status)
 			}))
@@ -772,8 +792,15 @@ func TestCallIsNeverRetried(t *testing.T) {
 			// retrying client by finishing first.
 			time.Sleep(250 * time.Millisecond)
 
-			if n := posts.Load(); n != 1 {
-				t.Errorf("server received %d POSTs, want exactly 1: a call must never be re-sent", n)
+			mu.Lock()
+			defer mu.Unlock()
+			if len(methodCounts) == 0 {
+				t.Fatal("the server saw no POSTs; the test proved nothing")
+			}
+			for method, n := range methodCounts {
+				if n != 1 {
+					t.Errorf("server received %d POSTs of %q, want exactly 1: a call must never be re-sent", n, method)
+				}
 			}
 		})
 	}
@@ -876,6 +903,15 @@ func TestConnectRefusesADoneContext(t *testing.T) {
 
 // TestInitializeHonorsCancellation checks the caller's context reaches the wire:
 // a server that never answers must not outlast the caller who gave up.
+//
+// The wait margin below is wider than it looks like it needs to be. Since the
+// SDK bump to v1.7.0, Connect tries "server/discover" first and, on failure,
+// falls back to a legacy "initialize" — each of those, on cancellation, spends
+// up to the SDK's own unexported notifyCancellationTimeout (5s, as of this SDK
+// version) making a best-effort attempt to tell the peer before giving up (see
+// cancelCall in vendor/.../mcp/transport.go). Against a server that never
+// answers, that cost is paid twice: observed ~10.05-10.1s. 20s leaves headroom
+// without the test itself becoming the slow part of the suite.
 func TestInitializeHonorsCancellation(t *testing.T) {
 	t.Parallel()
 
@@ -905,7 +941,7 @@ func TestInitializeHonorsCancellation(t *testing.T) {
 			t.Fatal("Initialize() succeeded, want a cancellation")
 		}
 		assertClass(t, err, client.FailureCancelled)
-	case <-time.After(10 * time.Second):
+	case <-time.After(20 * time.Second):
 		t.Fatal("Initialize() did not return after its context was cancelled")
 	}
 }

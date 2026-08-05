@@ -53,9 +53,10 @@ func fromSDKServerCapabilities(c *mcp.ServerCapabilities) ServerCapabilities {
 		return ServerCapabilities{}
 	}
 	caps := ServerCapabilities{
-		Tools:       c.Tools != nil,
-		Prompts:     c.Prompts != nil,
-		Resources:   c.Resources != nil,
+		Tools:     c.Tools != nil,
+		Prompts:   c.Prompts != nil,
+		Resources: c.Resources != nil,
+		//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 		Logging:     c.Logging != nil,
 		Completions: c.Completions != nil,
 	}
