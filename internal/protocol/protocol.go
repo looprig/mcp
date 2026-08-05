@@ -312,6 +312,33 @@ type InitializeResult struct {
 // initialize (e.g. "2025-06-18"). It is server-supplied and untrusted.
 type ProtocolVersion string
 
+// statelessSince is the first spec revision with the stateless wire model
+// (SEP-2575): no initialize handshake, no resumability, MRTR in place of
+// server-initiated requests.
+const statelessSince = "2026-07-28"
+
+// Stateless reports whether this revision speaks the stateless wire model.
+// Version strings are ISO dates, so lexical comparison is date comparison. A
+// value that is not date-shaped is treated as legacy: the string is
+// server-supplied and untrusted, and the legacy path is the conservative one.
+func (v ProtocolVersion) Stateless() bool {
+	if len(v) != len(statelessSince) {
+		return false
+	}
+	for i, r := range v {
+		if i == 4 || i == 7 {
+			if r != '-' {
+				return false
+			}
+			continue
+		}
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return string(v) >= statelessSince
+}
+
 // ServerIdentity is what a server claims to be. Every field is server-supplied
 // and cosmetic: it names a peer, it never authorizes one.
 type ServerIdentity struct {
