@@ -21,6 +21,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/looprig/mcp/internal/mcptest"
 	"github.com/looprig/mcp/internal/protocol"
 )
 
@@ -46,15 +47,35 @@ type rootsProbe struct {
 // connectRootsProbe wires a server and a Session over an in-memory pair.
 func connectRootsProbe(t *testing.T, cfg protocol.ConnectConfig) *rootsProbe {
 	t.Helper()
+	return connectRootsProbeTransport(t, cfg, false)
+}
+
+// connectRootsProbeLegacy is connectRootsProbe, but pins the session to
+// protocol revisions <= mcptest.LegacyProtocolVersion (see
+// mcptest.PinLegacyProtocol), so a test may drive an ad hoc
+// ServerSession.ListRoots call: SDK v1.7.0 forbids that once the negotiated
+// protocol version reaches 2026-07-28 (SEP-2322), and offers no other way to
+// request an older version from an in-memory test peer.
+func connectRootsProbeLegacy(t *testing.T, cfg protocol.ConnectConfig) *rootsProbe {
+	t.Helper()
+	return connectRootsProbeTransport(t, cfg, true)
+}
+
+func connectRootsProbeTransport(t *testing.T, cfg protocol.ConnectConfig, legacy bool) *rootsProbe {
+	t.Helper()
 
 	probe := &rootsProbe{}
 	server := mcp.NewServer(&mcp.Implementation{Name: "roots-probe", Version: "1"}, nil)
 	clientT, serverT := mcp.NewInMemoryTransports()
+	var serverTransport mcp.Transport = serverT
+	if legacy {
+		serverTransport = mcptest.PinLegacyProtocol(serverT)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), sessionTimeout)
 	t.Cleanup(cancel)
 
-	ss, err := server.Connect(ctx, serverT, nil)
+	ss, err := server.Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatalf("server.Connect() error = %v", err)
 	}
@@ -146,15 +167,9 @@ func TestRootsAdvertisement(t *testing.T) {
 // not the SDK's never-populated empty set.
 func TestRootsRoundTrip(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on Task 8: SDK v1.7.0 unconditionally refuses an ad hoc " +
-		"ServerSession.ListRoots call once the negotiated protocol version is " +
-		">=2026-07-28 (SEP-2322: \"return an InputRequests map instead\"), and " +
-		"there is no public SDK API to pin a lower version for this in-memory " +
-		"test peer. Needs Task 8's version-pinned fixture (or an MRTR rewrite) " +
-		"— see docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8.")
 
 	want := protocol.Root{URI: "file:///approved/workspace", Name: "workspace"}
-	probe := connectRootsProbe(t, rootsConfig(true, func(context.Context) ([]protocol.Root, error) {
+	probe := connectRootsProbeLegacy(t, rootsConfig(true, func(context.Context) ([]protocol.Root, error) {
 		return []protocol.Root{want}, nil
 	}))
 
@@ -203,14 +218,8 @@ func TestRootsProviderErrorFailsHandshake(t *testing.T) {
 // and no more than MaxRoots reach the server, however many the provider returns.
 func TestRootsBoundAndCanonical(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on Task 8: SDK v1.7.0 unconditionally refuses an ad hoc " +
-		"ServerSession.ListRoots call once the negotiated protocol version is " +
-		">=2026-07-28 (SEP-2322: \"return an InputRequests map instead\"), and " +
-		"there is no public SDK API to pin a lower version for this in-memory " +
-		"test peer. Needs Task 8's version-pinned fixture (or an MRTR rewrite) " +
-		"— see docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8.")
 
-	probe := connectRootsProbe(t, rootsConfig(true, func(context.Context) ([]protocol.Root, error) {
+	probe := connectRootsProbeLegacy(t, rootsConfig(true, func(context.Context) ([]protocol.Root, error) {
 		roots := []protocol.Root{{URI: "", Name: "no-uri"}}
 		for i := 0; i < protocol.MaxRoots+50; i++ {
 			roots = append(roots, protocol.Root{URI: fmt.Sprintf("file:///r%d", i)})

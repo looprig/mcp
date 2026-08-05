@@ -19,6 +19,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/looprig/mcp/internal/mcptest"
 	"github.com/looprig/mcp/internal/protocol"
 )
 
@@ -39,15 +40,35 @@ type sampleProbe struct {
 // connectSampleProbe wires a server and a Session over an in-memory pair.
 func connectSampleProbe(t *testing.T, cfg protocol.ConnectConfig) *sampleProbe {
 	t.Helper()
+	return connectSampleProbeTransport(t, cfg, false)
+}
+
+// connectSampleProbeLegacy is connectSampleProbe, but pins the session to
+// protocol revisions <= mcptest.LegacyProtocolVersion (see
+// mcptest.PinLegacyProtocol), so a test may drive an ad hoc
+// ServerSession.CreateMessage call: SDK v1.7.0 forbids that once the
+// negotiated protocol version reaches 2026-07-28 (SEP-2322), and offers no
+// other way to request an older version from an in-memory test peer.
+func connectSampleProbeLegacy(t *testing.T, cfg protocol.ConnectConfig) *sampleProbe {
+	t.Helper()
+	return connectSampleProbeTransport(t, cfg, true)
+}
+
+func connectSampleProbeTransport(t *testing.T, cfg protocol.ConnectConfig, legacy bool) *sampleProbe {
+	t.Helper()
 
 	probe := &sampleProbe{}
 	server := mcp.NewServer(&mcp.Implementation{Name: "sample-probe", Version: "1"}, nil)
 	clientT, serverT := mcp.NewInMemoryTransports()
+	var serverTransport mcp.Transport = serverT
+	if legacy {
+		serverTransport = mcptest.PinLegacyProtocol(serverT)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), sessionTimeout)
 	t.Cleanup(cancel)
 
-	ss, err := server.Connect(ctx, serverT, nil)
+	ss, err := server.Connect(ctx, serverTransport, nil)
 	if err != nil {
 		t.Fatalf("server.Connect() error = %v", err)
 	}
@@ -188,16 +209,10 @@ func TestSamplingAdvertisesNoSubCapabilities(t *testing.T) {
 // checks what the server gets back.
 func TestSamplingRoundTrip(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on Task 8: SDK v1.7.0 unconditionally refuses an ad hoc " +
-		"ServerSession.CreateMessage call once the negotiated protocol version " +
-		"is >=2026-07-28 (SEP-2322: \"return an InputRequests map instead\"), " +
-		"and there is no public SDK API to pin a lower version for this " +
-		"in-memory test peer. Needs Task 8's version-pinned fixture (or an MRTR " +
-		"rewrite) — see docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8.")
 
 	var got protocol.SampleRequest
 	var mu sync.Mutex
-	probe := connectSampleProbe(t, sampleConfig(true, func(_ context.Context, req protocol.SampleRequest) (protocol.SampleResult, error) {
+	probe := connectSampleProbeLegacy(t, sampleConfig(true, func(_ context.Context, req protocol.SampleRequest) (protocol.SampleResult, error) {
 		mu.Lock()
 		got = req
 		mu.Unlock()

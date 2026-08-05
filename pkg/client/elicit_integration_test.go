@@ -51,20 +51,19 @@ func (e *scriptedElicitor) requests() []client.ElicitRequest {
 // server, which reports it back in the tool's result.
 func TestRealServerElicitsAHuman(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on Task 8: the fixture's \"-elicit\" tool calls " +
-		"ServerSession.Elicit ad hoc from within its handler, which SDK v1.7.0 " +
-		"unconditionally refuses once the negotiated protocol version is " +
-		">=2026-07-28 (SEP-2322: \"return an InputRequests map instead\"); the " +
-		"fixture needs an MRTR-based rewrite — see " +
-		"docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8, step 3.")
 
 	h := &scriptedElicitor{res: client.ElicitResult{
 		Action:  client.ElicitAccept,
 		Content: json.RawMessage(`{"name":"ada"}`),
 	}}
+	// -legacy-protocol: the fixture's "-elicit" tool calls ServerSession.Elicit
+	// ad hoc from within its handler, which SDK v1.7.0 unconditionally refuses
+	// once the negotiated protocol version reaches 2026-07-28 (SEP-2322).
+	// Pinning the session to mcptest.LegacyProtocolVersion (see
+	// mcptest.PinLegacyProtocol) is what keeps the ad hoc call legal.
 	c := fixtureClient(t, client.Handlers{Elicitation: h}, func(d *client.Definition) {
 		d.Capabilities.Elicitation = true
-	}, "-elicit")
+	}, "-elicit", "-legacy-protocol")
 
 	res, err := c.CallTool(testCtx(t), mcptest.ToolElicit,
 		json.RawMessage(`{"mode":"form","schema":true}`), client.CallOpts{})
@@ -116,19 +115,14 @@ func TestRealServerElicitsAHuman(t *testing.T) {
 // CallTool's error would pass against the broken advertisement.
 func TestRealServerElicitsAURL(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on Task 8: the fixture's \"-elicit\" tool calls " +
-		"ServerSession.Elicit ad hoc from within its handler, which SDK v1.7.0 " +
-		"unconditionally refuses once the negotiated protocol version is " +
-		">=2026-07-28 (SEP-2322: \"return an InputRequests map instead\"); the " +
-		"fixture needs an MRTR-based rewrite — see " +
-		"docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8, step 3.")
 
 	const actionURL = "https://example.invalid/authorize?token=abc"
 
 	h := &scriptedElicitor{res: client.ElicitResult{Action: client.ElicitAccept}}
+	// -legacy-protocol: see TestRealServerElicitsAHuman.
 	c := fixtureClient(t, client.Handlers{Elicitation: h}, func(d *client.Definition) {
 		d.Capabilities.Elicitation = true
-	}, "-elicit")
+	}, "-elicit", "-legacy-protocol")
 
 	res, err := c.CallTool(testCtx(t), mcptest.ToolElicit,
 		json.RawMessage(`{"mode":"url","url":"`+actionURL+`"}`), client.CallOpts{})
@@ -162,17 +156,12 @@ func TestRealServerElicitsAURL(t *testing.T) {
 // the server as one, rather than as a failure.
 func TestRealServerElicitationDecline(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on Task 8: the fixture's \"-elicit\" tool calls " +
-		"ServerSession.Elicit ad hoc from within its handler, which SDK v1.7.0 " +
-		"unconditionally refuses once the negotiated protocol version is " +
-		">=2026-07-28 (SEP-2322: \"return an InputRequests map instead\"); the " +
-		"fixture needs an MRTR-based rewrite — see " +
-		"docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8, step 3.")
 
 	h := &scriptedElicitor{res: client.ElicitResult{Action: client.ElicitDecline}}
+	// -legacy-protocol: see TestRealServerElicitsAHuman.
 	c := fixtureClient(t, client.Handlers{Elicitation: h}, func(d *client.Definition) {
 		d.Capabilities.Elicitation = true
-	}, "-elicit")
+	}, "-elicit", "-legacy-protocol")
 
 	res, err := c.CallTool(testCtx(t), mcptest.ToolElicit, json.RawMessage(`{"mode":"form"}`), client.CallOpts{})
 	if err != nil {
@@ -270,21 +259,21 @@ func TestRealServerOverBoundPromptIsRefused(t *testing.T) {
 // the handshake.
 func TestRealServerElicitOnInitialize(t *testing.T) {
 	t.Parallel()
-	t.Skip("blocked on Task 8: the fixture's elicitOnInitialized (internal/mcptest/server.go) " +
-		"calls ServerSession.Elicit ad hoc from InitializedHandler, which SDK " +
-		"v1.7.0 unconditionally refuses once the negotiated protocol version is " +
-		">=2026-07-28 (SEP-2322: \"return an InputRequests map instead\"); the " +
-		"fixture needs an MRTR-based rewrite — see " +
-		"docs/plans/2026-08-05-protocol-upgrade-implementation.md Task 8.")
 
 	events := make(chan client.Event, 64)
 	h := &scriptedElicitor{res: client.ElicitResult{Action: client.ElicitDecline}}
+	// -legacy-protocol: the fixture's elicitOnInitialized
+	// (internal/mcptest/server.go) calls ServerSession.Elicit ad hoc from
+	// InitializedHandler, which SDK v1.7.0 unconditionally refuses once the
+	// negotiated protocol version reaches 2026-07-28 (SEP-2322). Pinning the
+	// session to mcptest.LegacyProtocolVersion (see mcptest.PinLegacyProtocol)
+	// is what keeps the ad hoc call legal.
 	fixtureClient(t, client.Handlers{
 		Elicitation: h,
 		Event:       func(e client.Event) { events <- e },
 	}, func(d *client.Definition) {
 		d.Capabilities.Elicitation = true
-	}, "-elicit-on-initialize")
+	}, "-elicit-on-initialize", "-legacy-protocol")
 
 	// The elicitation is unprompted, so the event stream is what says it
 	// happened — waiting on it is what makes this deterministic rather than a
