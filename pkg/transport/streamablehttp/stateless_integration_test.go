@@ -214,3 +214,50 @@ func TestReconnectStateless(t *testing.T) {
 		t.Errorf("ProtocolVersion after reconnect = %q, want 2026-07-28", got)
 	}
 }
+
+// TestListChangedStateless: the fixture mutates its tool list; on 2026-07-28
+// the change notification arrives on the subscriptions/listen stream rather
+// than as a free-floating notification, and must still produce a candidate
+// generation.
+func TestListChangedStateless(t *testing.T) {
+	t.Parallel()
+
+	url := newFixtureServer(t, mcptest.Config{Stateless: true, Mutate: true})
+	f, err := New(Config{Endpoint: url})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c, err := client.Connect(ctx, client.Definition{Name: "fixture", Transport: f}, client.Handlers{})
+	if err != nil {
+		t.Fatalf("client.Connect() error = %v", err)
+	}
+	t.Cleanup(func() {
+		closeCtx, closeCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer closeCancel()
+		_ = c.Close(closeCtx)
+	})
+
+	args, err := json.Marshal(mcptest.MutateInput{Add: true})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	res, err := c.CallTool(ctx, mcptest.ToolMutate, args, client.CallOpts{})
+	if err != nil || res.IsError {
+		t.Fatalf("CallTool(mutate) error = %v, IsError = %v", err, res.IsError)
+	}
+
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if cand, ok := c.Candidate(); ok {
+			if _, ok := cand.ToolByRawName(mcptest.ToolMutated); !ok {
+				t.Errorf("candidate lacks the mutated tool %q", mcptest.ToolMutated)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no candidate generation arrived over subscriptions/listen")
+}
