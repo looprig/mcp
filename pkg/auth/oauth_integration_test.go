@@ -521,6 +521,70 @@ func TestOAuthFlowEndToEnd(t *testing.T) {
 	}
 }
 
+// Persistence across a restart: a second, independently constructed provider
+// — standing in for the process starting over, pointed at the credentials and
+// store the first process persisted — must reuse the token without a browser
+// or another registration. This is the property that lets an application
+// carry OAuth state across restarts using nothing but a persistent TokenStore
+// and its own persisted client registration; the SDK's token-source hooks are
+// not involved because this provider never uses them.
+func TestOAuthFlowPersistsTokensAcrossProviderRestarts(t *testing.T) {
+	t.Parallel()
+
+	as := newAuthServer(t)
+	store := auth.NewMemoryStore()
+
+	// --- Process 1: the full flow, from nothing.
+	browserA := &fakeBrowser{client: as.client()}
+	providerA := newProvider(t, as, browserA, store)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	setA, err := providerA.Token(ctx)
+	if err != nil {
+		t.Fatalf("provider A: Token() error = %v", err)
+	}
+	credsA := providerA.Credentials()
+
+	tokenRequestsBefore, registrationsBefore := as.counts()
+
+	// --- Process 2: a fresh provider, configured with the client ID process 1
+	// registered (exactly what a real application persists alongside the
+	// token) and pointed at the same store. Its browser refuses outright: if
+	// this provider so much as attempted to authorize, the test fails on that
+	// refusal rather than silently opening a window.
+	providerB, err := auth.NewOAuthProvider(auth.OAuthConfig{
+		ServerURL:            as.serverURL(),
+		Credentials:          credsA,
+		Store:                store,
+		Browser:              refusingBrowser{},
+		HTTPClient:           as.client(),
+		AuthorizationTimeout: 15 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("provider B: NewOAuthProvider() error = %v", err)
+	}
+
+	headers, err := providerB.Headers(ctx)
+	if err != nil {
+		t.Fatalf("provider B: Headers() error = %v, want the stored token reused without authorization", err)
+	}
+	if len(headers) != 1 || headers[0].Value() != "Bearer "+setA.Access() {
+		t.Errorf("provider B: Headers() = %v, want the bearer token issued to provider A", headers)
+	}
+
+	tokenRequestsAfter, registrationsAfter := as.counts()
+	if tokenRequestsAfter != tokenRequestsBefore {
+		t.Errorf("provider B made %d token requests, want 0: a restarted provider must not re-authorize",
+			tokenRequestsAfter-tokenRequestsBefore)
+	}
+	if registrationsAfter != registrationsBefore {
+		t.Errorf("provider B registered %d times, want 0: a restarted provider must not re-register",
+			registrationsAfter-registrationsBefore)
+	}
+}
+
 // The CSRF defense. An attacker who can reach the loopback listener feeds it a
 // code of their own; if the client exchanges it, the user silently ends up
 // operating as the attacker.
