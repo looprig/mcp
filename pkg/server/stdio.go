@@ -3,6 +3,7 @@ package server
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -78,10 +79,12 @@ func writerCloser(value io.Writer) io.Closer {
 // while refusing a frame whose JSON bytes exceed max. The terminating '\n' is
 // not counted. It never buffers more than max+1 bytes from the current frame.
 type boundedFrameReader struct {
-	reader io.ByteReader
-	max    int
-	used   int
-	sticky error
+	reader   io.ByteReader
+	max      int
+	frame    []byte
+	pending  []byte
+	sticky   error
+	frameErr error
 }
 
 func newBoundedFrameReader(reader io.Reader, max int) *boundedFrameReader {
@@ -96,30 +99,66 @@ func (r *boundedFrameReader) Read(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
-	for n := 0; n < len(p); n++ {
-		b, err := r.reader.ReadByte()
-		if err != nil {
-			if n > 0 {
-				return n, err
-			}
+	if len(r.pending) == 0 {
+		if err := r.readFrame(); err != nil {
 			return 0, err
 		}
-		if b == '\n' {
-			p[n] = b
-			r.used = 0
-			return n + 1, nil
-		}
-		if r.used >= r.max {
-			r.sticky = ErrInputLimit
-			return n, r.sticky
-		}
-		p[n] = b
-		r.used++
 	}
-	return len(p), nil
+	n := copy(p, r.pending)
+	r.pending = r.pending[n:]
+	if len(r.pending) == 0 && r.frameErr != nil {
+		return n, r.frameErr
+	}
+	return n, nil
 }
 
 func (r *boundedFrameReader) limitExceeded() bool { return errors.Is(r.sticky, ErrInputLimit) }
+
+func (r *boundedFrameReader) readFrame() error {
+	r.frame = r.frame[:0]
+	for {
+		b, err := r.reader.ReadByte()
+		if err != nil {
+			if len(r.frame) == 0 {
+				return err
+			}
+			r.pending = append(r.pending[:0], r.frame...)
+			r.frame = r.frame[:0]
+			r.frameErr = err
+			return nil
+		}
+		r.frame = append(r.frame, b)
+		if b != '\n' && len(r.frame) > r.max {
+			r.sticky = ErrInputLimit
+			return r.sticky
+		}
+		if b != '\n' {
+			continue
+		}
+		if err := validateRequestEnvelope(r.frame[:len(r.frame)-1]); err != nil {
+			r.sticky = err
+			return err
+		}
+		r.pending = append(r.pending[:0], r.frame...)
+		r.frame = r.frame[:0]
+		return nil
+	}
+}
+
+func validateRequestEnvelope(frame []byte) error {
+	var envelope struct {
+		ID json.RawMessage `json:"id"`
+	}
+	if err := json.Unmarshal(frame, &envelope); err != nil {
+		// The SDK owns JSON-RPC parse errors; this seam only rejects valid frames
+		// whose echoed identity would violate the response bound.
+		return nil
+	}
+	if len(envelope.ID) > MaxRequestIDBytes {
+		return ErrInputEnvelope
+	}
+	return nil
+}
 
 // boundedFrameWriter refuses an oversized SDK frame before it reaches the
 // process's stdout. The terminating '\n' is not counted. SDK writes are

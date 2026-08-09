@@ -31,6 +31,11 @@ const (
 	// bounded argument or result. It is part of the frame policy, not an
 	// allowance for application payloads.
 	MaxFrameOverheadBytes = 4 << 10
+	// MaxRequestIDBytes bounds the encoded JSON-RPC request ID (including JSON
+	// quotes for a string). The ID is echoed into every response, so this bound
+	// is reserved from the frame overhead rather than allowed to consume
+	// application payload capacity.
+	MaxRequestIDBytes = MaxFrameOverheadBytes - 512
 	// DefaultMaxMessageBytes bounds one newline-delimited MCP frame's JSON
 	// bytes. The final '\n' delimiter is excluded from this count. The default
 	// is deliberately larger than the maximum argument/result plus the
@@ -76,6 +81,9 @@ var (
 	// frame or result exceeds the configured bound.
 	ErrInputLimit  = errors.New("input exceeds limit")
 	ErrOutputLimit = errors.New("output exceeds limit")
+	// ErrInputEnvelope is returned when a peer-controlled field that is echoed
+	// in a response (currently the JSON-RPC request ID) exceeds its bound.
+	ErrInputEnvelope = errors.New("input envelope exceeds limit")
 )
 
 // Config configures a Server. Zero identity fields and bounds select the

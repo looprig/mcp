@@ -1,11 +1,13 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync/atomic"
@@ -256,6 +258,160 @@ func TestServerMaxOutputFitsTheFrameEnvelope(t *testing.T) {
 	if got, want := dst.Len(), len(encoded)+1; got != want {
 		t.Fatalf("written bytes = %d, want %d", got, want)
 	}
+}
+
+func TestServeRejectsOversizedRequestIDBeforeHandler(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	s, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := s.RegisterTool(Tool{
+		Name: "guard",
+		Handler: func(context.Context, json.RawMessage) (Result, error) {
+			calls.Add(1)
+			return Result{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTool() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverConn, clientConn := net.Pipe()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}`)
+	readRawRPC(t, reader)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+
+	overlargeID := strings.Repeat("i", MaxFrameOverheadBytes)
+	call := fmt.Sprintf(`{"jsonrpc":"2.0","id":%q,"method":"tools/call","params":{"name":"guard","arguments":{}}}`, overlargeID)
+	writeRawRPC(t, clientConn, call)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, readErr := reader.ReadBytes('\n')
+	if readErr == nil {
+		t.Fatal("oversized request ID unexpectedly received a response")
+	}
+	if !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrClosedPipe) && !strings.Contains(readErr.Error(), "closed") {
+		t.Fatalf("oversized request ID read error = %v, want bounded shutdown", readErr)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("handler calls = %d, want 0", calls.Load())
+	}
+
+	cancel()
+	clientConn.Close()
+	if err := <-serverErr; err != nil && strings.Contains(err.Error(), overlargeID) {
+		t.Fatalf("server error leaked request ID: %v", err)
+	}
+}
+
+func TestServeNearBoundRequestIDAndMaxResultWritesWithinFrame(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	structured := exactStructuredContent(t, s)
+	if err := s.RegisterTool(Tool{
+		Name: "max-result",
+		Handler: func(context.Context, json.RawMessage) (Result, error) {
+			return Result{StructuredContent: structured}, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTool() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverConn, clientConn := net.Pipe()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}`)
+	readRawRPC(t, reader)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+
+	// MaxRequestIDBytes counts the encoded JSON ID; a string ID contributes two
+	// quote bytes in addition to its value.
+	requestID := strings.Repeat("n", MaxRequestIDBytes-2)
+	call := fmt.Sprintf(`{"jsonrpc":"2.0","id":%q,"method":"tools/call","params":{"name":"max-result","arguments":{}}}`, requestID)
+	writeRawRPC(t, clientConn, call)
+	response, readErr := reader.ReadBytes('\n')
+	if readErr != nil {
+		select {
+		case serveErr := <-serverErr:
+			t.Fatalf("read max-valid response error = %v (server error: %v)", readErr, serveErr)
+		default:
+			t.Fatalf("read max-valid response error = %v", readErr)
+		}
+	}
+	if len(response) < 1 || response[len(response)-1] != '\n' {
+		t.Fatalf("response missing newline delimiter")
+	}
+	if got := len(response) - 1; got > DefaultMaxMessageBytes {
+		t.Fatalf("response JSON bytes = %d, exceed frame limit %d", got, DefaultMaxMessageBytes)
+	}
+	var decoded struct {
+		ID     json.RawMessage `json:"id"`
+		Result json.RawMessage `json:"result"`
+		Error  json.RawMessage `json:"error"`
+	}
+	if err := json.Unmarshal(response, &decoded); err != nil {
+		t.Fatalf("json.Unmarshal(response) error = %v", err)
+	}
+	if len(decoded.Error) != 0 && string(decoded.Error) != "null" {
+		t.Fatalf("max-valid result returned error: %s", decoded.Error)
+	}
+	if string(decoded.ID) != fmt.Sprintf("%q", requestID) {
+		t.Fatalf("response ID length/value mismatch: got %d bytes", len(decoded.ID))
+	}
+	if len(decoded.Result) == 0 {
+		t.Fatal("response result is empty")
+	}
+
+	cancel()
+	clientConn.Close()
+	<-serverErr
+}
+
+func exactStructuredContent(t *testing.T, s *Server) json.RawMessage {
+	t.Helper()
+	for n := DefaultMaxOutputBytes; n >= 0; n-- {
+		candidate := json.RawMessage(fmt.Sprintf(`{"value":%q}`, strings.Repeat("x", n)))
+		wire, err := s.result(Result{StructuredContent: candidate})
+		if err != nil {
+			continue
+		}
+		encoded, err := json.Marshal(wire)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		if len(encoded) == DefaultMaxOutputBytes {
+			return candidate
+		}
+	}
+	t.Fatal("could not construct exact-boundary structured output")
+	return nil
+}
+
+func writeRawRPC(t *testing.T, writer io.Writer, raw string) {
+	t.Helper()
+	if _, err := io.WriteString(writer, raw+"\n"); err != nil {
+		t.Fatalf("writeRawRPC() error = %v", err)
+	}
+}
+
+func readRawRPC(t *testing.T, reader *bufio.Reader) []byte {
+	t.Helper()
+	line, err := reader.ReadBytes('\n')
+	if err != nil {
+		t.Fatalf("readRawRPC() error = %v", err)
+	}
+	return line
 }
 
 func exactObjectJSON(t *testing.T, size int) json.RawMessage {
