@@ -2,6 +2,7 @@ package server
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -146,6 +147,10 @@ func (r *boundedFrameReader) readFrame() error {
 }
 
 func validateRequestEnvelope(frame []byte) error {
+	trimmed := bytes.TrimSpace(frame)
+	if len(trimmed) > 0 && trimmed[0] == '[' {
+		return ErrBatchUnsupported
+	}
 	var envelope struct {
 		ID json.RawMessage `json:"id"`
 	}

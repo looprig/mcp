@@ -84,6 +84,9 @@ var (
 	// ErrInputEnvelope is returned when a peer-controlled field that is echoed
 	// in a response (currently the JSON-RPC request ID) exceeds its bound.
 	ErrInputEnvelope = errors.New("input envelope exceeds limit")
+	// ErrBatchUnsupported rejects JSON-RPC batch arrays before the SDK can
+	// dispatch any member or construct an aggregate response.
+	ErrBatchUnsupported = errors.New("batch requests are not supported")
 )
 
 // Config configures a Server. Zero identity fields and bounds select the

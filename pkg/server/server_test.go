@@ -378,6 +378,95 @@ func TestServeNearBoundRequestIDAndMaxResultWritesWithinFrame(t *testing.T) {
 	<-serverErr
 }
 
+func TestServeRejectsBatchWithOversizedIDBeforeDispatch(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	s, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := s.RegisterTool(Tool{
+		Name: "guard",
+		Handler: func(context.Context, json.RawMessage) (Result, error) {
+			calls.Add(1)
+			return Result{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTool() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverConn, clientConn := net.Pipe()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}`)
+	readRawRPC(t, reader)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+
+	overlargeID := strings.Repeat("b", MaxFrameOverheadBytes)
+	call := fmt.Sprintf(`{"jsonrpc":"2.0","id":%q,"method":"tools/call","params":{"name":"guard","arguments":{}}}`, overlargeID)
+	writeRawRPC(t, clientConn, " \t["+call+"]")
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, readErr := reader.ReadBytes('\n')
+	if readErr == nil {
+		t.Fatal("batch with oversized ID unexpectedly received a response")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("handler calls = %d, want 0", calls.Load())
+	}
+	cancel()
+	clientConn.Close()
+	if err := <-serverErr; err != nil && strings.Contains(err.Error(), overlargeID) {
+		t.Fatalf("server error leaked batch ID: %v", err)
+	}
+}
+
+func TestServeRejectsBatchOfMaxOutputCallsBeforeDispatch(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	s, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	maxResult := exactStructuredContent(t, s)
+	if err := s.RegisterTool(Tool{
+		Name: "max-result",
+		Handler: func(context.Context, json.RawMessage) (Result, error) {
+			calls.Add(1)
+			return Result{StructuredContent: maxResult}, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTool() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverConn, clientConn := net.Pipe()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}`)
+	readRawRPC(t, reader)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	batch := `[{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"max-result","arguments":{}}},{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"max-result","arguments":{}}}]`
+	writeRawRPC(t, clientConn, batch)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	response, readErr := reader.ReadBytes('\n')
+	if readErr == nil && len(response)-1 > DefaultMaxMessageBytes {
+		t.Fatalf("batch response JSON bytes = %d, exceed frame limit %d", len(response)-1, DefaultMaxMessageBytes)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("handler calls = %d, want 0", calls.Load())
+	}
+	cancel()
+	clientConn.Close()
+	if err := <-serverErr; err != nil && strings.Contains(err.Error(), "max-result") {
+		t.Fatalf("server error leaked tool/request data: %v", err)
+	}
+}
+
 func exactStructuredContent(t *testing.T, s *Server) json.RawMessage {
 	t.Helper()
 	for n := DefaultMaxOutputBytes; n >= 0; n-- {
