@@ -74,7 +74,7 @@ require (
 require (
 	github.com/looprig/core v0.5.0
 	github.com/looprig/harness v0.20.0
-	github.com/looprig/inference v0.7.0
+	github.com/looprig/inference v0.8.0
 )
 
 replace github.com/looprig/harness => ../harness
