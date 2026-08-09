@@ -260,12 +260,12 @@ func TestValidateFrameCanonicalNumericIDs(t *testing.T) {
 }
 
 func TestFrameRejectsUnknownNotificationsBeforeSDK(t *testing.T) {
-	for _, raw := range []string{`{"jsonrpc":"2.0","method":"tools/call"}`, `{"jsonrpc":"2.0","method":"notifications/progress"}`} {
+	for _, raw := range []string{`{"jsonrpc":"2.0","method":"tools/call"}`, `{"jsonrpc":"2.0","method":"notifications/unknown"}`} {
 		if err := validateFrame([]byte(raw), 64); !errors.Is(err, ErrInputEnvelope) {
 			t.Fatalf("%s err=%v", raw, err)
 		}
 	}
-	for _, raw := range []string{`{"jsonrpc":"2.0","method":"notifications/initialized"}`, `{"jsonrpc":"2.0","method":"notifications/cancelled"}`} {
+	for _, raw := range []string{`{"jsonrpc":"2.0","method":"notifications/initialized"}`, `{"jsonrpc":"2.0","method":"notifications/cancelled"}`, `{"jsonrpc":"2.0","method":"notifications/roots/list_changed"}`, `{"jsonrpc":"2.0","method":"notifications/progress"}`} {
 		if err := validateFrame([]byte(raw), 64); err != nil {
 			t.Fatalf("control %s err=%v", raw, err)
 		}
@@ -302,8 +302,8 @@ func TestAdmissionPendingCallPrecedesEOF(t *testing.T) {
 	if _, err := c.Read(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	_ = c.Write(context.Background(), &jsonrpc.Response{ID: id1})
 	_ = base.Close()
+	_ = c.Write(context.Background(), &jsonrpc.Response{ID: id1})
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	m, err := c.Read(ctx)

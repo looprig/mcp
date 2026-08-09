@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"sync"
 
@@ -190,6 +191,12 @@ func (c *admissionConn) admit(m jsonrpc.Message) bool {
 					}
 					r := <-nextCh
 					if r.err != nil {
+						if errors.Is(r.err, io.EOF) {
+							c.mu.Lock()
+							c.err = io.EOF
+							c.mu.Unlock()
+							return false
+						}
 						c.mu.Lock()
 						c.err = r.err
 						c.mu.Unlock()
@@ -207,6 +214,28 @@ func (c *admissionConn) admit(m jsonrpc.Message) bool {
 					continue
 				case r := <-nextCh:
 					if r.err != nil {
+						if errors.Is(r.err, io.EOF) {
+							select {
+							case <-c.released:
+							case <-c.stop:
+								return false
+							}
+							select {
+							case <-c.slots:
+							case <-c.stop:
+								return false
+							}
+							c.track(pending)
+							select {
+							case c.requests <- pending:
+							case <-c.stop:
+								return false
+							}
+							c.mu.Lock()
+							c.err = io.EOF
+							c.mu.Unlock()
+							return false
+						}
 						c.mu.Lock()
 						c.err = r.err
 						c.mu.Unlock()
@@ -286,7 +315,7 @@ func (p *permit) release() {
 }
 func controlMethod(method string) bool {
 	switch method {
-	case "notifications/initialized", "notifications/cancelled":
+	case "notifications/initialized", "notifications/cancelled", "notifications/roots/list_changed", "notifications/progress":
 		return true
 	}
 	return false
