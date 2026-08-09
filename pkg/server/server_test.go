@@ -337,7 +337,10 @@ func TestServeNearBoundRequestIDAndMaxResultWritesWithinFrame(t *testing.T) {
 
 	// MaxRequestIDBytes counts the encoded JSON ID; a string ID contributes two
 	// quote bytes in addition to its value.
-	requestID := strings.Repeat("n", MaxRequestIDBytes-2)
+	requestID := strings.Repeat("n", MaxRequestIDBytes-2-12) + "\u2028\u2029"
+	if got := len(canonicalJSONString(t, requestID)); got != MaxRequestIDBytes {
+		t.Fatalf("canonical near-bound ID bytes = %d, want %d", got, MaxRequestIDBytes)
+	}
 	call := fmt.Sprintf(`{"jsonrpc":"2.0","id":%q,"method":"tools/call","params":{"name":"max-result","arguments":{}}}`, requestID)
 	writeRawRPC(t, clientConn, call)
 	response, readErr := reader.ReadBytes('\n')
@@ -366,7 +369,7 @@ func TestServeNearBoundRequestIDAndMaxResultWritesWithinFrame(t *testing.T) {
 	if len(decoded.Error) != 0 && string(decoded.Error) != "null" {
 		t.Fatalf("max-valid result returned error: %s", decoded.Error)
 	}
-	if string(decoded.ID) != fmt.Sprintf("%q", requestID) {
+	if !bytes.Equal(decoded.ID, canonicalJSONString(t, requestID)) {
 		t.Fatalf("response ID length/value mismatch: got %d bytes", len(decoded.ID))
 	}
 	if len(decoded.Result) == 0 {
@@ -376,6 +379,98 @@ func TestServeNearBoundRequestIDAndMaxResultWritesWithinFrame(t *testing.T) {
 	cancel()
 	clientConn.Close()
 	<-serverErr
+}
+
+func TestServeRejectsNullRequestIDBeforeHandler(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	s, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := s.RegisterTool(Tool{
+		Name: "guard",
+		Handler: func(context.Context, json.RawMessage) (Result, error) {
+			calls.Add(1)
+			return Result{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTool() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverConn, clientConn := net.Pipe()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}`)
+	readRawRPC(t, reader)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","id":null,"method":"tools/call","params":{"name":"guard","arguments":{}}}`)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, readErr := reader.ReadBytes('\n')
+	if readErr == nil {
+		t.Fatal("null request ID unexpectedly received a response")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("handler calls = %d, want 0", calls.Load())
+	}
+	cancel()
+	clientConn.Close()
+	<-serverErr
+}
+
+func TestServeRejectsCanonicalExpandedRequestIDBeforeHandler(t *testing.T) {
+	t.Parallel()
+
+	var calls atomic.Int32
+	s, err := New(Config{})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := s.RegisterTool(Tool{
+		Name: "guard",
+		Handler: func(context.Context, json.RawMessage) (Result, error) {
+			calls.Add(1)
+			return Result{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTool() error = %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	serverConn, clientConn := net.Pipe()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
+	reader := bufio.NewReader(clientConn)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}`)
+	readRawRPC(t, reader)
+	writeRawRPC(t, clientConn, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+
+	value := strings.Repeat("c", MaxRequestIDBytes-2-3-1) + "\u2028"
+	literalID := `"` + value + `"`
+	if len([]byte(literalID)) >= MaxRequestIDBytes {
+		t.Fatalf("raw literal ID unexpectedly exceeds bound: %d", len(literalID))
+	}
+	if len(canonicalJSONString(t, value)) <= MaxRequestIDBytes {
+		t.Fatalf("canonical ID did not exceed bound: %d", len(canonicalJSONString(t, value)))
+	}
+	call := `{"jsonrpc":"2.0","id":` + literalID + `,"method":"tools/call","params":{"name":"guard","arguments":{}}}`
+	writeRawRPC(t, clientConn, call)
+	_ = clientConn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, readErr := reader.ReadBytes('\n')
+	if readErr == nil {
+		t.Fatal("canonically oversized request ID unexpectedly received a response")
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("handler calls = %d, want 0", calls.Load())
+	}
+	cancel()
+	clientConn.Close()
+	if err := <-serverErr; err != nil && strings.Contains(err.Error(), value) {
+		t.Fatalf("server error leaked canonical-expanded ID: %v", err)
+	}
 }
 
 func TestServeRejectsBatchWithOversizedIDBeforeDispatch(t *testing.T) {
@@ -485,6 +580,17 @@ func exactStructuredContent(t *testing.T, s *Server) json.RawMessage {
 	}
 	t.Fatal("could not construct exact-boundary structured output")
 	return nil
+}
+
+func canonicalJSONString(t *testing.T, value string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		t.Fatalf("canonical ID encoding error = %v", err)
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'})
 }
 
 func writeRawRPC(t *testing.T, writer io.Writer, raw string) {

@@ -151,18 +151,49 @@ func validateRequestEnvelope(frame []byte) error {
 	if len(trimmed) > 0 && trimmed[0] == '[' {
 		return ErrBatchUnsupported
 	}
-	var envelope struct {
-		ID json.RawMessage `json:"id"`
-	}
+	var envelope map[string]json.RawMessage
 	if err := json.Unmarshal(frame, &envelope); err != nil {
 		// The SDK owns JSON-RPC parse errors; this seam only rejects valid frames
 		// whose echoed identity would violate the response bound.
 		return nil
 	}
-	if len(envelope.ID) > MaxRequestIDBytes {
+	rawID, hasID := envelope["id"]
+	if !hasID {
+		return nil
+	}
+	var decodedID any
+	if err := json.Unmarshal(rawID, &decodedID); err != nil {
+		return ErrInputEnvelope
+	}
+	var canonicalID any
+	switch value := decodedID.(type) {
+	case string:
+		canonicalID = value
+	case float64:
+		// This mirrors the SDK's jsonrpc2.MakeID conversion before its
+		// response encoder writes the echoed ID.
+		canonicalID = int64(value)
+	default:
+		// null, booleans, arrays, and objects are not call IDs for this
+		// server. Reject them before a handler can run without a response
+		// correlation key.
+		return ErrInputEnvelope
+	}
+	canonical, err := canonicalJSON(canonicalID)
+	if err != nil || len(canonical) > MaxRequestIDBytes {
 		return ErrInputEnvelope
 	}
 	return nil
+}
+
+func canonicalJSON(value any) ([]byte, error) {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte{'\n'}), nil
 }
 
 // boundedFrameWriter refuses an oversized SDK frame before it reaches the
