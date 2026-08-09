@@ -259,6 +259,64 @@ func TestClientResponseAndTransportFailuresDoNotExposeSecrets(t *testing.T) {
 	}
 }
 
+func TestCollabMCPIntegrationClientConfigAndWireProjection(t *testing.T) {
+	t.Parallel()
+	secretMarker := "wire-secret-marker"
+	capability := bytes.Repeat([]byte{0x44}, CapabilityBytes)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	client, err := NewClientWithDialer(ClientConfig{Endpoint: "/tmp/" + secretMarker, Token: capability}, func(context.Context, string) (net.Conn, error) {
+		return clientConn, nil
+	})
+	if err != nil {
+		t.Fatalf("NewClientWithDialer: %v", err)
+	}
+	cfg := client.Config()
+	if cfg.Token != nil {
+		t.Fatalf("Config retained token bytes: %x", cfg.Token)
+	}
+	if !bytes.Equal(cfg.Capability, capability) || cfg.Endpoint != "/tmp/"+secretMarker {
+		t.Fatalf("Config projection = %#v, want endpoint and capability without token", cfg)
+	}
+	if cfg.ConnectTimeout <= 0 || cfg.AdmissionTimeout <= 0 || cfg.MaxFrameBytes != MaxFrameBytes {
+		t.Fatalf("normalized Config = %#v, want positive defaults and max frame %d", cfg, MaxFrameBytes)
+	}
+
+	serverDone := make(chan error, 1)
+	go func() {
+		gotCapability, err := ReadHandshake(serverConn)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if !bytes.Equal(gotCapability, capability) {
+			serverDone <- ErrAuthentication
+			return
+		}
+		frame, err := ReadFrame(serverConn)
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		if bytes.Contains(frame, []byte(secretMarker)) || bytes.Contains(frame, []byte(hex.EncodeToString(capability))) {
+			serverDone <- errors.New("configuration secret appeared in request JSON")
+			return
+		}
+		serverDone <- WriteFrame(serverConn, []byte(`{"agent_id":"55555555-5555-4555-8555-555555555555","name":"child","state":"idle","delivery_status":"injected","response_status":"completed","response":"round trip"}`))
+	}()
+	result, err := client.Call(context.Background(), MessageAgentRequest{AgentID: "55555555-5555-4555-8555-555555555555", Message: "hello", WaitForResponse: true})
+	if err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if result.Response != "round trip" || result.DeliveryStatus != "injected" || result.ResponseStatus != "completed" {
+		t.Fatalf("DelegateResult = %#v, want public round-trip fields", result)
+	}
+	if err := <-serverDone; err != nil {
+		t.Fatalf("fake broker: %v", err)
+	}
+}
+
 func TestClientSupportsAdmissionDeadlineWithoutBoundingResponseObservation(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()
