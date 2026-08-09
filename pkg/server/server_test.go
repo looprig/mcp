@@ -14,8 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/looprig/mcp/internal/serverwire"
 )
 
 func TestServerRegistersToolAndReturnsStructuredContent(t *testing.T) {
@@ -56,8 +55,8 @@ func TestServerRegistersToolAndReturnsStructuredContent(t *testing.T) {
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
 
-	probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
-	cs, err := probe.Connect(ctx, &mcp.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
+	probe := serverwire.NewClient(&serverwire.Implementation{Name: "probe", Version: "0"}, nil)
+	cs, err := probe.Connect(ctx, &serverwire.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
 	if err != nil {
 		clientConn.Close()
 		t.Fatalf("client Connect() error = %v", err)
@@ -86,7 +85,7 @@ func TestServerRegistersToolAndReturnsStructuredContent(t *testing.T) {
 		t.Fatalf("tools = %#v, want only echo", tools.Tools)
 	}
 
-	res, err := cs.CallTool(ctx, &mcp.CallToolParams{
+	res, err := cs.CallTool(ctx, &serverwire.CallToolParams{
 		Name:      "echo",
 		Arguments: json.RawMessage(`{"message":"hello"}`),
 	})
@@ -99,7 +98,7 @@ func TestServerRegistersToolAndReturnsStructuredContent(t *testing.T) {
 	if len(res.Content) != 1 {
 		t.Fatalf("content = %#v, want one block", res.Content)
 	}
-	text, ok := res.Content[0].(*mcp.TextContent)
+	text, ok := res.Content[0].(*serverwire.TextContent)
 	if !ok || text.Text != "hello" {
 		t.Fatalf("content[0] = %#v, want text hello", res.Content[0])
 	}
@@ -199,14 +198,14 @@ func TestServerAcceptsInputAtExactArgumentLimit(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
-	probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
-	cs, err := probe.Connect(ctx, &mcp.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
+	probe := serverwire.NewClient(&serverwire.Implementation{Name: "probe", Version: "0"}, nil)
+	cs, err := probe.Connect(ctx, &serverwire.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
 	if err != nil {
 		clientConn.Close()
 		t.Fatalf("client Connect() error = %v", err)
 	}
 	defer cs.Close()
-	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "exact-input", Arguments: argument}); err != nil {
+	if _, err := cs.CallTool(ctx, &serverwire.CallToolParams{Name: "exact-input", Arguments: argument}); err != nil {
 		t.Fatalf("CallTool() at exact argument limit error = %v", err)
 	}
 	if seen.Load() != 1 {
@@ -640,20 +639,20 @@ func TestServerBoundsInputBeforeCallingHandler(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
-	probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
-	cs, err := probe.Connect(ctx, &mcp.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
+	probe := serverwire.NewClient(&serverwire.Implementation{Name: "probe", Version: "0"}, nil)
+	cs, err := probe.Connect(ctx, &serverwire.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
 	if err != nil {
 		clientConn.Close()
 		t.Fatalf("client Connect() error = %v", err)
 	}
 	defer cs.Close()
 
-	_, err = cs.CallTool(ctx, &mcp.CallToolParams{
+	_, err = cs.CallTool(ctx, &serverwire.CallToolParams{
 		Name:      "bounded",
 		Arguments: json.RawMessage(`{"too":"large"}`),
 	})
-	var wireErr *jsonrpc.Error
-	if !errors.As(err, &wireErr) || wireErr.Code != jsonrpc.CodeInvalidParams {
+	var wireErr *serverwire.JSONRPCError
+	if !errors.As(err, &wireErr) || wireErr.Code != serverwire.CodeInvalidParams {
 		t.Fatalf("CallTool() error = %v (%T), want invalid params", err, err)
 	}
 	if calls.Load() != 0 {
@@ -673,8 +672,8 @@ func TestServerClassifiesHandlerErrorsWithoutLeakingSecrets(t *testing.T) {
 		err  error
 		code int64
 	}{
-		{name: "invalid argument", err: fmt.Errorf("%w: handler-secret", ErrInvalidArgument), code: jsonrpc.CodeInvalidParams},
-		{name: "internal", err: errors.New("handler-secret"), code: jsonrpc.CodeInternalError},
+		{name: "invalid argument", err: fmt.Errorf("%w: handler-secret", ErrInvalidArgument), code: serverwire.CodeInvalidParams},
+		{name: "internal", err: errors.New("handler-secret"), code: serverwire.CodeInternalError},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -695,15 +694,15 @@ func TestServerClassifiesHandlerErrorsWithoutLeakingSecrets(t *testing.T) {
 			serverConn, clientConn := net.Pipe()
 			serverErr := make(chan error, 1)
 			go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
-			probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
-			cs, err := probe.Connect(ctx, &mcp.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
+			probe := serverwire.NewClient(&serverwire.Implementation{Name: "probe", Version: "0"}, nil)
+			cs, err := probe.Connect(ctx, &serverwire.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
 			if err != nil {
 				clientConn.Close()
 				cancel()
 				t.Fatalf("client Connect() error = %v", err)
 			}
-			_, callErr := cs.CallTool(ctx, &mcp.CallToolParams{Name: "fail"})
-			var wireErr *jsonrpc.Error
+			_, callErr := cs.CallTool(ctx, &serverwire.CallToolParams{Name: "fail"})
+			var wireErr *serverwire.JSONRPCError
 			if !errors.As(callErr, &wireErr) || wireErr.Code != tt.code {
 				t.Fatalf("CallTool() error = %v (%T), want code %d", callErr, callErr, tt.code)
 			}
@@ -738,16 +737,16 @@ func TestServerBoundsHandlerOutput(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
-	probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
-	cs, err := probe.Connect(ctx, &mcp.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
+	probe := serverwire.NewClient(&serverwire.Implementation{Name: "probe", Version: "0"}, nil)
+	cs, err := probe.Connect(ctx, &serverwire.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
 	if err != nil {
 		clientConn.Close()
 		cancel()
 		t.Fatalf("client Connect() error = %v", err)
 	}
-	_, callErr := cs.CallTool(ctx, &mcp.CallToolParams{Name: "big"})
-	var wireErr *jsonrpc.Error
-	if !errors.As(callErr, &wireErr) || wireErr.Code != jsonrpc.CodeInternalError {
+	_, callErr := cs.CallTool(ctx, &serverwire.CallToolParams{Name: "big"})
+	var wireErr *serverwire.JSONRPCError
+	if !errors.As(callErr, &wireErr) || wireErr.Code != serverwire.CodeInternalError {
 		t.Fatalf("CallTool() error = %v (%T), want internal error", callErr, callErr)
 	}
 	if strings.Contains(callErr.Error(), "this is too large") {

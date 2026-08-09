@@ -7,12 +7,14 @@
 package server
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"sync"
 
-	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/looprig/mcp/internal/serverwire"
 )
 
 // The default identity is intentionally explicit: an empty SDK implementation
@@ -40,7 +42,9 @@ const (
 	// bytes. The final '\n' delimiter is excluded from this count. The default
 	// is deliberately larger than the maximum argument/result plus the
 	// envelope, so a handler-valid boundary value cannot fail at transport.
-	DefaultMaxMessageBytes = DefaultMaxOutputBytes + MaxFrameOverheadBytes
+	DefaultMaxMessageBytes       = DefaultMaxOutputBytes + MaxFrameOverheadBytes
+	DefaultMaxConcurrentRequests = 8
+	MaxConcurrentRequests        = DefaultMaxConcurrentRequests
 )
 
 // These aliases make the policy easy to discover without creating a second
@@ -102,7 +106,8 @@ type Config struct {
 	MaxInputBytes int
 	// MaxOutputBytes bounds the encoded tools/call result produced by a
 	// Handler.
-	MaxOutputBytes int
+	MaxOutputBytes        int
+	MaxConcurrentRequests int
 }
 
 // ServerConfig is a descriptive alias for Config.
@@ -124,11 +129,15 @@ func (c Config) normalized() (Config, error) {
 	if c.MaxOutputBytes == 0 {
 		c.MaxOutputBytes = DefaultMaxOutputBytes
 	}
+	if c.MaxConcurrentRequests == 0 {
+		c.MaxConcurrentRequests = DefaultMaxConcurrentRequests
+	}
 	if strings.TrimSpace(c.Name) == "" || strings.TrimSpace(c.Version) == "" ||
 		c.MaxMessageBytes < 1 || c.MaxInputBytes < 1 || c.MaxOutputBytes < 1 ||
 		c.MaxMessageBytes > DefaultMaxMessageBytes ||
 		c.MaxInputBytes > DefaultMaxInputBytes ||
 		c.MaxOutputBytes > DefaultMaxOutputBytes ||
+		c.MaxConcurrentRequests < 1 || c.MaxConcurrentRequests > DefaultMaxConcurrentRequests ||
 		c.MaxMessageBytes < maxInt(c.MaxInputBytes, c.MaxOutputBytes)+MaxFrameOverheadBytes {
 		return Config{}, ErrInvalidConfig
 	}
@@ -147,7 +156,7 @@ func maxInt(left, right int) int {
 type Server struct {
 	mu    sync.Mutex
 	cfg   Config
-	sdk   *mcp.Server
+	wire  *serverwire.Adapter
 	tools map[string]struct{}
 }
 
@@ -162,13 +171,8 @@ func New(cfg Config) (*Server, error) {
 	// A non-nil capabilities value disables the SDK's historical default
 	// logging capability. The empty ToolsCapabilities value suppresses
 	// list-changed notifications while still advertising tools once one exists.
-	sdk := mcp.NewServer(
-		&mcp.Implementation{Name: normalized.Name, Version: normalized.Version},
-		&mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{
-			Tools: &mcp.ToolCapabilities{},
-		}},
-	)
-	return &Server{cfg: normalized, sdk: sdk, tools: make(map[string]struct{})}, nil
+	wire := serverwire.New(serverwire.Config{Name: normalized.Name, Version: normalized.Version, MaxMessageBytes: normalized.MaxMessageBytes, MaxInputBytes: normalized.MaxInputBytes, MaxOutputBytes: normalized.MaxOutputBytes, MaxConcurrentRequests: normalized.MaxConcurrentRequests, MaxRequestIDBytes: MaxRequestIDBytes})
+	return &Server{cfg: normalized, wire: wire, tools: make(map[string]struct{})}, nil
 }
 
 // NewServer is an explicit-name alias for New.
@@ -202,16 +206,19 @@ func (s *Server) RegisterTool(tool Tool) error {
 		return fmt.Errorf("%w: %s", ErrDuplicateTool, normalized.Name)
 	}
 
-	sdkTool := &mcp.Tool{
-		Name:         normalized.Name,
-		Title:        normalized.Title,
-		Description:  normalized.Description,
-		InputSchema:  normalized.InputSchema,
-		OutputSchema: normalized.OutputSchema,
-	}
-	// normalizeTool mirrors the SDK's panic-producing schema checks, so this
-	// call cannot panic for caller-controlled definitions.
-	s.sdk.AddTool(sdkTool, s.handler(normalized.Handler))
+	s.wire.RegisterTool(serverwire.Tool{Name: normalized.Name, Title: normalized.Title, Description: normalized.Description, InputSchema: normalized.InputSchema, OutputSchema: normalized.OutputSchema, Handler: func(ctx context.Context, args json.RawMessage) (serverwire.Result, error) {
+		result, err := normalized.Handler(ctx, args)
+		if errors.Is(err, ErrInvalidArgument) {
+			err = serverwire.ErrInvalidArgument
+		}
+		return serverwire.Result{Content: func() []serverwire.Content {
+			out := make([]serverwire.Content, len(result.Content))
+			for i, c := range result.Content {
+				out[i] = serverwire.Content{Text: c.Text}
+			}
+			return out
+		}(), StructuredContent: result.StructuredContent, IsError: result.IsError}, err
+	}})
 	s.tools[normalized.Name] = struct{}{}
 	return nil
 }

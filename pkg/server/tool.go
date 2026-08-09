@@ -1,14 +1,9 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-
-	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Handler handles one tools/call argument object. Arguments are a defensive
@@ -95,65 +90,30 @@ func validateObjectSchema(raw json.RawMessage) error {
 	return nil
 }
 
-func (s *Server) handler(handler Handler) mcp.ToolHandler {
-	return func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := json.RawMessage(`{}`)
-		if req == nil || req.Params == nil {
-			return nil, invalidArgumentWireError()
-		}
-		if len(req.Params.Arguments) > s.cfg.MaxInputBytes {
-			return nil, invalidArgumentWireError()
-		}
-		if len(req.Params.Arguments) > 0 {
-			args = append(json.RawMessage(nil), req.Params.Arguments...)
-			if !isObjectJSON(args) || !json.Valid(args) {
-				return nil, invalidArgumentWireError()
-			}
-		}
-
-		result, err := handler(ctx, args)
-		if err != nil {
-			if errors.Is(err, ErrInvalidArgument) {
-				return nil, invalidArgumentWireError()
-			}
-			return nil, internalWireError()
-		}
-		wireResult, err := s.result(result)
-		if err != nil {
-			return nil, err
-		}
-		return wireResult, nil
-	}
+// result is retained as a package-local sizing seam for tests; it deliberately
+// uses only neutral JSON data and does not expose an SDK result type.
+type sizedResult struct {
+	Content           []sizedContent  `json:"content"`
+	StructuredContent json.RawMessage `json:"structuredContent,omitempty"`
+	IsError           bool            `json:"isError,omitempty"`
+}
+type sizedContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
-func (s *Server) result(result Result) (*mcp.CallToolResult, error) {
-	wire := &mcp.CallToolResult{IsError: result.IsError}
-	for _, content := range result.Content {
-		wire.Content = append(wire.Content, &mcp.TextContent{Text: content.Text})
+func (s *Server) result(result Result) (*sizedResult, error) {
+	w := &sizedResult{IsError: result.IsError}
+	for _, c := range result.Content {
+		w.Content = append(w.Content, sizedContent{Type: "text", Text: c.Text})
 	}
-	if len(result.StructuredContent) > 0 {
-		if !json.Valid(result.StructuredContent) {
-			return nil, internalWireError()
-		}
-		wire.StructuredContent = append(json.RawMessage(nil), result.StructuredContent...)
+	if len(result.StructuredContent) > 0 && !json.Valid(result.StructuredContent) {
+		return nil, ErrInternal
 	}
-
-	encoded, err := json.Marshal(wire)
-	if err != nil || len(encoded) > s.cfg.MaxOutputBytes {
-		return nil, internalWireError()
+	w.StructuredContent = append(json.RawMessage(nil), result.StructuredContent...)
+	b, err := json.Marshal(w)
+	if err != nil || len(b) > s.cfg.MaxOutputBytes {
+		return nil, ErrInternal
 	}
-	return wire, nil
-}
-
-func isObjectJSON(raw []byte) bool {
-	trimmed := bytes.TrimSpace(raw)
-	return len(trimmed) > 0 && trimmed[0] == '{'
-}
-
-func invalidArgumentWireError() error {
-	return &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: invalidArgumentMessage}
-}
-
-func internalWireError() error {
-	return &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: internalErrorMessage}
+	return w, nil
 }

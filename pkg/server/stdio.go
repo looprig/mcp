@@ -9,8 +9,6 @@ import (
 	"io"
 	"os"
 	"sync"
-
-	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Serve runs the server over stdio-shaped streams. The reader and writer may
@@ -25,11 +23,7 @@ func (s *Server) Serve(ctx context.Context, reader io.Reader, writer io.Writer) 
 		return errors.New("server: nil serve argument")
 	}
 
-	fr := newBoundedFrameReader(reader, s.cfg.MaxMessageBytes)
-	fw := newBoundedFrameWriter(writer, s.cfg.MaxMessageBytes)
-	frc := &boundedReadCloser{reader: fr, closer: readerCloser(reader)}
-	fwc := &boundedWriteCloser{writer: fw, closer: writerCloser(writer)}
-	return s.sdk.Run(ctx, &mcp.IOTransport{Reader: frc, Writer: fwc})
+	return s.wire.Serve(ctx, &ownedReader{Reader: reader, Closer: readerCloser(reader)}, &ownedWriter{Writer: writer, Closer: writerCloser(writer)})
 }
 
 // Run serves the process's stdin/stdout. It is the convenience entry point
@@ -40,6 +34,15 @@ func (s *Server) Run(ctx context.Context) error { return s.Serve(ctx, os.Stdin, 
 // make the stdio boundary visible in their composition code.
 func (s *Server) ServeStdio(ctx context.Context, reader io.Reader, writer io.Writer) error {
 	return s.Serve(ctx, reader, writer)
+}
+
+type ownedReader struct {
+	io.Reader
+	io.Closer
+}
+type ownedWriter struct {
+	io.Writer
+	io.Closer
 }
 
 type boundedReadCloser struct {
