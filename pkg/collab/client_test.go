@@ -260,14 +260,14 @@ func TestClientResponseAndTransportFailuresDoNotExposeSecrets(t *testing.T) {
 }
 
 func TestClientSupportsAdmissionDeadlineWithoutBoundingResponseObservation(t *testing.T) {
-	t.Parallel()
-
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()
 	defer clientConn.Close()
 	capability := bytes.Repeat([]byte{0x33}, CapabilityBytes)
+	serverReady := make(chan struct{})
 	go func() {
 		defer serverConn.Close()
+		close(serverReady)
 		if _, err := ReadHandshake(serverConn); err != nil {
 			return
 		}
@@ -277,6 +277,7 @@ func TestClientSupportsAdmissionDeadlineWithoutBoundingResponseObservation(t *te
 		time.Sleep(50 * time.Millisecond)
 		_ = WriteFrame(serverConn, []byte(`{"agent_id":"55555555-5555-4555-8555-555555555555","name":"worker","state":"idle","delivery_status":"injected","response_status":"completed","response":"late"}`))
 	}()
+	<-serverReady
 	client, err := NewClientWithDialer(ClientConfig{Endpoint: "/unused", Capability: capability, AdmissionTimeout: 10 * time.Millisecond}, func(context.Context, string) (net.Conn, error) {
 		return clientConn, nil
 	})
