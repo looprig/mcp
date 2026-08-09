@@ -29,12 +29,17 @@ type boundedTransport struct {
 }
 
 func (t *boundedTransport) Connect(ctx context.Context) (mcp.Connection, error) {
+	if t.max < 1 {
+		t.max = 1
+	}
 	base, err := (&mcp.IOTransport{Reader: t.reader, Writer: t.writer}).Connect(ctx)
 	if err != nil {
 		return nil, err
 	}
 	t.base = base
-	return &admissionConn{Connection: base, slots: make(chan struct{}, t.max), max: t.max, held: make(map[jsonrpc.ID]struct{})}, nil
+	c := &admissionConn{Connection: base, slots: make(chan struct{}, t.max), max: t.max, held: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, t.max), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{})}
+	go c.dispatch()
+	return c, nil
 }
 func (t *boundedTransport) Close() error {
 	if t.base != nil {
@@ -45,44 +50,148 @@ func (t *boundedTransport) Close() error {
 
 type admissionConn struct {
 	mcp.Connection
-	slots chan struct{}
-	max   int
-	mu    sync.Mutex
-	held  map[jsonrpc.ID]struct{}
+	slots     chan struct{}
+	max       int
+	mu        sync.Mutex
+	held      map[jsonrpc.ID]struct{}
+	requests  chan jsonrpc.Message
+	controls  chan jsonrpc.Message
+	done      chan struct{}
+	stop      chan struct{}
+	closeOnce sync.Once
+	err       error
 }
 
 func (c *admissionConn) Read(ctx context.Context) (jsonrpc.Message, error) {
-	m, err := c.Connection.Read(ctx)
-	if err != nil {
+	select {
+	case m := <-c.controls:
+		return m, nil
+	default:
+	}
+	select {
+	case m := <-c.controls:
+		return m, nil
+	case m := <-c.requests:
+		if req, ok := m.(*jsonrpc.Request); ok && !req.ID.IsValid() {
+			<-c.slots
+		}
+		return m, nil
+	case <-c.done:
+		c.mu.Lock()
+		err := c.err
+		c.mu.Unlock()
+		if err == nil {
+			err = io.EOF
+		}
 		return nil, err
+	case <-ctx.Done():
+		return nil, ctx.Err()
 	}
-	if req, ok := m.(*jsonrpc.Request); ok && req.ID.IsValid() && !controlMethod(req.Method) {
-		select {
-		case c.slots <- struct{}{}:
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
-		if req.ID.IsValid() {
-			c.mu.Lock()
-			c.held[req.ID] = struct{}{}
-			c.mu.Unlock()
-		}
-	}
-	return m, nil
 }
 func (c *admissionConn) Write(ctx context.Context, m jsonrpc.Message) error {
 	err := c.Connection.Write(ctx, m)
-	if resp, ok := m.(*jsonrpc.Response); ok && resp.ID.IsValid() {
-		c.mu.Lock()
-		if _, held := c.held[resp.ID]; held {
-			delete(c.held, resp.ID)
-			<-c.slots
+	if err == nil {
+		if resp, ok := m.(*jsonrpc.Response); ok && resp.ID.IsValid() {
+			c.mu.Lock()
+			if _, held := c.held[resp.ID]; held {
+				delete(c.held, resp.ID)
+				<-c.slots
+			}
+			c.mu.Unlock()
 		}
-		c.mu.Unlock()
 	}
 	return err
 }
-func (c *admissionConn) Close() error { return c.Connection.Close() }
+func (c *admissionConn) Close() error {
+	c.closeOnce.Do(func() { close(c.stop); _ = c.Connection.Close() })
+	return nil
+}
+
+func (c *admissionConn) dispatch() {
+	defer close(c.done)
+	for {
+		m, err := c.Connection.Read(context.Background())
+		if err != nil {
+			c.mu.Lock()
+			c.err = err
+			c.mu.Unlock()
+			return
+		}
+		if req, ok := m.(*jsonrpc.Request); ok && !controlMethod(req.Method) {
+			if !c.admit(m) {
+				return
+			}
+			continue
+		}
+		select {
+		case c.controls <- m:
+		case <-c.stop:
+			return
+		}
+	}
+}
+
+func (c *admissionConn) admit(m jsonrpc.Message) bool {
+	for {
+		select {
+		case c.slots <- struct{}{}:
+			c.track(m)
+			select {
+			case c.requests <- m:
+				return true
+			case <-c.stop:
+				return false
+			}
+		default:
+			// One bounded lookahead lets a cancellation/control notification pass
+			// a saturated application request. Additional application requests
+			// remain backpressured; no peer-controlled queue grows here.
+			pending := m
+			for {
+				next, err := c.Connection.Read(context.Background())
+				if err != nil {
+					c.mu.Lock()
+					c.err = err
+					c.mu.Unlock()
+					return false
+				}
+				if req, ok := next.(*jsonrpc.Request); ok && !controlMethod(req.Method) {
+					select {
+					case c.slots <- struct{}{}:
+						c.track(pending)
+						select {
+						case c.requests <- pending:
+							m = next
+							break
+						case <-c.stop:
+							return false
+						}
+						break
+					default:
+						// Discard excess application calls while saturated. They are
+						// never exposed to the SDK; this keeps the dispatcher bounded
+						// and leaves its single reserved lane available for control.
+						continue
+					case <-c.stop:
+						return false
+					}
+				}
+				select {
+				case c.controls <- next:
+				case <-c.stop:
+					return false
+				}
+			}
+		}
+	}
+}
+func (c *admissionConn) track(m jsonrpc.Message) {
+	if req, ok := m.(*jsonrpc.Request); ok && req.ID.IsValid() {
+		c.mu.Lock()
+		c.held[req.ID] = struct{}{}
+		c.mu.Unlock()
+	}
+}
 func controlMethod(method string) bool {
 	switch method {
 	case "initialize", "ping", "notifications/initialized", "notifications/cancelled", "logging/setLevel":
@@ -127,22 +236,41 @@ func (r *FrameReader) frame() error {
 			if len(b) == 0 {
 				return e
 			}
-			if err := validateFrame(b, r.idmax); err != nil {
+			raw := append([]byte(nil), b...)
+			body := b
+			if len(body) > 0 && body[len(body)-1] == '\r' {
+				body = body[:len(body)-1]
+			}
+			if len(body) > r.max {
+				r.sticky = ErrInputLimit
+				return r.sticky
+			}
+			if err := validateFrame(body, r.idmax); err != nil {
 				return err
 			}
-			r.pending = append(r.pending, b...)
+			r.pending = append(r.pending, raw...)
 			return nil
 		}
 		if x == '\n' {
-			if err := validateFrame(b, r.idmax); err != nil {
+			raw := append([]byte(nil), b...)
+			body := b
+			if len(body) > 0 && body[len(body)-1] == '\r' {
+				body = body[:len(body)-1]
+			}
+			if len(body) > r.max {
+				r.sticky = ErrInputLimit
+				return r.sticky
+			}
+			if err := validateFrame(body, r.idmax); err != nil {
 				r.sticky = err
 				return err
 			}
-			r.pending = append(r.pending, b...)
+			r.pending = append(r.pending, raw...)
+			r.pending = append(r.pending, '\n')
 			return nil
 		}
 		b = append(b, x)
-		if len(b) > r.max {
+		if len(b) > r.max && !(len(b) == r.max+1 && b[len(b)-1] == '\r') {
 			r.sticky = ErrInputLimit
 			return r.sticky
 		}
@@ -165,8 +293,12 @@ func validateFrame(b []byte, idmax int) error {
 	if json.Unmarshal(raw, &v) != nil {
 		return ErrInputEnvelope
 	}
-	switch v.(type) {
-	case string, float64:
+	var canonical any
+	switch value := v.(type) {
+	case string:
+		canonical = value
+	case float64:
+		canonical = int64(value)
 	default:
 		return ErrInputEnvelope
 	}
@@ -174,7 +306,7 @@ func validateFrame(b []byte, idmax int) error {
 		var enc bytes.Buffer
 		e := json.NewEncoder(&enc)
 		e.SetEscapeHTML(false)
-		if e.Encode(v) != nil {
+		if e.Encode(canonical) != nil {
 			return ErrInputEnvelope
 		}
 		x := bytes.TrimSuffix(enc.Bytes(), []byte{'\n'})
@@ -202,5 +334,9 @@ func (w *FrameWriter) Write(p []byte) (int, error) {
 	if n > w.max {
 		return 0, ErrOutputLimit
 	}
-	return w.w.Write(p)
+	written, err := w.w.Write(p)
+	if err == nil && written != len(p) {
+		err = io.ErrShortWrite
+	}
+	return written, err
 }
