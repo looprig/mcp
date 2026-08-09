@@ -21,16 +21,21 @@ const (
 	DefaultServerName    = "coderig-collab-mcp"
 	DefaultServerVersion = "0.1.0"
 
-	// DefaultMaxMessageBytes bounds one newline-delimited MCP frame, excluding
-	// the delimiter. It prevents the SDK decoder from buffering an unbounded
-	// request or response before this package can inspect it.
-	DefaultMaxMessageBytes = 192 << 10
 	// DefaultMaxInputBytes bounds one tools/call arguments value before the
 	// application handler is invoked.
 	DefaultMaxInputBytes = 256 << 10
 	// DefaultMaxOutputBytes bounds a handler's structured result and encoded
 	// content before the SDK is allowed to serialize it.
 	DefaultMaxOutputBytes = 256 << 10
+	// MaxFrameOverheadBytes is reserved for the JSON-RPC/MCP envelope around a
+	// bounded argument or result. It is part of the frame policy, not an
+	// allowance for application payloads.
+	MaxFrameOverheadBytes = 4 << 10
+	// DefaultMaxMessageBytes bounds one newline-delimited MCP frame's JSON
+	// bytes. The final '\n' delimiter is excluded from this count. The default
+	// is deliberately larger than the maximum argument/result plus the
+	// envelope, so a handler-valid boundary value cannot fail at transport.
+	DefaultMaxMessageBytes = DefaultMaxOutputBytes + MaxFrameOverheadBytes
 )
 
 // These aliases make the policy easy to discover without creating a second
@@ -109,10 +114,21 @@ func (c Config) normalized() (Config, error) {
 		c.MaxOutputBytes = DefaultMaxOutputBytes
 	}
 	if strings.TrimSpace(c.Name) == "" || strings.TrimSpace(c.Version) == "" ||
-		c.MaxMessageBytes < 1 || c.MaxInputBytes < 1 || c.MaxOutputBytes < 1 {
+		c.MaxMessageBytes < 1 || c.MaxInputBytes < 1 || c.MaxOutputBytes < 1 ||
+		c.MaxMessageBytes > DefaultMaxMessageBytes ||
+		c.MaxInputBytes > DefaultMaxInputBytes ||
+		c.MaxOutputBytes > DefaultMaxOutputBytes ||
+		c.MaxMessageBytes < maxInt(c.MaxInputBytes, c.MaxOutputBytes)+MaxFrameOverheadBytes {
 		return Config{}, ErrInvalidConfig
 	}
 	return c, nil
+}
+
+func maxInt(left, right int) int {
+	if left > right {
+		return left
+	}
+	return right
 }
 
 // Server is a reusable, one-session MCP server. It is safe to register tools

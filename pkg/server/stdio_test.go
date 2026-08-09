@@ -40,6 +40,28 @@ func TestBoundedFrameWriterRejectsOversizedOutputWithoutWriting(t *testing.T) {
 	}
 }
 
+func TestBoundedFramesExcludeTrailingNewlineFromLimit(t *testing.T) {
+	t.Parallel()
+
+	var dst bytes.Buffer
+	w := newBoundedFrameWriter(&dst, 8)
+	if _, err := w.Write([]byte("12345678\n")); err != nil {
+		t.Fatalf("Write() at exact frame limit error = %v", err)
+	}
+	if _, err := w.Write([]byte("123456789\n")); !errors.Is(err, ErrOutputLimit) {
+		t.Fatalf("Write() above frame limit error = %v, want ErrOutputLimit", err)
+	}
+
+	r := newBoundedFrameReader(strings.NewReader("12345678\n"), 8)
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll() at exact frame limit error = %v", err)
+	}
+	if string(got) != "12345678\n" {
+		t.Fatalf("ReadAll() = %q, want exact frame", got)
+	}
+}
+
 func TestServeStdioUsesExplicitStreams(t *testing.T) {
 	t.Parallel()
 

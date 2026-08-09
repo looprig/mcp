@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -143,6 +144,126 @@ func TestServerRejectsDuplicateAndInvalidToolNames(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServerRejectsBoundsAboveHardMaximumAndIncompatibleFrames(t *testing.T) {
+	t.Parallel()
+
+	tests := []Config{
+		{MaxInputBytes: DefaultMaxInputBytes + 1},
+		{MaxOutputBytes: DefaultMaxOutputBytes + 1},
+		{MaxMessageBytes: DefaultMaxMessageBytes + 1},
+		{MaxMessageBytes: DefaultMaxMessageBytes - 1, MaxInputBytes: DefaultMaxInputBytes},
+		{MaxMessageBytes: DefaultMaxMessageBytes - 1, MaxOutputBytes: DefaultMaxOutputBytes},
+	}
+	for _, cfg := range tests {
+		if _, err := New(cfg); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("New(%+v) error = %v, want ErrInvalidConfig", cfg, err)
+		}
+	}
+	if _, err := New(Config{
+		MaxMessageBytes: DefaultMaxMessageBytes,
+		MaxInputBytes:   DefaultMaxInputBytes,
+		MaxOutputBytes:  DefaultMaxOutputBytes,
+	}); err != nil {
+		t.Fatalf("New() at exact hard maxima error = %v", err)
+	}
+}
+
+func TestServerAcceptsInputAtExactArgumentLimit(t *testing.T) {
+	t.Parallel()
+
+	var seen atomic.Int32
+	s, err := New(Config{MaxInputBytes: DefaultMaxInputBytes})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := s.RegisterTool(Tool{
+		Name: "exact-input",
+		Handler: func(_ context.Context, args json.RawMessage) (Result, error) {
+			if len(args) != DefaultMaxInputBytes {
+				return Result{}, fmt.Errorf("unexpected argument length: %d", len(args))
+			}
+			seen.Add(1)
+			return Result{}, nil
+		},
+	}); err != nil {
+		t.Fatalf("RegisterTool() error = %v", err)
+	}
+
+	argument := exactObjectJSON(t, DefaultMaxInputBytes)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serverConn, clientConn := net.Pipe()
+	serverErr := make(chan error, 1)
+	go func() { serverErr <- s.Serve(ctx, serverConn, serverConn) }()
+	probe := mcp.NewClient(&mcp.Implementation{Name: "probe", Version: "0"}, nil)
+	cs, err := probe.Connect(ctx, &mcp.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
+	if err != nil {
+		clientConn.Close()
+		t.Fatalf("client Connect() error = %v", err)
+	}
+	defer cs.Close()
+	if _, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "exact-input", Arguments: argument}); err != nil {
+		t.Fatalf("CallTool() at exact argument limit error = %v", err)
+	}
+	if seen.Load() != 1 {
+		t.Fatalf("handler calls = %d, want 1", seen.Load())
+	}
+	cancel()
+	clientConn.Close()
+	<-serverErr
+}
+
+func TestServerMaxOutputFitsTheFrameEnvelope(t *testing.T) {
+	t.Parallel()
+
+	s, err := New(Config{MaxOutputBytes: DefaultMaxOutputBytes})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	// Find the largest structured string whose complete MCP result is exactly
+	// the handler output bound. This exercises the result layer at the exact
+	// boundary, then the frame writer with its trailing newline excluded.
+	var structured json.RawMessage
+	var encoded []byte
+	for n := DefaultMaxOutputBytes; n >= 0; n-- {
+		candidate := json.RawMessage(fmt.Sprintf(`{"value":%q}`, strings.Repeat("x", n)))
+		wire, resultErr := s.result(Result{StructuredContent: candidate})
+		if resultErr != nil {
+			continue
+		}
+		encoded, err = json.Marshal(wire)
+		if err != nil {
+			t.Fatalf("json.Marshal() error = %v", err)
+		}
+		if len(encoded) == DefaultMaxOutputBytes {
+			structured = candidate
+			break
+		}
+	}
+	if len(structured) == 0 {
+		t.Fatal("could not construct exact-boundary structured output")
+	}
+	if len(encoded) != DefaultMaxOutputBytes {
+		t.Fatalf("encoded output length = %d, want %d", len(encoded), DefaultMaxOutputBytes)
+	}
+	var dst bytes.Buffer
+	w := newBoundedFrameWriter(&dst, DefaultMaxMessageBytes)
+	if _, err := w.Write(append(encoded, '\n')); err != nil {
+		t.Fatalf("writing max-valid output frame error = %v", err)
+	}
+	if got, want := dst.Len(), len(encoded)+1; got != want {
+		t.Fatalf("written bytes = %d, want %d", got, want)
+	}
+}
+
+func exactObjectJSON(t *testing.T, size int) json.RawMessage {
+	t.Helper()
+	if size < len(`{"x":""}`) {
+		t.Fatalf("size %d is too small for exact object fixture", size)
+	}
+	return json.RawMessage(fmt.Sprintf(`{"x":%q}`, strings.Repeat("x", size-len(`{"x":""}`))))
 }
 
 func TestServerBoundsInputBeforeCallingHandler(t *testing.T) {

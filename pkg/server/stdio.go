@@ -75,8 +75,8 @@ func writerCloser(value io.Writer) io.Closer {
 }
 
 // boundedFrameReader exposes one or more complete newline-delimited frames
-// while refusing a frame whose JSON bytes exceed max. It never buffers more
-// than max+1 bytes from the current frame.
+// while refusing a frame whose JSON bytes exceed max. The terminating '\n' is
+// not counted. It never buffers more than max+1 bytes from the current frame.
 type boundedFrameReader struct {
 	reader io.ByteReader
 	max    int
@@ -122,8 +122,9 @@ func (r *boundedFrameReader) Read(p []byte) (int, error) {
 func (r *boundedFrameReader) limitExceeded() bool { return errors.Is(r.sticky, ErrInputLimit) }
 
 // boundedFrameWriter refuses an oversized SDK frame before it reaches the
-// process's stdout. SDK writes are serialized, but the mutex also makes this
-// helper safe if it is reused by a custom transport.
+// process's stdout. The terminating '\n' is not counted. SDK writes are
+// serialized, but the mutex also makes this helper safe if it is reused by a
+// custom transport.
 type boundedFrameWriter struct {
 	mu     sync.Mutex
 	writer io.Writer
@@ -137,7 +138,11 @@ func newBoundedFrameWriter(writer io.Writer, max int) *boundedFrameWriter {
 func (w *boundedFrameWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(p) > w.max {
+	frameBytes := len(p)
+	if frameBytes > 0 && p[frameBytes-1] == '\n' {
+		frameBytes--
+	}
+	if frameBytes > w.max {
 		return 0, ErrOutputLimit
 	}
 	n, err := w.writer.Write(p)
