@@ -10,12 +10,119 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/looprig/mcp/internal/serverwire"
 )
+
+func TestServeSaturatedActiveHandlerCancellationClosesBlockedWriter(t *testing.T) {
+	s, err := New(Config{MaxConcurrentRequests: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	stopped := make(chan struct{})
+	var calls atomic.Int32
+	if err := s.RegisterTool(Tool{Name: "block", Handler: func(ctx context.Context, _ json.RawMessage) (Result, error) {
+		calls.Add(1)
+		close(started)
+		<-ctx.Done()
+		close(stopped)
+		return Result{StructuredContent: json.RawMessage(`{"cancelled":true}`)}, nil
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	serverConn, clientConn := net.Pipe()
+	endpoint := newServeTestEndpoint(serverConn)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- s.Serve(ctx, endpoint, endpoint) }()
+	client := serverwire.NewClient(&serverwire.Implementation{Name: "probe", Version: "1"}, nil)
+	cs, err := client.Connect(context.Background(), &serverwire.IOTransport{Reader: clientConn, Writer: clientConn}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cs.Close()
+	_ = cs.InitializeResult()
+	endpoint.block.Store(true)
+	call1 := make(chan error, 1)
+	go func() {
+		_, e := cs.CallTool(context.Background(), &serverwire.CallToolParams{Name: "block"})
+		call1 <- e
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("active handler did not start")
+	}
+	call2 := make(chan error, 1)
+	go func() {
+		_, e := cs.CallTool(context.Background(), &serverwire.CallToolParams{Name: "block"})
+		call2 <- e
+	}()
+	time.Sleep(30 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("handler calls=%d want 1", got)
+	}
+	cancel()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("handler context did not cancel")
+	}
+	select {
+	case <-call1:
+	case <-time.After(time.Second):
+		t.Fatal("active call remained blocked")
+	}
+	select {
+	case <-call2:
+	case <-time.After(time.Second):
+		t.Fatal("pending call remained blocked")
+	}
+	select {
+	case e := <-serveErr:
+		if e != nil && !errors.Is(e, context.Canceled) {
+			t.Fatalf("Serve error=%v", e)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve remained blocked")
+	}
+	if got := endpoint.closes.Load(); got != 1 {
+		t.Fatalf("endpoint closes=%d want 1", got)
+	}
+}
+
+type serveTestEndpoint struct {
+	net.Conn
+	block     atomic.Bool
+	closes    atomic.Int32
+	once      sync.Once
+	closed    chan struct{}
+	writeOnce sync.Once
+}
+
+func newServeTestEndpoint(c net.Conn) *serveTestEndpoint {
+	return &serveTestEndpoint{Conn: c, closed: make(chan struct{})}
+}
+func (e *serveTestEndpoint) Write(p []byte) (int, error) {
+	if e.block.Load() {
+		e.writeOnce.Do(func() {})
+		select {
+		case <-e.closed:
+			return 0, io.ErrClosedPipe
+		}
+	}
+	return e.Conn.Write(p)
+}
+func (e *serveTestEndpoint) Close() error {
+	e.once.Do(func() { e.closes.Add(1); close(e.closed); _ = e.Conn.Close() })
+	return nil
+}
 
 func TestServerRegistersToolAndReturnsStructuredContent(t *testing.T) {
 	t.Parallel()
