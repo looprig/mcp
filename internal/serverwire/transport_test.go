@@ -16,10 +16,10 @@ import (
 
 func TestAdmissionSaturationStillDeliversCancellation(t *testing.T) {
 	base := newFakeConnection()
-	c := &admissionConn{Connection: base, slots: make(chan struct{}, 8), max: 8, held: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, 8), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{})}
+	c := &admissionConn{Connection: base, slots: newSlots(8), max: 8, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), requests: make(chan jsonrpc.Message, 8), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
 	go c.dispatch()
 	defer c.Close()
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 9; i++ {
 		id, _ := jsonrpc.MakeID(float64(i + 1))
 		base.in <- &jsonrpc.Request{ID: id, Method: "tools/call"}
 	}
@@ -42,7 +42,7 @@ func TestAdmissionSaturationStillDeliversCancellation(t *testing.T) {
 
 func TestAdmissionCloseUnblocksRead(t *testing.T) {
 	base := newFakeConnection()
-	c := &admissionConn{Connection: base, slots: make(chan struct{}, 1), max: 1, held: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, 1), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{})}
+	c := &admissionConn{Connection: base, slots: newSlots(1), max: 1, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), requests: make(chan jsonrpc.Message, 1), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
 	go c.dispatch()
 	got := make(chan error, 1)
 	go func() { _, err := c.Read(context.Background()); got <- err }()
@@ -51,6 +51,100 @@ func TestAdmissionCloseUnblocksRead(t *testing.T) {
 	case <-got:
 	case <-time.After(time.Second):
 		t.Fatal("Read remained blocked after Close")
+	}
+}
+
+func TestAdmissionNotificationPermitHeldUntilHandlerCompletion(t *testing.T) {
+	base := newFakeConnection()
+	c := &admissionConn{Connection: base, slots: newSlots(1), max: 1, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), requests: make(chan jsonrpc.Message, 1), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
+	go c.dispatch()
+	defer c.Close()
+	base.in <- &jsonrpc.Request{Method: "tools/call"}
+	base.in <- &jsonrpc.Request{Method: "tools/call"}
+	first, err := c.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	extra, ok := first.(*jsonrpc.Request).Extra.(*mcp.RequestExtra)
+	if !ok || extra.CloseSSEStream == nil {
+		t.Fatal("missing completion release")
+	}
+	select {
+	case <-c.requests:
+		t.Fatal("second notification admitted before first completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	extra.CloseSSEStream(mcp.CloseSSEStreamArgs{})
+	if _, err := c.Read(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestAdmissionPendingCallIsDeliveredAfterResponseFreesSlot(t *testing.T) {
+	base := newFakeConnection()
+	c := &admissionConn{Connection: base, slots: newSlots(1), max: 1, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), requests: make(chan jsonrpc.Message, 1), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
+	go c.dispatch()
+	defer c.Close()
+	id1, _ := jsonrpc.MakeID(float64(1))
+	id2, _ := jsonrpc.MakeID(float64(2))
+	base.in <- &jsonrpc.Request{ID: id1, Method: "tools/call"}
+	base.in <- &jsonrpc.Request{ID: id2, Method: "tools/call"}
+	if _, err := c.Read(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	before := len(c.permits)
+	c.mu.Unlock()
+	if before != 1 {
+		t.Fatalf("permits before response=%d", before)
+	}
+	if err := c.Write(context.Background(), &jsonrpc.Response{ID: id1}); err != nil {
+		t.Fatal(err)
+	}
+	c.mu.Lock()
+	held := len(c.permits)
+	c.mu.Unlock()
+	if held != 0 {
+		t.Fatalf("permits after response=%d", held)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if len(c.requests) == 0 {
+		t.Fatalf("pending request was not enqueued; released=%d", len(c.released))
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	m, err := c.Read(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.(*jsonrpc.Request).ID != id2 {
+		t.Fatalf("got pending request %#v", m)
+	}
+}
+
+func TestAdmissionDoesNotLoseQueuedCalls(t *testing.T) {
+	base := newFakeConnection()
+	c := &admissionConn{Connection: base, slots: newSlots(1), max: 1, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), requests: make(chan jsonrpc.Message, 1), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
+	go c.dispatch()
+	defer c.Close()
+	ids := make([]jsonrpc.ID, 3)
+	for i := range ids {
+		ids[i], _ = jsonrpc.MakeID(float64(i + 1))
+		base.in <- &jsonrpc.Request{ID: ids[i], Method: "tools/call"}
+	}
+	for i, id := range ids {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		m, err := c.Read(ctx)
+		cancel()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.(*jsonrpc.Request).ID != id {
+			t.Fatalf("call %d got id %#v", i, m)
+		}
+		if err := c.Write(context.Background(), &jsonrpc.Response{ID: id}); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
 

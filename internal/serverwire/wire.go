@@ -51,6 +51,9 @@ func (a *Adapter) handler(fn Handler) mcp.ToolHandler {
 		if req == nil || req.Params == nil || len(req.Params.Arguments) > a.cfg.MaxInputBytes || !objectJSON(req.Params.Arguments) {
 			return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "invalid arguments"}
 		}
+		if req.Extra != nil && req.Extra.CloseSSEStream != nil {
+			defer req.Extra.CloseSSEStream(mcp.CloseSSEStreamArgs{})
+		}
 		args := append(json.RawMessage(nil), req.Params.Arguments...)
 		ctx2, cancel := context.WithCancel(ctx)
 		stop := context.AfterFunc(a.ctx, cancel)

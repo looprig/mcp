@@ -37,7 +37,7 @@ func (t *boundedTransport) Connect(ctx context.Context) (mcp.Connection, error) 
 		return nil, err
 	}
 	t.base = base
-	c := &admissionConn{Connection: base, slots: make(chan struct{}, t.max), max: t.max, held: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, t.max), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{})}
+	c := &admissionConn{Connection: base, slots: newSlots(t.max), max: t.max, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), requests: make(chan jsonrpc.Message, t.max), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
 	go c.dispatch()
 	return c, nil
 }
@@ -54,10 +54,12 @@ type admissionConn struct {
 	max       int
 	mu        sync.Mutex
 	held      map[jsonrpc.ID]struct{}
+	permits   map[jsonrpc.ID]*permit
 	requests  chan jsonrpc.Message
 	controls  chan jsonrpc.Message
 	done      chan struct{}
 	stop      chan struct{}
+	released  chan struct{}
 	closeOnce sync.Once
 	err       error
 }
@@ -72,9 +74,6 @@ func (c *admissionConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 	case m := <-c.controls:
 		return m, nil
 	case m := <-c.requests:
-		if req, ok := m.(*jsonrpc.Request); ok && !req.ID.IsValid() {
-			<-c.slots
-		}
 		return m, nil
 	case <-c.done:
 		c.mu.Lock()
@@ -93,9 +92,10 @@ func (c *admissionConn) Write(ctx context.Context, m jsonrpc.Message) error {
 	if err == nil {
 		if resp, ok := m.(*jsonrpc.Response); ok && resp.ID.IsValid() {
 			c.mu.Lock()
-			if _, held := c.held[resp.ID]; held {
+			if p, held := c.permits[resp.ID]; held {
 				delete(c.held, resp.ID)
-				<-c.slots
+				delete(c.permits, resp.ID)
+				p.release()
 			}
 			c.mu.Unlock()
 		}
@@ -134,7 +134,11 @@ func (c *admissionConn) dispatch() {
 func (c *admissionConn) admit(m jsonrpc.Message) bool {
 	for {
 		select {
-		case c.slots <- struct{}{}:
+		case <-c.slots:
+			select {
+			case <-c.released:
+			default:
+			}
 			c.track(m)
 			select {
 			case c.requests <- m:
@@ -143,54 +147,118 @@ func (c *admissionConn) admit(m jsonrpc.Message) bool {
 				return false
 			}
 		default:
-			// One bounded lookahead lets a cancellation/control notification pass
-			// a saturated application request. Additional application requests
-			// remain backpressured; no peer-controlled queue grows here.
 			pending := m
 			for {
-				next, err := c.Connection.Read(context.Background())
-				if err != nil {
-					c.mu.Lock()
-					c.err = err
-					c.mu.Unlock()
-					return false
-				}
-				if req, ok := next.(*jsonrpc.Request); ok && !controlMethod(req.Method) {
+				nextCh := make(chan readResult, 1)
+				go func() { m, err := c.Connection.Read(context.Background()); nextCh <- readResult{m, err} }()
+				select {
+				case <-c.released:
 					select {
-					case c.slots <- struct{}{}:
-						c.track(pending)
-						select {
-						case c.requests <- pending:
-							m = next
-							break
-						case <-c.stop:
-							return false
-						}
-						break
-					default:
-						// Discard excess application calls while saturated. They are
-						// never exposed to the SDK; this keeps the dispatcher bounded
-						// and leaves its single reserved lane available for control.
-						continue
+					case <-c.slots:
 					case <-c.stop:
 						return false
 					}
-				}
-				select {
-				case c.controls <- next:
-				case <-c.stop:
-					return false
+					c.track(pending)
+					select {
+					case c.requests <- pending:
+					case <-c.stop:
+						return false
+					}
+					r := <-nextCh
+					if r.err != nil {
+						c.mu.Lock()
+						c.err = r.err
+						c.mu.Unlock()
+						return false
+					}
+					if req, ok := r.msg.(*jsonrpc.Request); ok && !controlMethod(req.Method) {
+						pending = r.msg
+						continue
+					}
+					select {
+					case c.controls <- r.msg:
+					case <-c.stop:
+						return false
+					}
+					continue
+				case r := <-nextCh:
+					if r.err != nil {
+						c.mu.Lock()
+						c.err = r.err
+						c.mu.Unlock()
+						return false
+					}
+					if req, ok := r.msg.(*jsonrpc.Request); ok && !controlMethod(req.Method) {
+						select {
+						case <-c.released:
+						case <-c.stop:
+							return false
+						}
+						select {
+						case <-c.slots:
+						case <-c.stop:
+							return false
+						}
+						c.track(pending)
+						select {
+						case c.requests <- pending:
+						case <-c.stop:
+							return false
+						}
+						pending = r.msg
+						continue
+					}
+					select {
+					case c.controls <- r.msg:
+					case <-c.stop:
+						return false
+					}
 				}
 			}
 		}
 	}
 }
-func (c *admissionConn) track(m jsonrpc.Message) {
-	if req, ok := m.(*jsonrpc.Request); ok && req.ID.IsValid() {
-		c.mu.Lock()
-		c.held[req.ID] = struct{}{}
-		c.mu.Unlock()
+
+type readResult struct {
+	msg jsonrpc.Message
+	err error
+}
+
+func newSlots(n int) chan struct{} {
+	ch := make(chan struct{}, n)
+	for i := 0; i < n; i++ {
+		ch <- struct{}{}
 	}
+	return ch
+}
+
+func (c *admissionConn) track(m jsonrpc.Message) {
+	if req, ok := m.(*jsonrpc.Request); ok {
+		p := &permit{c: c}
+		if req.ID.IsValid() {
+			c.mu.Lock()
+			c.held[req.ID] = struct{}{}
+			c.permits[req.ID] = p
+			c.mu.Unlock()
+		} else {
+			req.Extra = &mcp.RequestExtra{CloseSSEStream: func(mcp.CloseSSEStreamArgs) { p.release() }}
+		}
+	}
+}
+
+type permit struct {
+	c    *admissionConn
+	once sync.Once
+}
+
+func (p *permit) release() {
+	p.once.Do(func() {
+		p.c.slots <- struct{}{}
+		select {
+		case p.c.released <- struct{}{}:
+		default:
+		}
+	})
 }
 func controlMethod(method string) bool {
 	switch method {
