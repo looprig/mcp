@@ -258,3 +258,59 @@ func TestValidateFrameCanonicalNumericIDs(t *testing.T) {
 		}
 	}
 }
+
+func TestFrameRejectsUnknownNotificationsBeforeSDK(t *testing.T) {
+	for _, raw := range []string{`{"jsonrpc":"2.0","method":"tools/call"}`, `{"jsonrpc":"2.0","method":"notifications/progress"}`} {
+		if err := validateFrame([]byte(raw), 64); !errors.Is(err, ErrInputEnvelope) {
+			t.Fatalf("%s err=%v", raw, err)
+		}
+	}
+	for _, raw := range []string{`{"jsonrpc":"2.0","method":"notifications/initialized"}`, `{"jsonrpc":"2.0","method":"notifications/cancelled"}`} {
+		if err := validateFrame([]byte(raw), 64); err != nil {
+			t.Fatalf("control %s err=%v", raw, err)
+		}
+	}
+}
+
+func TestAdmissionRejectsDuplicateActiveID(t *testing.T) {
+	base := newFakeConnection()
+	c := &admissionConn{Connection: base, slots: newSlots(2), max: 2, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), seen: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, 2), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
+	go c.dispatch()
+	defer c.Close()
+	id, _ := jsonrpc.MakeID(float64(7))
+	base.in <- &jsonrpc.Request{ID: id, Method: "tools/call"}
+	base.in <- &jsonrpc.Request{ID: id, Method: "tools/call"}
+	if _, err := c.Read(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if _, err := c.Read(ctx); !errors.Is(err, ErrInputEnvelope) {
+		t.Fatalf("duplicate err=%v", err)
+	}
+}
+
+func TestAdmissionPendingCallPrecedesEOF(t *testing.T) {
+	base := newFakeConnection()
+	c := &admissionConn{Connection: base, slots: newSlots(1), max: 1, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), seen: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, 1), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
+	go c.dispatch()
+	defer c.Close()
+	id1, _ := jsonrpc.MakeID(float64(1))
+	id2, _ := jsonrpc.MakeID(float64(2))
+	base.in <- &jsonrpc.Request{ID: id1, Method: "tools/call"}
+	base.in <- &jsonrpc.Request{ID: id2, Method: "tools/call"}
+	if _, err := c.Read(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_ = c.Write(context.Background(), &jsonrpc.Response{ID: id1})
+	_ = base.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	m, err := c.Read(ctx)
+	if err != nil || m.(*jsonrpc.Request).ID != id2 {
+		t.Fatalf("pending=%v err=%v", m, err)
+	}
+	if _, err := c.Read(ctx); !errors.Is(err, io.EOF) {
+		t.Fatalf("EOF err=%v", err)
+	}
+}

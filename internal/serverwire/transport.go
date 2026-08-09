@@ -37,7 +37,7 @@ func (t *boundedTransport) Connect(ctx context.Context) (mcp.Connection, error) 
 		return nil, err
 	}
 	t.base = base
-	c := &admissionConn{Connection: base, slots: newSlots(t.max), max: t.max, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), requests: make(chan jsonrpc.Message, t.max), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
+	c := &admissionConn{Connection: base, slots: newSlots(t.max), max: t.max, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), seen: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, t.max), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
 	go c.dispatch()
 	return c, nil
 }
@@ -55,6 +55,7 @@ type admissionConn struct {
 	mu        sync.Mutex
 	held      map[jsonrpc.ID]struct{}
 	permits   map[jsonrpc.ID]*permit
+	seen      map[jsonrpc.ID]struct{}
 	requests  chan jsonrpc.Message
 	controls  chan jsonrpc.Message
 	done      chan struct{}
@@ -67,6 +68,11 @@ type admissionConn struct {
 func (c *admissionConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 	select {
 	case m := <-c.controls:
+		return m, nil
+	default:
+	}
+	select {
+	case m := <-c.requests:
 		return m, nil
 	default:
 	}
@@ -95,6 +101,7 @@ func (c *admissionConn) Write(ctx context.Context, m jsonrpc.Message) error {
 			if p, held := c.permits[resp.ID]; held {
 				delete(c.held, resp.ID)
 				delete(c.permits, resp.ID)
+				delete(c.seen, resp.ID)
 				p.release()
 			}
 			c.mu.Unlock()
@@ -118,6 +125,23 @@ func (c *admissionConn) dispatch() {
 			return
 		}
 		if req, ok := m.(*jsonrpc.Request); ok && !controlMethod(req.Method) {
+			if req.ID.IsValid() {
+				c.mu.Lock()
+				if c.seen == nil {
+					c.seen = make(map[jsonrpc.ID]struct{})
+				}
+				_, duplicate := c.seen[req.ID]
+				if !duplicate {
+					c.seen[req.ID] = struct{}{}
+				}
+				c.mu.Unlock()
+				if duplicate {
+					c.mu.Lock()
+					c.err = ErrInputEnvelope
+					c.mu.Unlock()
+					return
+				}
+			}
 			if !c.admit(m) {
 				return
 			}
@@ -262,7 +286,7 @@ func (p *permit) release() {
 }
 func controlMethod(method string) bool {
 	switch method {
-	case "initialize", "ping", "notifications/initialized", "notifications/cancelled", "logging/setLevel":
+	case "notifications/initialized", "notifications/cancelled":
 		return true
 	}
 	return false
@@ -355,6 +379,10 @@ func validateFrame(b []byte, idmax int) error {
 	}
 	raw, ok := env["id"]
 	if !ok {
+		var method string
+		if rawMethod, exists := env["method"]; !exists || json.Unmarshal(rawMethod, &method) != nil || !controlMethod(method) {
+			return ErrInputEnvelope
+		}
 		return nil
 	}
 	var v any
