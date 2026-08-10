@@ -186,8 +186,8 @@ func buildCollabMCPBinary(t *testing.T) string {
 		t.Fatal("runtime.Caller failed")
 	}
 	root := filepath.Clean(filepath.Join(filepath.Dir(source), "..", ".."))
-	binaryPath := filepath.Join(t.TempDir(), "coderig-collab-mcp")
-	build := exec.Command("go", "build", "-o", binaryPath, "./cmd/coderig-collab-mcp") // #nosec G204 -- fixed local module and output path
+	binaryPath := filepath.Join(t.TempDir(), "carbon-collab-mcp")
+	build := exec.Command("go", "build", "-o", binaryPath, "./cmd/carbon-collab-mcp") // #nosec G204 -- fixed local module and output path
 	build.Dir = root
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("building collaboration MCP executable: %v\n%s", err, output)

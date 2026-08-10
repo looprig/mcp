@@ -1,8 +1,8 @@
-// Package server provides the small MCP server surface used by CodeRig's
+// Package server provides the small MCP server surface used by a product's
 // injected collaboration process.
 //
 // The package deliberately keeps the SDK behind this boundary. Callers
-// register CodeRig-owned tools and handlers, while the package owns MCP
+// register product-owned tools and handlers, while the package owns MCP
 // framing, capability advertisement, bounds, and wire-error classification.
 package server
 
@@ -20,7 +20,7 @@ import (
 // The default identity is intentionally explicit: an empty SDK implementation
 // would otherwise produce an invalid peer identity on the wire.
 const (
-	DefaultServerName    = "coderig-collab-mcp"
+	DefaultServerName    = "carbon-collab-mcp"
 	DefaultServerVersion = "0.1.0"
 
 	// DefaultMaxInputBytes bounds one tools/call arguments value before the

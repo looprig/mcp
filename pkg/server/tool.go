@@ -15,7 +15,7 @@ type Handler func(context.Context, json.RawMessage) (Result, error)
 // ToolHandler is a descriptive alias for Handler.
 type ToolHandler = Handler
 
-// Tool is a CodeRig-owned tool definition. InputSchema must be a JSON object
+// Tool is a product-owned tool definition. InputSchema must be a JSON object
 // schema; an omitted schema means any object. OutputSchema is optional. SDK
 // types intentionally do not appear in this exported API.
 type Tool struct {
@@ -34,7 +34,7 @@ type Content struct {
 	Text string
 }
 
-// Result is the CodeRig-owned projection of an MCP tools/call result.
+// Result is the product-owned projection of an MCP tools/call result.
 type Result struct {
 	Content           []Content
 	StructuredContent json.RawMessage

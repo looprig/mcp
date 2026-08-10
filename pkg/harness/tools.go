@@ -70,11 +70,13 @@ const (
 // CapabilityToolInvoke is the normalized capability kind every external MCP
 // tool emits from preparation. It is a CONSUMER-BOUND kind: the consumer routes
 // it to its own product access source via a gate AccessBinding (the
-// access-profile spec names CodeRig's binding), never to a sandbox profile, and
+// access-profile spec names the product composition root's binding), never to a
+// sandbox profile, and
 // it is never silently mapped to command execution. The gate always resolves it
 // Gated — one combined approval or one persisted rule keyed on the tool
 // identity — so a tool.invoke requirement carries no reusable rule candidates
-// of this adapter's own. The string is the product-bound kind CodeRig binds
+// of this adapter's own. The product composition root binds this product-bound
+// kind:
 // (coderig-assembly: tools emit "tool.invoke").
 const CapabilityToolInvoke = "tool.invoke"
 
