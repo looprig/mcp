@@ -56,11 +56,6 @@ const (
 	MaxOutputBytes  = DefaultMaxOutputBytes
 )
 
-const (
-	invalidArgumentMessage = "invalid arguments"
-	internalErrorMessage   = "internal error"
-)
-
 var (
 	// ErrInvalidArgument classifies a handler failure as an MCP invalid-params
 	// error. Its text is never sent to a peer, so wrapping it cannot disclose a

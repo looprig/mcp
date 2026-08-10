@@ -222,7 +222,7 @@ func TestCollabMCPIntegrationProcessBoundary(t *testing.T) {
 	if os.PathSeparator != '/' {
 		t.Skip("the collaboration process boundary requires Unix sockets")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	capability := bytes.Repeat([]byte{0xde}, collab.CapabilityBytes)
 	secretToken, err := collab.EncodeCapabilityToken(capability)

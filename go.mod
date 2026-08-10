@@ -73,12 +73,6 @@ require (
 
 require (
 	github.com/looprig/core v0.5.0
-	github.com/looprig/harness v0.20.0
-	github.com/looprig/inference v0.8.0
+	github.com/looprig/harness v0.22.0
+	github.com/looprig/inference v0.9.0
 )
-
-replace github.com/looprig/harness => ../harness
-
-replace github.com/looprig/core => ../core
-
-replace github.com/looprig/inference => ../inference

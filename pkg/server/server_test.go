@@ -112,10 +112,8 @@ func newServeTestEndpoint(c net.Conn) *serveTestEndpoint {
 func (e *serveTestEndpoint) Write(p []byte) (int, error) {
 	if e.block.Load() {
 		e.writeOnce.Do(func() {})
-		select {
-		case <-e.closed:
-			return 0, io.ErrClosedPipe
-		}
+		<-e.closed
+		return 0, io.ErrClosedPipe
 	}
 	return e.Conn.Write(p)
 }
@@ -180,6 +178,7 @@ func TestServerRegistersToolAndReturnsStructuredContent(t *testing.T) {
 	if caps == nil || caps.Tools == nil {
 		t.Fatalf("tools capability = %#v, want tools only", caps)
 	}
+	//lint:ignore SA1019 supported for peers ≤2025-11-25 (SEP-2577)
 	if caps.Logging != nil || caps.Prompts != nil || caps.Resources != nil || caps.Completions != nil {
 		t.Fatalf("unexpected server capabilities: %#v", caps)
 	}
