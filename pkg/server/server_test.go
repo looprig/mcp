@@ -18,6 +18,12 @@ import (
 	"github.com/looprig/mcp/internal/serverwire"
 )
 
+func TestDefaultServerNameIsCarbonCollabMCP(t *testing.T) {
+	if DefaultServerName != "carbon-collab-mcp" {
+		t.Fatalf("DefaultServerName = %q, want carbon-collab-mcp", DefaultServerName)
+	}
+}
+
 func TestServeSaturatedActiveHandlerCancellationClosesBlockedWriter(t *testing.T) {
 	s, err := New(Config{MaxConcurrentRequests: 1})
 	if err != nil {
