@@ -98,7 +98,7 @@ func TestRunRejectsMissingEnvironmentBeforeServing(t *testing.T) {
 }
 
 func testConfig() collab.ClientConfig {
-	return collab.ClientConfig{Endpoint: "/tmp/coderig-collab-test.sock", Capability: bytes.Repeat([]byte{0x01}, collab.CapabilityBytes)}
+	return collab.ClientConfig{Endpoint: "/tmp/carbon-collab-test.sock", Capability: bytes.Repeat([]byte{0x01}, collab.CapabilityBytes)}
 }
 
 func connectServer(t *testing.T, s *server.Server) (*serverwire.ClientSession, io.Closer, func()) {

@@ -77,7 +77,7 @@ const (
 // identity — so a tool.invoke requirement carries no reusable rule candidates
 // of this adapter's own. The product composition root binds this product-bound
 // kind:
-// (coderig-assembly: tools emit "tool.invoke").
+// (carbon-assembly: tools emit "tool.invoke").
 const CapabilityToolInvoke = "tool.invoke"
 
 // ToolInvokeIdentity is the stable capability identity of one MCP tool

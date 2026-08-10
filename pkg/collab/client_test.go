@@ -158,7 +158,7 @@ func TestUnixClientAuthenticatesFramesAndObservesResponse(t *testing.T) {
 	}
 	t.Parallel()
 
-	endpoint := filepath.Join("/private/tmp", fmt.Sprintf("coderig-collab-%d.sock", os.Getpid()))
+	endpoint := filepath.Join("/private/tmp", fmt.Sprintf("carbon-collab-%d.sock", os.Getpid()))
 	_ = os.Remove(endpoint)
 	t.Cleanup(func() { _ = os.Remove(endpoint) })
 	listener, err := net.Listen("unix", endpoint)

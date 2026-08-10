@@ -656,7 +656,7 @@ func TestPrepareCallEmitsStableToolInvokeRequirement(t *testing.T) {
 	}
 	requirement := req.Requirements[0]
 	if CapabilityToolInvoke != "tool.invoke" {
-		t.Fatalf("CapabilityToolInvoke = %q, want the product-bound tool.invoke string CodeRig binds", CapabilityToolInvoke)
+		t.Fatalf("CapabilityToolInvoke = %q, want the product-bound tool.invoke string Carbon binds", CapabilityToolInvoke)
 	}
 	if requirement.Kind != CapabilityToolInvoke {
 		t.Errorf("Kind = %q, want the consumer-bound tool.invoke", requirement.Kind)
