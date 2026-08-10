@@ -1,4 +1,4 @@
-// Command coderig-collab-mcp exposes CodeRig's one loop-scoped collaboration
+// Command carbon-collab-mcp exposes CodeRig's one loop-scoped collaboration
 // operation over MCP stdio. Its broker endpoint and bearer capability arrive
 // only through fixed environment entries; command-line arguments are ignored.
 package main
@@ -84,6 +84,6 @@ func main() {
 		// All package-level failures are already categorical and secret-free;
 		// keep the process diagnostic equally bounded and avoid printing any
 		// endpoint or capability supplied by the environment.
-		_, _ = fmt.Fprintln(os.Stderr, "coderig-collab-mcp: server failed")
+		_, _ = fmt.Fprintln(os.Stderr, "carbon-collab-mcp: server failed")
 	}
 }

@@ -20,7 +20,7 @@ import (
 // The default identity is intentionally explicit: an empty SDK implementation
 // would otherwise produce an invalid peer identity on the wire.
 const (
-	DefaultServerName    = "coderig-collab-mcp"
+	DefaultServerName    = "carbon-collab-mcp"
 	DefaultServerVersion = "0.1.0"
 
 	// DefaultMaxInputBytes bounds one tools/call arguments value before the

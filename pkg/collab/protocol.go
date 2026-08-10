@@ -20,7 +20,7 @@ import (
 
 const (
 	// EndpointEnv and TokenEnv are the only environment entries accepted by
-	// coderig-collab-mcp. They are intentionally constants rather than flags so
+	// carbon-collab-mcp. They are intentionally constants rather than flags so
 	// a token can never arrive through process arguments.
 	EndpointEnv = "CODERIG_COLLAB_ENDPOINT"
 	TokenEnv    = "CODERIG_COLLAB_TOKEN" // #nosec G101 -- environment variable name, not a credential
