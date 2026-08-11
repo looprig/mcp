@@ -1,0 +1,186 @@
+{
+  "schemaVersion": 1,
+  "repository": "mcp",
+  "proofSources": [
+    {
+      "id": "example-mcp-stdio-client-server-source",
+      "type": "source",
+      "path": "examples/stdio/main.go"
+    },
+    {
+      "id": "example-mcp-streamable-http-source",
+      "type": "source",
+      "path": "examples/streamable-http/main.go"
+    },
+    {
+      "id": "example-mcp-server-authoring-source",
+      "type": "source",
+      "path": "examples/server/main.go"
+    },
+    {
+      "id": "example-mcp-harness-adoption-source",
+      "type": "source",
+      "path": "examples/harness-adoption/main.go"
+    },
+    {
+      "id": "example-mcp-acp-passthrough-source",
+      "type": "source",
+      "path": "examples/acp-passthrough/main.go"
+    },
+    {
+      "id": "example-mcp-acp-passthrough-test",
+      "type": "test",
+      "path": "examples/acp-passthrough/main_test.go",
+      "symbol": "TestExampleRejectsInvalidRequestBeforeDial"
+    },
+    {
+      "id": "example-mcp-examples-contract-test",
+      "type": "test",
+      "path": "examples/contract_test.go",
+      "symbol": "TestDocsExamplesArtifacts"
+    },
+    {
+      "id": "example-mcp-stdio-transport-connect-source",
+      "type": "source",
+      "path": "pkg/transport/stdio/stdio.go",
+      "symbol": "New"
+    },
+    {
+      "id": "example-mcp-http-transport-connect-source",
+      "type": "source",
+      "path": "pkg/transport/streamablehttp/streamablehttp.go",
+      "symbol": "New"
+    },
+    {
+      "id": "example-mcp-server-register-tool-source",
+      "type": "source",
+      "path": "pkg/server/server.go",
+      "symbol": "Server.RegisterTool"
+    },
+    {
+      "id": "example-mcp-harness-start-adoption-source",
+      "type": "source",
+      "path": "pkg/harness/adoption.go",
+      "symbol": "Manager.StartAdoption"
+    },
+    {
+      "id": "example-mcp-collab-protocol-boundary-source",
+      "type": "source",
+      "path": "pkg/collab/protocol.go",
+      "symbol": "MessageAgentRequest"
+    }
+  ],
+  "examples": [
+    {
+      "id": "example-mcp-stdio-client-server",
+      "title": "Run a bounded MCP server as an owned stdio child",
+      "ecosystem": "go",
+      "owner": "mcp",
+      "sourcePath": "examples/stdio/main.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/mcp": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go run ./examples/stdio",
+      "assertion": "A real child process completes initialize, catalog discovery, and one tool call over stdio. The transport supplies an explicit environment allowlist, owns shutdown, and never treats stderr as protocol data.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "Client.Close drains the MCP session, closes the child's stdin, terminates the process group if needed, and reaps the child before the parent exits.",
+      "liveGate": null,
+      "proofIds": [
+        "example-mcp-stdio-client-server-source",
+        "example-mcp-stdio-transport-connect-source",
+        "example-mcp-examples-contract-test"
+      ]
+    },
+    {
+      "id": "example-mcp-streamable-http-lifecycle",
+      "title": "Connect to an authenticated Streamable HTTP server",
+      "ecosystem": "go",
+      "owner": "mcp",
+      "sourcePath": "examples/streamable-http/main.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/mcp": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go run ./examples/streamable-http",
+      "assertion": "A loopback server proves credentials are requested for each HTTP request, the negotiated session ID is reused, Client.Close releases the session with DELETE, and a 401 initialization failure is classified as auth_required without exposing the token. Tool calls are not retried; only an SSE read may resume with Last-Event-ID.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "Client.Close releases the MCP session, then httptest.Server.Close stops the loopback listener. No remote service or credential is used.",
+      "liveGate": null,
+      "proofIds": [
+        "example-mcp-streamable-http-source",
+        "example-mcp-http-transport-connect-source",
+        "example-mcp-examples-contract-test"
+      ]
+    },
+    {
+      "id": "example-mcp-server-authoring",
+      "title": "Author a tools-only MCP server behind the stable Looprig API",
+      "ecosystem": "go",
+      "owner": "mcp",
+      "sourcePath": "examples/server/main.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/mcp": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go run ./examples/server",
+      "assertion": "A real in-memory MCP session proves tool registration, JSON argument decoding, text content, structured output, explicit server identity, bounded framing, and tools-only capability advertisement.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The SDK client session closes, the context is cancelled, and both ends of the in-memory pipe are released.",
+      "liveGate": null,
+      "proofIds": [
+        "example-mcp-server-authoring-source",
+        "example-mcp-server-register-tool-source",
+        "example-mcp-examples-contract-test"
+      ]
+    },
+    {
+      "id": "example-mcp-harness-adoption",
+      "title": "Adopt MCP tools into a Harness loop at its boundary",
+      "ecosystem": "go",
+      "owner": "mcp",
+      "sourcePath": "examples/harness-adoption/main.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/mcp": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go run ./examples/harness-adoption",
+      "assertion": "A required session-scoped binding starts through a real stdio child, an Adopter atomically installs a qualified mcp__docs__lookup definition for one loop, and DisableBinding retires the live connection. Sampling remains unadvertised because the binding does not request it; requesting sampling also requires a host SamplingPolicy and never grants tools or session authority to that policy.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "Adopter.Close stops its subscription before Manager.Close retires routes and closes the owned stdio connection.",
+      "liveGate": null,
+      "proofIds": [
+        "example-mcp-harness-adoption-source",
+        "example-mcp-harness-start-adoption-source",
+        "example-mcp-examples-contract-test"
+      ]
+    },
+    {
+      "id": "example-mcp-acp-passthrough",
+      "title": "Pass a collaboration request through the host-owned broker boundary",
+      "ecosystem": "go",
+      "owner": "mcp",
+      "sourcePath": "examples/acp-passthrough/main.go",
+      "availability": "source-workspace",
+      "versions": {
+        "github.com/looprig/mcp": "source-workspace"
+      },
+      "offlineCommand": "GOWORK=off go run ./examples/acp-passthrough",
+      "assertion": "A deterministic net.Pipe broker proves MessageAgent validation occurs before dialing, authenticates with a bounded binary capability, and returns only the public correlation-free result. MCP does not launch, proxy, or import ACP here; an ACP-capable host owns delegation and exposes only this narrow broker operation to its MCP process.",
+      "workflowPath": ".github/workflows/docs-examples.yml",
+      "jobId": "docs-examples",
+      "cleanup": "The collaboration client closes its one-request connection and the example closes the broker side of the in-memory pipe.",
+      "liveGate": null,
+      "proofIds": [
+        "example-mcp-acp-passthrough-source",
+        "example-mcp-acp-passthrough-test",
+        "example-mcp-collab-protocol-boundary-source",
+        "example-mcp-examples-contract-test"
+      ]
+    }
+  ]
+}

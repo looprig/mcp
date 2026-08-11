@@ -1,0 +1,31 @@
+name: Documentation examples
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  docs-examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Run stdio client and server example
+        run: GOWORK=off go run ./examples/stdio
+      - name: Run Streamable HTTP lifecycle example
+        run: GOWORK=off go run ./examples/streamable-http
+      - name: Run server authoring example
+        run: GOWORK=off go run ./examples/server
+      - name: Run Harness adoption example
+        run: GOWORK=off go run ./examples/harness-adoption
+      - name: Run ACP pass-through boundary example
+        run: GOWORK=off go run ./examples/acp-passthrough
+      - name: Run native tests
+        run: GOWORK=off make test
+      - name: Run standalone race suite
+        run: GOWORK=off go test -race ./...
