@@ -23,7 +23,7 @@ const (
 	// carbon-collab-mcp. They are intentionally constants rather than flags so
 	// a token can never arrive through process arguments.
 	EndpointEnv = "CODERIG_COLLAB_ENDPOINT"
-	TokenEnv    = "CODERIG_COLLAB_TOKEN"
+	TokenEnv    = "CODERIG_COLLAB_TOKEN" // #nosec G101 -- environment variable name, not a credential
 
 	// Aliases make the environment contract explicit at call sites without
 	// creating alternate accepted names.
@@ -333,7 +333,7 @@ func writeFrameLimit(w io.Writer, payload []byte, max int) error {
 		return ErrFrameLimit
 	}
 	var header [4]byte
-	binary.BigEndian.PutUint32(header[:], uint32(len(payload)))
+	binary.BigEndian.PutUint32(header[:], uint32(len(payload))) // #nosec G115 -- length is bounded by uint32 max above
 	if err := writeFull(w, header[:]); err != nil {
 		return redactWireError(ErrFrame, err)
 	}
@@ -355,6 +355,7 @@ func readFrameLimit(r io.Reader, max int) ([]byte, error) {
 	if length == 0 {
 		return nil, ErrFrame
 	}
+	// #nosec G115 -- max is a positive, validated frame bound at every call site.
 	if uint64(length) > uint64(max) {
 		return nil, ErrFrameLimit
 	}

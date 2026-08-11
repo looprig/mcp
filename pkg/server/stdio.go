@@ -45,22 +45,6 @@ type ownedWriter struct {
 	io.Closer
 }
 
-type boundedReadCloser struct {
-	reader *boundedFrameReader
-	closer io.Closer
-}
-
-func (r *boundedReadCloser) Read(p []byte) (int, error) { return r.reader.Read(p) }
-func (r *boundedReadCloser) Close() error               { return r.closer.Close() }
-
-type boundedWriteCloser struct {
-	writer *boundedFrameWriter
-	closer io.Closer
-}
-
-func (w *boundedWriteCloser) Write(p []byte) (int, error) { return w.writer.Write(p) }
-func (w *boundedWriteCloser) Close() error                { return w.closer.Close() }
-
 type nopCloser struct{}
 
 func (nopCloser) Close() error { return nil }

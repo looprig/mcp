@@ -39,6 +39,7 @@ func (t *boundedTransport) Connect(ctx context.Context) (mcp.Connection, error) 
 	}
 	t.base = base
 	c := &admissionConn{Connection: base, slots: newSlots(t.max), max: t.max, held: make(map[jsonrpc.ID]struct{}), permits: make(map[jsonrpc.ID]*permit), seen: make(map[jsonrpc.ID]struct{}), requests: make(chan jsonrpc.Message, t.max), controls: make(chan jsonrpc.Message, 1), done: make(chan struct{}), stop: make(chan struct{}), released: make(chan struct{}, 1)}
+	// #nosec G118 -- the dispatcher is connection-scoped and stops through c.stop, not a request context.
 	go c.dispatch()
 	return c, nil
 }
