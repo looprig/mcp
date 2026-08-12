@@ -81,6 +81,11 @@ var sdkImportAllowlist = map[string]struct{}{
 	modulePath + "/pkg/transport/streamablehttp": {},
 	modulePath + "/pkg/transport/sse":            {},
 	modulePath + "/internal/serverwire":          {},
+
+	// Documentation examples deliberately show the upstream SDK API directly;
+	// they are executable examples rather than consumer-facing pkg/... code.
+	modulePath + "/examples/server":          {},
+	modulePath + "/examples/streamable-http": {},
 }
 
 // listedPackage is the slice of `go list -json` output this guard consumes.
