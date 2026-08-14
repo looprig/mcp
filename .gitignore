@@ -14,4 +14,9 @@ coverage.*
 # Editor/OS noise
 .DS_Store
 
-# vendor/ is deliberately tracked (house convention) — do not ignore it.
+# This module does not vendor. go.mod pins exact versions and go.sum verifies
+# their content hashes; a vendor tree would add only offline builds and
+# source-level dependency diffs, at the cost of masking which version a
+# GOWORK=off build actually resolves. Ignored so a stray `go mod vendor` cannot
+# be committed by accident.
+/vendor/

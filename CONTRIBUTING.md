@@ -46,8 +46,8 @@ Run these before pushing. CI runs the same.
 ```sh
 make fmt              # gofmt the whole module in place
 make test             # go test -race ./...
-make secure           # lint (fmt-check + vendor-check + vet + staticcheck
-                       # + gosec) + vuln (go mod verify + govulncheck)
+make secure           # lint (fmt-check + vet + staticcheck + gosec)
+                      # + vuln (go mod verify + govulncheck)
 ```
 
 Build with `CGO_ENABLED=0 go build -trimpath` so binaries never leak local
@@ -64,9 +64,14 @@ boundary.
 
 Fuzz any parser of external input: `go test -fuzz=FuzzXxx ./pkg -fuzztime=30s`.
 
-The module **vendors** its dependency tree. Do not run `go get` casually;
-`make vendor` refreshes `vendor/` and `make vendor-check` fails the build
-if any VCS metadata leaked into it.
+**Dependencies are pinned, not vendored.** `go.mod` pins exact versions and
+`go.sum` verifies their content hashes, which is what makes a build
+reproducible. This module deliberately has no `vendor/`: a vendor tree is
+ignored under a `go.work` but silently satisfies a `GOWORK=off` build, so a
+stale one lets standalone verification pass against the vendored copy rather
+than the version `go.mod` actually pins — defeating the purpose of verifying
+standalone. Run `GOWORK=off go test ./...` to check this module against its
+real pinned dependencies. Do not run `go get` casually.
 
 ## Tests
 
