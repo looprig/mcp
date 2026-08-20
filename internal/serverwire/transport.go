@@ -84,6 +84,22 @@ func (c *admissionConn) Read(ctx context.Context) (jsonrpc.Message, error) {
 	case m := <-c.requests:
 		return m, nil
 	case <-c.done:
+		// dispatch has finished, but a message it already delivered can be
+		// buffered right now: both that case and this one are then ready at
+		// once, and select chooses uniformly at random. Returning the terminal
+		// error here would drop an admitted call that the peer is still owed.
+		// Drain what dispatch delivered -- controls first, same as above --
+		// before surfacing the error.
+		select {
+		case m := <-c.controls:
+			return m, nil
+		default:
+		}
+		select {
+		case m := <-c.requests:
+			return m, nil
+		default:
+		}
 		c.mu.Lock()
 		err := c.err
 		c.mu.Unlock()
