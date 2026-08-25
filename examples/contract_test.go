@@ -92,7 +92,7 @@ func TestDocsExamplesArtifacts(t *testing.T) {
 		t.Fatalf("read workflow: %v", err)
 	}
 	workflow := string(workflowData)
-	for _, literal := range []string{"docs-examples:", "GOWORK=off make test", offlineCommand} {
+	for _, literal := range []string{"docs-examples:", "GOWORK=off make check", offlineCommand} {
 		if !strings.Contains(workflow, literal) {
 			t.Errorf("workflow lacks %q", literal)
 		}
