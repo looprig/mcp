@@ -1,16 +1,34 @@
 # mcp
 
-An MCP (Model Context Protocol) **client** for Looprig. It lets a Harness agent
-consume existing MCP servers; it does not expose Harness agents as MCP servers.
+`github.com/looprig/mcp` is the Model Context Protocol (MCP) module for Looprig. Its main job is an MCP
+**client** that lets a Harness agent consume existing MCP servers. It also carries a deliberately small MCP
+**server** surface (`pkg/server`) and the `carbon-collab-mcp` command, which Carbon injects into ACP children to
+expose one collaboration operation; it does not expose Harness agents as general MCP servers.
 
 The module wraps the official [go-sdk](https://github.com/modelcontextprotocol/go-sdk)
 (pinned at v1.7.0) **without leaking its types**: no SDK type appears in any
-`pkg/...` exported API. Only `internal/protocol`, `internal/mcptest`, and
-`pkg/transport/*` may import the SDK, and `internal/protocol/leakguard_test.go`
-enforces both halves of that rule. Supported MCP spec revisions: 2024-11-05
-through 2026-07-28.
+`pkg/...` exported API. Only `internal/protocol`, `internal/serverwire`, `internal/mcptest` (and its fixture
+command), `pkg/transport/*` and the `examples/server` and `examples/streamable-http` programs may import the SDK,
+and `internal/protocol/leakguard_test.go` enforces both halves of that rule. Supported MCP spec revisions:
+2024-11-05 through 2026-07-28.
 
-Design doc: `../harness/docs/plans/2026-07-16-mcp-client-module-design.md`
+## Status
+
+Released. Carbon and the `tests` integration lane consume it.
+
+Known limits worth knowing before composing it (details in the security section below):
+
+- MCP tool definitions declare no Harness capture safety (`tool.CaptureSafetyDeclarer`), so Harness classifies
+  them as materialized and not high-output. Adapter text is capped at 64 KiB, but image and audio blocks are
+  bounded only by the client `Limits`, which a composer can raise.
+- Elicitation gates are opened by the host's `GateOpener`, not by a Session.
+- The credential-field rejection on elicitation forms is a guardrail, not a security boundary.
+
+## Install
+
+```sh
+go get github.com/looprig/mcp@latest
+```
 
 ## Packages
 
@@ -20,6 +38,10 @@ Design doc: `../harness/docs/plans/2026-07-16-mcp-client-module-design.md`
 | `pkg/auth` | OAuth 2.1 + PKCE, dynamic client registration, token storage. Secrets are closure-held. |
 | `pkg/transport/{stdio,streamablehttp,sse}` | Transports. Each wraps an SDK transport and keeps it on the inside. |
 | `pkg/harness` | The **optional** adapter from MCP capabilities to Harness tools, gates, events, and configuration identity. |
+| `pkg/server` | A small MCP server surface: register product-owned tools and handlers; the package owns framing, capability advertisement, bounds and wire-error classification. |
+| `pkg/collab` | Wire DTOs and framing for the collaboration broker behind `carbon-collab-mcp` (MessageAgent). Imports neither Harness nor ACP. |
+| `cmd/carbon-collab-mcp` | Exposes Carbon's one loop-scoped collaboration operation over MCP stdio. Its broker endpoint and capability arrive only through `CODERIG_COLLAB_ENDPOINT` and `CODERIG_COLLAB_TOKEN`; arguments are ignored. |
+| `examples/*` | Runnable programs: `stdio`, `streamable-http`, `server`, `harness-adoption`, `acp-passthrough`. |
 | `internal/*` | SDK conversion, catalog model, bounds, scheduling, test fixtures. Not importable. |
 
 Harness does not import this module. The TUI knows nothing about MCP. An
@@ -265,3 +287,17 @@ Anything that crosses a process boundary is tagged `//go:build integration` and 
 End-to-end tests that need a real Harness rig — real Sessions, real turns, real
 delegates — live in the `github.com/looprig/tests` module. That is why this
 module does not depend on `storage`.
+
+Go 1.26.8 baseline. Verify standalone against the pinned dependencies with
+`GOWORK=off go test ./...`; `make check` runs the standard CI surface (fmt-check,
+vet, staticcheck, gosec, govulncheck, test, build).
+
+## Where it sits
+
+Tier 4 in the Looprig graph. Direct Looprig dependencies: `core`, `harness` and
+`inference` (the last only in `examples/harness-adoption`). Consumed by `carbon`
+and `tests`.
+
+## License
+
+Apache License 2.0. See `LICENSE`.
